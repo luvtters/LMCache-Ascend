@@ -140,3 +140,34 @@ For actual P/D request routing, the pinned LMCache tree contains
 `examples/disagg_prefill_mp/disagg_proxy_server.py`. Its store-finished signal
 does not by itself prove L2 persistence: default policy can serve D from L1.
 Keep P/D routing evidence separate from the L1-clear test above.
+
+## One P/D request through MemFabric
+
+The additional `pd_inference_smoke.py` check sends **one inference request to
+the unchanged upstream P/D proxy**. Run it against fresh P/D engines and a fresh
+experimental service, with these changes to the preceding commands:
+
+1. Add `--l2-store-policy skip_l1` to `lmcache server`. LMCache removes each L1
+   object after successful L2 storage; the check never calls `/cache/clear`.
+2. Start the upstream proxy with ports 28000 (client) and 25768 (telemetry),
+   prefiller 28001 and decoder 28002, all on 127.0.0.1.
+3. Set P's `LMCACHE_REQUEST_TELEMETRY_TYPE=fastapi` and
+   `LMCACHE_REQUEST_TELEMETRY_ENDPOINT=http://127.0.0.1:25769/api/v1/telemetry`.
+   The check temporarily serves this telemetry relay; leave D telemetry unset.
+4. Run `python examples/memfabric/pd_inference_smoke.py --output /your/private/pd-results`
+   using a new output directory.
+
+The relay receives P's actual `request_store_finished` event, waits for BM
+stores to complete and L1 object count/allocated bytes to reach zero, saves that
+snapshot, then forwards the same event to the proxy. Only then can the proxy
+send to D. A timeout fails the check. This relay is a single-request validation
+gate, not a production router or a multi-request commit protocol.
+
+The 2026-10-24 run passed with P on device 4, D on 6, and BM ranks on 8/10:
+P computed 1373 prompt tokens and generated one token; before D, 10 objects /
+180 MiB existed in rank 1 DRAM and L1 was empty. D's request logged **0 L1,
+10 L2** hits, read 180 MiB from BM, restored 1280 tokens, computed the remaining
+93 tokens, and answered `ORCHID`. Its local prefix-cache count stayed zero.
+Pool data still passes through temporary L1 buffers on the restoration path.
+See `before_decode.json`, `p_store_event.json`, `proxy_notification.json`,
+`summary.json`, and the P/D metric snapshots in the output directory.
