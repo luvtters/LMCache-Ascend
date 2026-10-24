@@ -246,6 +246,20 @@ The measured run returned a load miss without changing the destination, released
 the pin on unlock, preserved both allocator references, rejected subsequent
 stores, and closed cleanly. It does not inject a failure during a DMA operation.
 
+After `peer_loss_smoke.py`, keep the failed service and D running to check
+continued degradation under L1 pressure:
+
+```bash
+python examples/memfabric/degraded_workload.py --output /your/private/degraded
+```
+
+On TP1 with a 4 GiB L1 and LRU eviction, all 24 distinct long prompts passed.
+D recomputed 88551 tokens with zero additional BM reads/writes. The highest
+observed L1 usage was 4227858432 bytes, below its 4294967296-byte capacity;
+eight decreases in object count demonstrated eviction. Failed writes left no
+outstanding pins or store tasks. This is a bounded fallback check, not a
+long-duration availability test.
+
 ## Inspect actual SDMA tasks
 
 With other experiments stopped, run a member on device 2 and port 28584:
