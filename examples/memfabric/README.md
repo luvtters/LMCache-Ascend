@@ -80,7 +80,7 @@ lmcache server --host 127.0.0.1 --port 25555 \
 
 Wait for `POOL_MEMBER_READY` and check `curl -f http://127.0.0.1:28080/healthcheck`.
 `GET /status` includes the adapter's object count, transferred bytes, selected
-storage rank, and last error. BM membership and the service index are separate:
+storage rank, eviction count, outstanding pins, and last error. BM membership and the service index are separate:
 a healthy HTTP server alone does not establish that every pool member joined.
 
 ## Two inference instances
@@ -128,10 +128,16 @@ prefix-cache tokens. This was a correctness run, not a performance benchmark.
   be evicted. This setting fits the tested Qwen3-8B TP1 / chunk 128 geometry.
 - One I/O thread serializes BM operations. Lookups pin slots until LMCache
   unlocks them. Stores publish keys only after synchronous copies finish.
+- Startup waits for every peer DRAM segment to have a device VA mapping.
+  A nonzero `peer_rank_ptr` alone does not establish this. JOIN callbacks do not
+  replay every earlier member, so counting callbacks is insufficient.
 - Normal shutdown drains outstanding copies. Transfer failures poison the
-  adapter and retain buffer references until BM drain; fault recovery is not
-  validated. Stop inference engines, then the LMCache service, then any remaining
-  pool member before stopping the container.
+  adapter and retain buffer references until BM drain. Peer LEAVE notifications
+  also poison the adapter: new lookups miss, loads stop, and stores fail.
+  Idle pool-member SIGINT and SIGKILL were tested with correct inference fallback
+  and zero new BM reads. Automatic recovery and failure during DMA are untested.
+  Stop inference engines, then the LMCache service, then any remaining pool
+  member before stopping the container.
 - SDMA is explicitly selected. No physical-link counter, cross-host HCCS,
   throughput benchmark, long-duration load, or independent multi-service
   concurrency claim is made by these checks.
@@ -171,3 +177,93 @@ P computed 1373 prompt tokens and generated one token; before D, 10 objects /
 Pool data still passes through temporary L1 buffers on the restoration path.
 See `before_decode.json`, `p_store_event.json`, `proxy_notification.json`,
 `summary.json`, and the P/D metric snapshots in the output directory.
+
+## TP8, workload, cancellation, and failure checks
+
+The same gate supports `--tp-size 8`. It collects the actual completion events
+for all eight P ranks before checking L2 completion and empty L1, then forwards
+the last event to the unchanged proxy. The TP8 run restored the same 1280 tokens
+from 80 objects / 180 MiB. Tested configuration changes from TP1:
+
+- P devices `0,1,2,3,4,5,6,7`; D devices `8,9,10,11,12,13,14,15`.
+- Both engines: `--tensor-parallel-size 8 --max-num-seqs 4`.
+- MP service: `--max-gpu-workers 16 --l2-store-policy skip_l1`.
+- BM rank 0 uses device 8; pool member rank 1 uses device 10. Both reserve
+  `pool_gb: 4`; adapter `slot_size_mb: 4` gives 1024 slots on the selected rank.
+  Qwen3-8B TP8/chunk128 payloads occupy 2.25 MiB per slot.
+
+For **ordinary ungated routing**, set P telemetry directly to port **25768**
+and restart P. These checks use the unmodified upstream proxy:
+
+```bash
+python examples/memfabric/pd_workload.py --phase serial --output /your/private/serial
+python examples/memfabric/pd_workload.py --phase shared --concurrency 4 --output /your/private/shared
+python examples/memfabric/pd_workload.py --phase concurrent --concurrency 4 --output /your/private/concurrent
+python examples/memfabric/pd_workload.py --phase concurrent --records 192 --concurrency 4 --timeout 60 --output /your/private/long
+```
+
+Across TP1 and TP8, 82 ordinary requests passed password-dependent answer
+checks, including repeats, extensions, sub-chunk prompts, eviction, and four
+outstanding requests. TP1 used engine `max-num-seqs=1`; TP8 used 4. A small
+pool can evict KV before D reads it, causing recomputation. Under concurrent
+load, service logs also showed L1/L2 mixed hits and L1-only hits. Therefore
+`skip_l1`, a correct answer, or vLLM's external-transfer metric alone does not
+prove that each ordinary request read exclusively from BM. Use the gate for
+that specific claim and inspect each request's service prefetch log.
+
+Start D with `--enable-log-requests` for cancellation evidence:
+
+```bash
+python examples/memfabric/cancel_smoke.py --decoder-log /your/private/decode.log --output /your/private/cancel
+```
+
+This closes three streams after decoding starts, matches each ID to D's abort
+log, checks storage cleanup, then verifies a normal follow-up answer. The tested
+vLLM version does not increment its completed-request abort counter on this
+explicit cancellation path, so that counter is recorded but not used as proof.
+
+The following **stops the specified experimental pool member**. Use an idle
+experimental service, a fresh `SAFFRON` prefix, and a verified member PID:
+
+```bash
+python examples/memfabric/peer_loss_smoke.py --member-pid MEMBER_PID --output /your/private/peer-loss
+# Use --existing-pool for a service with unrelated cached prefixes.
+# Use --member-signal SIGKILL to test abrupt exit instead of SIGINT.
+```
+
+If departure is not detected, the check fails before attempting stale reads.
+After a detected departure it verifies full recomputation and zero new BM reads.
+The group must then be restarted together; the volatile index is not recovered.
+
+With devices 0 and 2 free, the following check owns its own pool member and
+tests departure **after lookup has pinned an object, before load starts**:
+
+```bash
+python examples/memfabric/locked_peer_loss_smoke.py --output /your/private/locked-peer-loss
+```
+
+The measured run returned a load miss without changing the destination, released
+the pin on unlock, preserved both allocator references, rejected subsequent
+stores, and closed cleanly. It does not inject a failure during a DMA operation.
+
+## Inspect actual SDMA tasks
+
+With other experiments stopped, run a member on device 2 and port 28584:
+
+```bash
+python examples/memfabric/pool_member.py --device 2 --rank 1 --store-url tcp://127.0.0.1:28584
+```
+
+In another terminal:
+
+```bash
+msprof --output=/your/private/trace --runtime-api=on --task-time=l1 --ai-core=off \
+  --sys-interconnection-profiling=on --sys-interconnection-freq=50 --storage-limit=200MB \
+  python examples/memfabric/profile_copy.py --device 0 --output /your/private/copy
+```
+
+The final measured run completed 3479 pairs plus one source-overwrite check,
+each copying 16 MiB in each direction. CANN recorded exactly **6960 SDMA_SQE**
+tasks, matching the 6960 BM copies. Both processes exited cleanly and payloads
+matched. This is device execution evidence for the adapter's host/pool copy
+primitive, not a vLLM throughput result or proof of a particular HCCS link.

@@ -63,6 +63,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
         self._last_error = ""
         self._written_bytes = 0
         self._read_bytes = 0
+        self._evicted_objects = 0
         self._next_id = 0
         self._tasks = {kind: {} for kind in ("store", "lookup", "load")}
         self._events = {kind: create_event_notifier() for kind in self._tasks}
@@ -177,6 +178,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
             if victim is None:
                 raise RuntimeError("BM pool is full and all slots are locked")
             self._remove(victim)
+            self._evicted_objects += 1
         return self._free.pop()
 
     def _copy(self, obj, address, size, *, store):
@@ -197,8 +199,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
         total = 0
         with self._state_lock:
             try:
+                self._observe_peer_departure()
                 if self._poisoned:
-                    raise RuntimeError("BM is unavailable after a transfer error")
+                    raise RuntimeError(self._last_error or "BM is unavailable")
                 for key, obj in zip(keys, objects, strict=True):
                     _, size, layout = self._buffer(obj)
                     if key in self._entries:
@@ -223,6 +226,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
     def _lookup(self, keys, layouts):
         found = Bitmap(len(keys))
         with self._state_lock:
+            self._observe_peer_departure()
             if self._poisoned:
                 return found
             for i, key in enumerate(keys):
@@ -244,6 +248,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
         found = Bitmap(len(keys))
         total = 0
         with self._state_lock:
+            self._observe_peer_departure()
             for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
                 if self._poisoned:
                     break
@@ -289,11 +294,23 @@ class MemFabricL2Adapter(L2AdapterInterface):
     def get_memory_tags(self):
         return MemoryTags(MemorySegment.DRAM, MemoryResidency.LOCAL)
 
+    def _observe_peer_departure(self):
+        if not self._poisoned and self._session.peer_departed.is_set():
+            self._poisoned = True
+            self._last_error = (
+                f"BM peer rank {self._session.departed_rank} left the fixed group; "
+                "restart the service and pool together")
+            logger.error(self._last_error)
+
     def report_status(self):
         with self._state_lock:
+            self._observe_peer_departure()
             return {"is_healthy": not self._closed and not self._poisoned,
                     "protocol": "SDMA", "storage_rank": self.storage_rank,
                     "objects": len(self._entries), "free_slots": len(self._free),
+                    "locked_objects": sum(e.pins > 0 for e in self._entries.values()),
+                    "total_pins": sum(e.pins for e in self._entries.values()),
+                    "evicted_objects": self._evicted_objects,
                     "store_bytes": self._written_bytes, "load_bytes": self._read_bytes,
                     "last_error": self._last_error}
 

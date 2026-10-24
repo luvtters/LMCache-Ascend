@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--decoder", default="http://127.0.0.1:28002")
     parser.add_argument("--proxy", default="http://127.0.0.1:28000")
     parser.add_argument("--telemetry-port", type=int, default=25769)
+    parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--proxy-telemetry",
                         default="http://127.0.0.1:25768/api/v1/telemetry")
     parser.add_argument("--output", default="pd-memfabric-results")
@@ -33,6 +34,8 @@ def main():
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     gate = {}
+    rank_events = {}
+    forwarding = False
     app = FastAPI()
 
     def save(name, data):
@@ -61,13 +64,23 @@ def main():
 
     @app.post("/api/v1/telemetry")
     async def on_store_finished(request: Request):
+        nonlocal forwarding
         payload = await request.json()
         if payload.get("event") != "request_store_finished":
             raise HTTPException(400, "Expected request_store_finished")
         if len(payload.get("request_ids_set", [])) != 1:
-            raise HTTPException(400, "This check requires one TP1 request")
-        if gate:
-            raise HTTPException(409, "This check accepts one store event")
+            raise HTTPException(400, "This check requires one request")
+        rank = payload.get("kv_rank")
+        if payload.get("world_size") != args.tp_size or rank not in range(args.tp_size):
+            raise HTTPException(400, "Unexpected TP size / rank")
+        if rank_events and payload["request_ids_set"] != next(
+                iter(rank_events.values()))["request_ids_set"]:
+            raise HTTPException(409, "This check accepts one request")
+        rank_events[rank] = payload
+        save("p_store_events", list(rank_events.values()))
+        if len(rank_events) < args.tp_size or forwarding:
+            return {"status": "accepted", "received_ranks": sorted(rank_events)}
+        forwarding = True
         save("p_store_event", payload)
         deadline = time.monotonic() + 45
         async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
@@ -96,6 +109,7 @@ def main():
             # This snapshot is taken before the proxy is allowed to send to D.
             save("before_decode", status)
             gate.update({"p_request_id": payload["request_ids_set"][0],
+                         "p_completed_ranks": sorted(rank_events),
                          "store_bytes": bm["store_bytes"],
                          "objects": bm["objects"], "load_bytes": bm["load_bytes"],
                          "l1_objects": l1["total_object_count"],
@@ -150,6 +164,8 @@ def main():
             bm_read = pool(status)["load_bytes"] - gate["load_bytes"]
             assert bm_read == gate["store_bytes"] > 0
             prompt_tokens = result["usage"]["prompt_tokens"]
+            assert gate["objects"] == (
+                prompt_tokens // initial["chunk_size"] * args.tp_size)
             after = {}
             deadline = time.monotonic() + 15
             while True:

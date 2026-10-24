@@ -3,6 +3,7 @@
 
 import importlib.metadata
 import threading
+import time
 
 from packaging.version import Version
 
@@ -23,6 +24,9 @@ class BMSession:
                 raise RuntimeError("Only one MemFabric BM session per process is supported")
             BMSession._active = True
         self.thread_id = threading.get_ident()
+        self.rank_id = rank_id
+        self.departed_rank = None
+        self.peer_departed = threading.Event()
         self.handle = None
         self.joined = False
         self.initialized = False
@@ -53,8 +57,24 @@ class BMSession:
                                      data_op_type=bm.BmDataOpType.SDMA)
             if self.handle is None:
                 raise RuntimeError("BM returned an empty handle")
+            self.handle.set_group_event_handler(self._on_group_event)
             self.check(self.handle.join(), "BM join")
             self.joined = True
+            # join() completes local membership; peer_rank_ptr() may already
+            # return a nonzero GVA before the peer's mapping has arrived.
+            # JOIN callbacks do not replay peers present before this rank joined.
+            # SDMA requires an actual device VA mapping for every peer segment.
+            deadline = time.monotonic() + config.init_timeout
+            while not self.peer_departed.is_set():
+                if all(self.handle.gva_to_va(
+                        self.peer_address(peer), bm.BmMemType.LOCAL_DEVICE)
+                       for peer in range(world_size) if peer != rank_id):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("BM peer DRAM mappings did not become ready")
+                self.peer_departed.wait(0.1)
+            if self.peer_departed.is_set():
+                raise RuntimeError("BM peer left while the fixed group was joining")
         except BaseException:
             self.close()
             raise
@@ -68,6 +88,13 @@ class BMSession:
         if threading.get_ident() != self.thread_id:
             raise RuntimeError("BM operations must run on the session owner thread")
 
+    def _on_group_event(self, rank, event):
+        # Native callback thread: only publish state, never issue BM/NPU work.
+        # Fixed membership cannot recover an old index after a peer restarts.
+        if rank != self.rank_id and event == self.bm.BmGroupEvent.LEAVE_EVENT:
+            self.departed_rank = rank
+            self.peer_departed.set()
+
     def peer_address(self, rank):
         self._check_thread()
         address = self.handle.peer_rank_ptr(rank, self.bm.BmMemType.HOST)
@@ -79,6 +106,8 @@ class BMSession:
         self._check_thread()
         if self.closed:
             raise RuntimeError("BM session is closed")
+        if self.peer_departed.is_set():
+            raise RuntimeError(f"BM peer rank {self.departed_rank} left the fixed group")
         kind = self.bm.BmCopyType.H2G if store else self.bm.BmCopyType.G2H
         # flags=0 selects synchronous copies; no asynchronous buffer recycling.
         self.check(self.handle.copy_data(src, dst, size, kind, 0), "BM copy")
