@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real BM/MemoryObj checks. Requires the prepared A3 environment; no mocks."""
+"""Real BM/MemoryObj checks. Requires the prepared A3 environment; no mocks.
 
+Device IDs are process-local and are mapped by ASCEND_RT_VISIBLE_DEVICES.
+"""
+
+import argparse
 import time
 
 import torch
@@ -29,11 +33,11 @@ def wait(query):
     raise TimeoutError("Adapter task did not complete")
 
 
-def main():
-    adapter = MemFabricL2Adapter({"device_id": 0, "world_size": 1,
+def main(args):
+    adapter = MemFabricL2Adapter({"device_id": args.device, "world_size": 1,
                                  "storage_rank": 0, "pool_gb": 1,
                                  "slot_size_mb": 512,
-                                 "store_url": "tcp://127.0.0.1:28582"})
+                                 "store_url": args.store_url})
     keys = [ObjectKey(bytes([i]) * 32, "memfabric-smoke", 0) for i in range(5)]
     source = [memory(i * 11) for i in range(5)]
     expected = source[0].raw_tensor.clone()
@@ -84,5 +88,16 @@ def main():
         adapter.close()
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", type=int, default=0,
+                        help="Process-local device ID, mapped by ASCEND_RT_VISIBLE_DEVICES")
+    parser.add_argument("--store-url", default="tcp://127.0.0.1:28582")
+    args = parser.parse_args(argv)
+    if args.device < 0:
+        parser.error("device must be non-negative")
+    return args
+
+
 if __name__ == "__main__":
-    main()
+    main(parse_args())

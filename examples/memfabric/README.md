@@ -281,3 +281,12 @@ each copying 16 MiB in each direction. CANN recorded exactly **6960 SDMA_SQE**
 tasks, matching the 6960 BM copies. Both processes exited cleanly and payloads
 matched. This is device execution evidence for the adapter's host/pool copy
 primitive, not a vLLM throughput result or proof of a particular HCCS link.
+
+## Small A/B benchmarks and retained L1 checks
+
+See [basic_bench](basic_bench/README.md) for the three small Qwen3 cases,
+the LMCache-only / MemFabric-L2 benchmark entrypoint, token-source evidence,
+and retained-L1 replay checks. The [TP1 terminal guide](basic_bench/TP1_8_15_操作指导.md)
+records the validated physical-device 8–15 layout. Device arguments in the
+standalone smoke scripts are process-local IDs mapped by
+`ASCEND_RT_VISIBLE_DEVICES`.

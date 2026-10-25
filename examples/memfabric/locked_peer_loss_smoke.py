@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real BM peer loss after lookup pins a key, before load starts.
 
-Owns and stops its child pool_member process. Run with devices 0 and 2 free.
+Owns and stops its child pool_member process. Device IDs are process-local
+and are mapped by ASCEND_RT_VISIBLE_DEVICES. Defaults use devices 0 and 2.
 """
 
 import argparse
@@ -25,13 +26,13 @@ def main(args):
     with (output / "member.log").open("w") as log:
         member = subprocess.Popen([
             sys.executable, "-u", str(Path(__file__).with_name("pool_member.py")),
-            "--device", "2", "--rank", "1", "--store-url", "tcp://127.0.0.1:28586"],
+            "--device", str(args.member_device), "--rank", "1", "--store-url", args.store_url],
             stdout=log, stderr=subprocess.STDOUT)
     try:
-        adapter = MemFabricL2Adapter({"device_id": 0, "world_size": 2,
+        adapter = MemFabricL2Adapter({"device_id": args.owner_device, "world_size": 2,
                                      "storage_rank": 1, "pool_gb": 1,
                                      "slot_size_mb": 32,
-                                     "store_url": "tcp://127.0.0.1:28586"})
+                                     "store_url": args.store_url})
         key = ObjectKey(b"L" * 32, "locked-peer-loss", 0)
         source, target = memory(23), memory(97)
         sentinel = target.raw_tensor.clone()
@@ -83,7 +84,21 @@ def main(args):
                 member.wait()
 
 
-if __name__ == "__main__":
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
-    main(parser.parse_args())
+    parser.add_argument("--owner-device", type=int, default=0,
+                        help="Process-local owner ID, mapped by ASCEND_RT_VISIBLE_DEVICES")
+    parser.add_argument("--member-device", type=int, default=2,
+                        help="Process-local member ID, mapped by ASCEND_RT_VISIBLE_DEVICES")
+    parser.add_argument("--store-url", default="tcp://127.0.0.1:28586")
+    args = parser.parse_args(argv)
+    if args.owner_device < 0 or args.member_device < 0:
+        parser.error("owner-device and member-device must be non-negative")
+    if args.owner_device == args.member_device:
+        parser.error("owner-device and member-device must be different")
+    return args
+
+
+if __name__ == "__main__":
+    main(parse_args())
