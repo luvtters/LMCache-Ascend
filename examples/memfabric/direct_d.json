@@ -1,0 +1,17 @@
+{
+  "kv_connector": "MemFabricDirectConnector",
+  "kv_connector_module_path": "lmcache_ascend.integration.vllm.memfabric_direct_connector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "lmcache.mp.host": "tcp://127.0.0.1",
+    "lmcache.mp.port": 25555,
+    "lmcache.mp.mp_transfer_mode": "auto",
+    "lmcache.mp.direct": {
+      "device_id": 0,
+      "rank_id": 2,
+      "world_size": 3,
+      "pool_gb": 2,
+      "store_url": "tcp://127.0.0.1:28680"
+    }
+  }
+}

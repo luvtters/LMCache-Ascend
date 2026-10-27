@@ -103,12 +103,23 @@ class BMSession:
         return address
 
     def copy(self, src, dst, size, *, store):
+        self._copy(src, dst, size, self.bm.BmCopyType.H2G if store
+                   else self.bm.BmCopyType.G2H)
+
+    def copy_npu_to_global(self, src, dst, size):
+        """Synchronously copy an actual local NPU pointer into a BM GVA."""
+        self._copy(src, dst, size, self.bm.BmCopyType.L2G)
+
+    def copy_global_to_npu(self, src, dst, size):
+        """Synchronously copy a BM GVA into an actual local NPU pointer."""
+        self._copy(src, dst, size, self.bm.BmCopyType.G2L)
+
+    def _copy(self, src, dst, size, kind):
         self._check_thread()
         if self.closed:
             raise RuntimeError("BM session is closed")
         if self.peer_departed.is_set():
             raise RuntimeError(f"BM peer rank {self.departed_rank} left the fixed group")
-        kind = self.bm.BmCopyType.H2G if store else self.bm.BmCopyType.G2H
         # flags=0 selects synchronous copies; no asynchronous buffer recycling.
         self.check(self.handle.copy_data(src, dst, size, kind, 0), "BM copy")
 
