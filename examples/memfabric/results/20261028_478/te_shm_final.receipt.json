@@ -1,0 +1,33 @@
+{
+  "name": "te_shm",
+  "mode": "measurement",
+  "started": 1793121819.4802487,
+  "args": [
+    "python",
+    "/workspace/d00896497/te_fast_20261027/harness/transfer_bench.py",
+    "--backend",
+    "te",
+    "--protocol",
+    "shm",
+    "--shm-library",
+    "/workspace/d00896497/te_fast_20261027/libte_shm_bridge.so",
+    "--cpu-affinity",
+    "96-119",
+    "--numa-node",
+    "4",
+    "--sizes-mib",
+    "1,18,64",
+    "--timeout",
+    "90",
+    "--warmup",
+    "20",
+    "--iterations",
+    "100",
+    "--repeats",
+    "3",
+    "--output",
+    "/workspace/d00896497/te_fast_20261027/runs_20261028/te_shm_final.json"
+  ],
+  "exit_code": 0,
+  "finished": 1793121824.9036598
+}

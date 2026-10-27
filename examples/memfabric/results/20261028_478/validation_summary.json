@@ -1,0 +1,124 @@
+{
+  "cpu_checks": 17,
+  "independent_review": "no blocking findings",
+  "formal_copies_per_backend": 1800,
+  "backends": {
+    "bm_compat_posix": {
+      "status": "PASS",
+      "worker_exit_codes": [
+        0,
+        0
+      ],
+      "correctness": [
+        {
+          "size_bytes": 1048576,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        },
+        {
+          "size_bytes": 18874368,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        },
+        {
+          "size_bytes": 67108864,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        }
+      ],
+      "measured_copies": 1800
+    },
+    "te_ascend_hccs_relay": {
+      "status": "PASS",
+      "worker_exit_codes": [
+        0,
+        0
+      ],
+      "correctness": [
+        {
+          "size_bytes": 1048576,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        },
+        {
+          "size_bytes": 18874368,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        },
+        {
+          "size_bytes": 67108864,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        }
+      ],
+      "measured_copies": 1800
+    },
+    "te_ascend_roce": {
+      "status": "PASS",
+      "worker_exit_codes": [
+        0,
+        0
+      ],
+      "correctness": [
+        {
+          "size_bytes": 1048576,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        },
+        {
+          "size_bytes": 18874368,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        },
+        {
+          "size_bytes": 67108864,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        }
+      ],
+      "measured_copies": 1800
+    },
+    "te_shm": {
+      "status": "PASS",
+      "worker_exit_codes": [
+        0,
+        0
+      ],
+      "correctness": [
+        {
+          "size_bytes": 1048576,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        },
+        {
+          "size_bytes": 18874368,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        },
+        {
+          "size_bytes": 67108864,
+          "remote_write_checked": true,
+          "overwritten_source_readback": true,
+          "independent_remote_read": true
+        }
+      ],
+      "measured_copies": 1800
+    }
+  },
+  "monitor": {
+    "snapshots": 21,
+    "observed_owner_entries": 17,
+    "foreign_or_unknown_owner_entries": []
+  }
+}

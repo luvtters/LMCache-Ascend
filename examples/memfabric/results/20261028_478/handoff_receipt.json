@@ -1,0 +1,10 @@
+{
+  "status": "handoff_accepted",
+  "thread_id": "01a15c7e-acec-7902-813c-533580e96da0",
+  "thread_name": "2. 解读 MemFabric 文档与仓库",
+  "text": "执行",
+  "turn_id": "01a17e66-7912-7981-818e-e264cba70d7a",
+  "turn_status_at_ack": "inProgress",
+  "resource_release_preceded_handoff": true,
+  "meaning": "Owner accepted the new turn; this is not proof that its subsequent work completed."
+}
