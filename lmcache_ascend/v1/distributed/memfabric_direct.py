@@ -141,8 +141,11 @@ class MemFabricDirectTransferContext(TransferContext):
         if lmcache_chunk_tokens not in (None, self.tokens_per_chunk):
             raise ValueError("Direct chunk token count differs from adapter")
         required = {"device_id", "rank_id", "world_size", "pool_gb", "store_url"}
-        if set(self.config) != required:
-            raise ValueError(f"Direct BM config requires exactly {sorted(required)}")
+        if not required <= set(self.config) or set(self.config) - required - {"init_timeout"}:
+            raise ValueError(f"Direct BM config requires {sorted(required)} and optional init_timeout")
+        init_timeout = self.config.get("init_timeout", 90)
+        if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
+            raise ValueError("BM init_timeout must be an integer in [1, 3600] seconds")
         if self.config["rank_id"] == 0:
             raise ValueError("Direct worker must use a nonzero BM client rank")
         if self._transfer_factory is None:

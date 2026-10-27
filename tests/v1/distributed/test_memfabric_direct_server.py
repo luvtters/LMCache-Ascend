@@ -133,6 +133,29 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_server()(None, config, session_factory=lambda **kw: FakeSession())
 
+    def test_optional_startup_timeout_is_forwarded_only_when_configured(self):
+        for optional in ({}, {"init_timeout": 300}):
+            with self.subTest(config=optional):
+                received = []
+
+                def factory(**kwargs):
+                    received.append(kwargs)
+                    return FakeSession()
+
+                server = load_server()(None, dict(self.config, **optional), session_factory=factory)
+                self.wait_ready(server)
+                if optional:
+                    self.assertEqual(received[0]["init_timeout"], 300)
+                else:
+                    self.assertNotIn("init_timeout", received[0])
+                server.close()
+
+    def test_optional_startup_timeout_requires_bounded_positive_integer(self):
+        for value in (0, -1, 3601, True, 1.5, "300"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "init_timeout"):
+                load_server()(None, dict(self.config, init_timeout=value),
+                    session_factory=lambda **kw: self.fail("must reject before BM creation"))
+
 
 if __name__ == "__main__":
     unittest.main()

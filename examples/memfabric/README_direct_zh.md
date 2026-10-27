@@ -65,6 +65,8 @@ ASCEND_RT_VISIBLE_DEVICES=14 lmcache server --host 127.0.0.1 --port 25555 \
 
 P、D 要在两个终端**并行启动**，不能等 P 完全 ready 后再启动 D，否则固定 BM 组会等不到全部成员。P 示例：
 
+**2026-10-28 冷启动等待修订。** 已观察到 Qwen P/D 冷加载超过 BM 默认的 90 秒启动窗口，导致 service 池先失效。可在 service module 的 `config` 及 P/D 的 `lmcache.mp.direct` 中都显式增加 `"init_timeout": 300`。该字段可选，允许 1–3600 的整数秒；不填仍为 90 秒，以保持兼容行为。它仅设置 BM 初始化、创建/join 及对端映射等待，不改变数据拷贝的 `operation_timeout=90`，也不把 RPC timeout 或成员失效解释为可以重建固定组。控制 RPC 的 `mq_timeout` 仍单独设置。
+
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=8 vllm serve /path/to/Qwen3-8B \
   --served-model-name mf-direct --tensor-parallel-size 1 --dtype bfloat16 \

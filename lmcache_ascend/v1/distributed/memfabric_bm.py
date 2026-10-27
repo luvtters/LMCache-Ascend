@@ -12,7 +12,10 @@ class BMSession:
     _guard = threading.Lock()
     _active = False
 
-    def __init__(self, *, device_id, rank_id, world_size, pool_gb, store_url):
+    def __init__(self, *, device_id, rank_id, world_size, pool_gb, store_url,
+                 init_timeout=90):
+        if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
+            raise ValueError("BM init_timeout must be an integer in [1, 3600] seconds")
         if not (0 <= rank_id < world_size and device_id >= 0 and pool_gb >= 1):
             raise ValueError("Invalid BM device, rank, world size, or pool capacity")
         if not isinstance(pool_gb, int):
@@ -46,8 +49,8 @@ class BMSession:
             config.auto_ranking = False
             config.rank_id = rank_id
             config.start_store = rank_id == 0
-            config.init_timeout = 90
-            config.create_timeout = 90
+            config.init_timeout = init_timeout
+            config.create_timeout = init_timeout
             config.operation_timeout = 90
             self.check(bm.initialize(store_url, world_size, device_id, config),
                        "bm.initialize")

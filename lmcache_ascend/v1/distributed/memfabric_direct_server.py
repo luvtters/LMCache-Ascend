@@ -3,6 +3,8 @@
 
 Configure via --server-module with this module_path and explicit config fields:
 device_id, rank_id (storage rank), world_size, pool_gb, slot_size_mb, store_url.
+Optional init_timeout extends BM startup/join waiting for cold-loading workers;
+it defaults to 90 seconds and does not change copy-operation timeouts.
 Only metadata crosses the JSON control interface. The BM pool owns payloads;
 the server's CPU L1 allocator is never used by this module.
 """
@@ -25,8 +27,11 @@ class MemFabricDirectServerModule(DiscoverableModule):
 
     def __init__(self, context, config, *, session_factory=None):
         fields = {"device_id", "rank_id", "world_size", "pool_gb", "slot_size_mb", "store_url"}
-        if set(config) != fields:
-            raise ValueError("MemFabric direct config requires exactly %s" % sorted(fields))
+        if not fields <= set(config) or set(config) - fields - {"init_timeout"}:
+            raise ValueError("MemFabric direct config requires %s and optional init_timeout" % sorted(fields))
+        init_timeout = config.get("init_timeout", 90)
+        if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
+            raise ValueError("BM init_timeout must be an integer in [1, 3600] seconds")
         numeric = [config[k] for k in fields - {"store_url"}]
         if (any(type(v) is not int for v in numeric) or config["device_id"] < 0
                 or config["pool_gb"] < 1 or config["slot_size_mb"] < 1
@@ -59,11 +64,12 @@ class MemFabricDirectServerModule(DiscoverableModule):
 
                 session_factory = BMSession
             config = self._config
+            optional = {"init_timeout": config["init_timeout"]} if "init_timeout" in config else {}
             session = session_factory(device_id=config["device_id"],
                                       rank_id=config["rank_id"],
                                       world_size=config["world_size"],
                                       pool_gb=config["pool_gb"],
-                                      store_url=config["store_url"])
+                                      store_url=config["store_url"], **optional)
             self._index.mark_ready()
             while True:
                 if session.peer_departed.is_set():

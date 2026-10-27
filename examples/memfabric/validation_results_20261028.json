@@ -1,0 +1,188 @@
+{
+  "date": "2026-10-28",
+  "timezone": "Asia/Shanghai",
+  "scope": "Single-host Qwen3-8B TP1 functional validation; not a performance benchmark",
+  "core_parent": "04e16ff",
+  "core_runtime_commit": "8bc9edc",
+  "ascend_direct_parent": "be90c96",
+  "runtime_branch": "fix/memfabric-worker-direct-runtime-20261028",
+  "software": {
+    "python": "3.12.13",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post4",
+    "vllm": "0.23.0",
+    "vllm_ascend": "0.23.0",
+    "memfabric": "1.2.1"
+  },
+  "config": {
+    "tensor_parallel": 1,
+    "chunk_tokens": 128,
+    "max_model_len": 4096,
+    "prefix_caching": false,
+    "bm_world_size": 3,
+    "pool_gib": 1,
+    "slot_mib": 32,
+    "init_timeout_seconds": 300,
+    "operation_timeout_seconds": 90
+  },
+  "cpu_checks": {
+    "ascend_bm_server_direct": 29,
+    "core_lazy_import": 1,
+    "actual_rpc_status_and_close_exit_code": 0
+  },
+  "synthetic_context": [
+    {
+      "status": "PASS",
+      "format": 16,
+      "payload_bytes": 18874368,
+      "block_size": 128,
+      "source_blocks": [
+        1
+      ],
+      "target_blocks": [
+        2
+      ]
+    },
+    {
+      "status": "PASS",
+      "format": 16,
+      "payload_bytes": 18874368,
+      "block_size": 64,
+      "source_blocks": [
+        3,
+        1
+      ],
+      "target_blocks": [
+        4,
+        2
+      ]
+    }
+  ],
+  "strict_gate": {
+    "status": "DIRECT_POOL_PATH_PASS",
+    "prompt_tokens": 1373,
+    "d_external_tokens": 1280.0,
+    "d_computed_tokens": 93.0,
+    "d_local_prefix_tokens": 0.0,
+    "pool_objects_before_d": 10,
+    "answer": "ORCHID",
+    "final_pool_pins": 0,
+    "manual_l1_clear": false,
+    "pool_observation_transport": "http_status",
+    "direct_trace": {
+      "p_l2g_copies": 10,
+      "d_g2l_copies": 10,
+      "p_l2g_bytes": 188743680,
+      "d_g2l_bytes": 188743680,
+      "p_gather_completions": 10,
+      "d_scatter_completions": 10,
+      "actual_local_memory_type": "npu",
+      "cpu_bm_copy_calls": 0,
+      "boundary": "Python/native-call trace; not a hardware DMA profiler"
+    },
+    "direct_path_without_trace": null,
+    "note": "Single-request gated correctness check; not a performance sample"
+  },
+  "strict_gate_actual_exit_code": 0,
+  "followups": {
+    "status": "PASS",
+    "actual_exit_code": 0,
+    "total_requests": 4,
+    "phases": [
+      {
+        "name": "sequential_1",
+        "requests": 1,
+        "answers": [
+          "ORCHID"
+        ],
+        "source_delta": {
+          "prompt": 1373.0,
+          "external": 1280.0,
+          "computed": 93.0,
+          "prefix": 0.0
+        },
+        "direct_trace": {
+          "g2l_copies": 10,
+          "scatter_completions": 10,
+          "g2l_bytes": 188743680,
+          "cpu_bm_copy_calls": 0,
+          "local_memory_type": "npu",
+          "new_p_copies": 0
+        },
+        "final_pins": 0,
+        "pending_writes": 0,
+        "note": "Concurrent source counters are aggregate, not per-request logs"
+      },
+      {
+        "name": "sequential_2",
+        "requests": 1,
+        "answers": [
+          "ORCHID"
+        ],
+        "source_delta": {
+          "prompt": 1373.0,
+          "external": 1280.0,
+          "computed": 93.0,
+          "prefix": 0.0
+        },
+        "direct_trace": {
+          "g2l_copies": 10,
+          "scatter_completions": 10,
+          "g2l_bytes": 188743680,
+          "cpu_bm_copy_calls": 0,
+          "local_memory_type": "npu",
+          "new_p_copies": 0
+        },
+        "final_pins": 0,
+        "pending_writes": 0,
+        "note": "Concurrent source counters are aggregate, not per-request logs"
+      },
+      {
+        "name": "concurrent_2",
+        "requests": 2,
+        "answers": [
+          "ORCHID",
+          "ORCHID"
+        ],
+        "source_delta": {
+          "prompt": 2746.0,
+          "external": 2560.0,
+          "computed": 186.0,
+          "prefix": 0.0
+        },
+        "direct_trace": {
+          "g2l_copies": 20,
+          "scatter_completions": 20,
+          "g2l_bytes": 377487360,
+          "cpu_bm_copy_calls": 0,
+          "local_memory_type": "npu",
+          "new_p_copies": 0
+        },
+        "final_pins": 0,
+        "pending_writes": 0,
+        "note": "Concurrent source counters are aggregate, not per-request logs"
+      }
+    ]
+  },
+  "shutdown_actual_exit_codes": {
+    "service": -9,
+    "p": 0,
+    "d": 0,
+    "proxy": 0,
+    "gate": 0
+  },
+  "shutdown_limit": "Service logged complete shutdown and then exited with SIGKILL (-9); signal origin unknown; cgroup OOM kill count and failcnt were zero. P/D, proxy, gate exited zero. No new NPU work was started after this signal.",
+  "release": {
+    "container_stopped": true,
+    "npu_processes_observed": false,
+    "beijing_time": "2026-10-28 02:32:33"
+  },
+  "not_verified": [
+    "Service normal process exit",
+    "Multi-TP integration",
+    "Cross-server HCCS benefit",
+    "Throughput or stable-latency benefit",
+    "Long-running stability",
+    "Mooncake native shutdown when explicitly selected"
+  ]
+}

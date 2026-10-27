@@ -196,12 +196,15 @@ class Transfer:
             raise RuntimeError("partial scatter failed")
 
 
-def context(client):
+def context(client, *, init_timeout=None, session_factory=Session):
+    config = dict(device_id=0, rank_id=1, world_size=2,
+                  pool_gb=1, store_url="test-only")
+    if init_timeout is not None:
+        config["init_timeout"] = init_timeout
     result = DIRECT.MemFabricDirectTransferContext(instance_id=1,
         req_client=client, tokens_per_chunk=128, mq_timeout=1,
-        extra_config={"lmcache.mp.direct": dict(device_id=0, rank_id=1,
-            world_size=2, pool_gb=1, store_url="test-only")},
-        session_factory=Session, transfer_factory=Transfer)
+        extra_config={"lmcache.mp.direct": config},
+        session_factory=session_factory, transfer_factory=Transfer)
     result.register({"layer": object()}, "qwen3", 1, 1, 1)
     return result
 
@@ -219,6 +222,37 @@ def add_object(client, object_key):
 
 
 class DirectTests(unittest.TestCase):
+    def test_optional_startup_timeout_is_forwarded_without_changing_default(self):
+        for value in (None, 300):
+            with self.subTest(value=value):
+                received = []
+
+                def factory(**kwargs):
+                    received.append(kwargs)
+                    return Session(**kwargs)
+
+                item = context(Client(), init_timeout=value, session_factory=factory)
+                if value is None:
+                    self.assertNotIn("init_timeout", received[0])
+                else:
+                    self.assertEqual(received[0]["init_timeout"], value)
+                item.close()
+
+    def test_optional_startup_timeout_is_validated_before_device_creation(self):
+        for value in (0, -1, 3601, True, 1.5, "300"):
+            with self.subTest(value=value):
+                item = DIRECT.MemFabricDirectTransferContext(instance_id=1,
+                    req_client=Client(), tokens_per_chunk=128, mq_timeout=1,
+                    extra_config={"lmcache.mp.direct": dict(device_id=0,
+                        rank_id=1, world_size=2, pool_gb=1, store_url="test-only",
+                        init_timeout=value)}, session_factory=Session,
+                    transfer_factory=Transfer)
+                try:
+                    with self.assertRaisesRegex(ValueError, "init_timeout"):
+                        item.register({}, "qwen3", 1, 1, 1)
+                finally:
+                    item.close()
+
     def test_keys_share_identity_across_workers_requests_and_metadata(self):
         full = DIRECT.chunk_keys(key(end=256), 128)
         self.assertEqual(full, DIRECT.chunk_keys(key(end=256, request="D",

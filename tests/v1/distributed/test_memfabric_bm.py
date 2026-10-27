@@ -4,7 +4,7 @@
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import threading
 import unittest
 
@@ -15,6 +15,7 @@ class BMCopyTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("memfabric_bm_cpu_test", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        self.module = module
         self.session = module.BMSession.__new__(module.BMSession)
         self.session.thread_id = threading.get_ident()
         self.session.closed = False
@@ -48,6 +49,38 @@ class BMCopyTests(unittest.TestCase):
         self.session.handle.copy_data.return_value = 7
         with self.assertRaisesRegex(RuntimeError, "BM copy failed: 7"):
             self.session.copy_global_to_npu(1, 2, 32)
+
+    def test_startup_timeout_defaults_to_90_and_can_be_extended(self):
+        for supplied, expected in (({}, 90), ({"init_timeout": 300}, 300)):
+            with self.subTest(config=supplied):
+                handle = MagicMock()
+                handle.join.return_value = handle.wait.return_value = handle.leave.return_value = 0
+                handle.peer_rank_ptr.return_value = 4096
+                handle.gva_to_va.return_value = 8192
+                bm = SimpleNamespace(BmConfig=SimpleNamespace,
+                    initialize=MagicMock(return_value=0),
+                    create2=MagicMock(return_value=handle), uninitialize=MagicMock(),
+                    BmDataOpType=SimpleNamespace(SDMA=1),
+                    BmMemType=SimpleNamespace(HOST=1, LOCAL_DEVICE=2))
+                mf = SimpleNamespace(bm=bm, initialize=MagicMock(return_value=0),
+                                     uninitialize=MagicMock())
+                torch = SimpleNamespace(npu=SimpleNamespace(set_device=MagicMock()))
+                with patch.dict("sys.modules", {"torch": torch,
+                        "torch_npu": SimpleNamespace(), "memfabric_hybrid": mf}), \
+                        patch.object(self.module.importlib.metadata, "version", return_value="1.2.1"):
+                    session = self.module.BMSession(device_id=0, rank_id=0,
+                        world_size=2, pool_gb=1, store_url="test-only", **supplied)
+                    native_config = bm.initialize.call_args.args[3]
+                    self.assertEqual(native_config.init_timeout, expected)
+                    self.assertEqual(native_config.create_timeout, expected)
+                    self.assertEqual(native_config.operation_timeout, 90)
+                    session.close()
+
+    def test_startup_timeout_rejects_invalid_values_before_native_import(self):
+        for value in (0, -1, 3601, True, 1.5, "300"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "init_timeout"):
+                self.module.BMSession(device_id=0, rank_id=0, world_size=2,
+                    pool_gb=1, store_url="test-only", init_timeout=value)
 
 
 if __name__ == "__main__":
