@@ -10,6 +10,11 @@ the launcher with that one foreground process; device roles also require
 `--allow-npu`. The outer executor must supply the verified runtime environment,
 record the actual PID/process group, wait for every child, and enforce its own
 authorized deadline on BOTH hosts. It must never restart a failed BM group.
+At actual execution, the runner prefixes its source paths to inherited
+`PYTHONPATH` and `lmcache_ascend` to inherited `LD_LIBRARY_PATH`; verified CANN,
+ACL and driver search paths remain intact. The printed plan contains prefixes
+only and does not capture the planning machine's environment. Executors that
+run the printed argv directly must apply the same prefix-and-preserve rule.
 
 Default paths:
 
@@ -119,3 +124,51 @@ python examples/memfabric/check_cross_host_cpu.py
 This covers independent clock domains and identity rejection, HTTP immutable
 events/duplicate/conflict/failure/timeout, three topology expansions, callback
 configuration and output-token limits. It imports no accelerator module.
+
+## Explicit homogeneous TP candidate (default remains TP1)
+
+`--tp-size 2|4|8` is an opt-in **inference-stage candidate** requiring the separate
+production TP changes (including the status-field collision fix). It must not be
+deployed against the fixed TP1-only baseline. Synthetic primitive/context roles
+currently remain TP1 and explicitly reject a TP candidate selection.
+
+The first TP2 T3 role plan can be inspected with:
+
+```bash
+python examples/memfabric/cross_host_role.py --topology T3 --stage inference \
+  --session-id w02-t3-tp2-attempt01 --tp-size 2 --pool-gb 2 --role p
+```
+
+Use the SAME TP/capacity/session flags for service, P, D, proxy, trace helpers and
+gate. TP2 T3 defaults to P137 physical `[8,9]`, D137 `[10,11]`, pool12 `[8]`.
+The P/D device mask maps to logical `[0,1]`; production context receives these
+explicit `device_ids`, P base BM rank1, D base rank3, world5. Actual model config
+supplies total KV heads; the launcher never fabricates that field.
+
+Optional `--p-devices 8,9 --d-devices 10,11 --pool-device 8` overrides physical
+lists. Duplicate devices, wrong list length, and overlaps between roles on the
+same host are rejected. Larger default T3 candidates are P `[8..11]` / D
+`[12..15]` for TP4 and P `[0..7]` / D `[8..15]` for TP8; these are plans, not
+resource authorization. Service keeps 32 MiB slots; `--pool-gb 2` can hold the
+single-prefix 10-chunk TP2/4 case (TP8 needs at least 80 slots, hence 3 GiB).
+The caller must explicitly select capacity sufficient for its TP condition.
+
+The gate collects one immutable P completion receipt from EVERY distinct real
+`kv_rank`, refusing conflicting or unrelated request receipts. Earlier ranks
+receive a local acknowledgement; they are not forwarded to the proxy, whose
+current handler would release D on the first received receipt. Only the full
+receipt set plus completed pool state/trace proof produces one proxy release.
+
+Each trace record carries actual worker `kv_worker_id`, vLLM rank and TP size.
+The gate requires P and D to each have all TP worker processes and the expected
+individual BM ranks. For 1373 input / chunk128, each rank must complete exactly
+10 transfers in its own direction, and its scratch/chunk bytes must be
+`18 MiB / TP`. Pool committed objects must be `10 * TP`; total completed bytes
+remain exactly 180 MiB in EACH direction. Per-rank gather/native/BM/scatter
+pairings, host-local time baselines and byte checks prevent an extra transfer on
+one worker from compensating for a missing or undersized shard on another.
+Observer counters retain role/shard/rank/PID and remain raw-trace-derived only.
+
+CPU checks include TP1/2/4/8 expected counts, independent time domains, missing
+rank and wrong BM rank rejection, and duplicate/partial/conflicting TP receipts.
+These checks do not validate the actual model, tensors, HCCS, or native runtime.

@@ -22,6 +22,7 @@ from lmcache_ascend.integration.vllm.memfabric_direct_connector import (
 _installed = False
 _lock = threading.RLock()
 _buffers = {}
+_worker_identity = {}
 
 
 def emit(kind, phase, **fields):
@@ -34,6 +35,7 @@ def emit(kind, phase, **fields):
     path.mkdir(parents=True, exist_ok=True)
     record = dict(kind=kind, phase=phase, role=role, pid=os.getpid(),
                   host_id=host_identity(), session_id=os.environ.get("MF_DIRECT_SESSION_ID"),
+                  **_worker_identity,
                   thread_id=threading.get_ident(), mono_ns=time.monotonic_ns(),
                   **fields)
     data = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
@@ -46,11 +48,18 @@ def emit(kind, phase, **fields):
             os.close(fd)
 
 
-def install_trace():
+def install_trace(parallel_strategy=None):
     """Patch only the direct worker's BM and native transfer entry points."""
     global _installed
     if _installed:
         return
+    tp_size = getattr(parallel_strategy, "tp_size", 1)
+    shard = getattr(parallel_strategy, "kv_worker_id", 0)
+    worker_id = getattr(parallel_strategy, "vllm_worker_id", 0)
+    if (tp_size not in (1, 2, 4, 8) or type(shard) is not int
+            or not 0 <= shard < tp_size or shard != worker_id):
+        raise ValueError("Trace requires real homogeneous TP worker/shard identity")
+    _worker_identity.update(worker_shard=shard, tp_size=tp_size, vllm_worker_id=worker_id)
     # Called from the worker factory after normal package initialization;
     # never import Ascend from Python sitecustomize or an import hook.
     from lmcache_ascend.v1.distributed.memfabric_bm import BMSession
@@ -157,5 +166,5 @@ class MemFabricDirectConnector(_DirectConnector):
     """Use the production connector with worker-only diagnostic wrappers."""
 
     def create_lmcache_mp_worker_adapter(self, **adapter_kwargs):
-        install_trace()
+        install_trace(adapter_kwargs.get("parallel_strategy"))
         return super().create_lmcache_mp_worker_adapter(**adapter_kwargs)

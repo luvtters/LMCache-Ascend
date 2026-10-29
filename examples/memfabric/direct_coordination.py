@@ -84,9 +84,12 @@ def make_server(bind, port, directory, run_id, trace_dir=None):
                 counters = {}
                 for record in records:
                     if record['kind'] == 'bm_copy':
-                        key = record['role'] + '_' + record['direction']
+                        key = record['role'] + '_shard' + str(record.get('worker_shard', 0)) + '_' + record['direction']
                         item = counters.setdefault(key, dict(started=0, completed=0, failed=0,
-                                                              completed_bytes=0))
+                                                              completed_bytes=0,
+                                                              worker_shard=record.get('worker_shard', 0),
+                                                              bm_rank=record.get('bm_rank'),
+                                                              pid=record.get('pid')))
                         if record['phase'] == 'begin':
                             item['started'] += 1
                         elif record['phase'] == 'complete':

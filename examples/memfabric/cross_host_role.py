@@ -20,6 +20,9 @@ def build_plan(args):
     examples = ascend / 'examples/memfabric'
     case = root / 'runs' / args.session_id
     mapping = TOPOLOGIES[args.topology]
+    tp_size = args.tp_size
+    if args.stage == 'inference' and tp_size > 1 and args.pool_gb * (1 << 30) < (1373 // 128) * tp_size * (32 << 20):
+        raise ValueError('Pool capacity cannot hold this frozen TP prefix with 32 MiB slots')
     pool_host = mapping['service'][0]
     owner = HOSTS[pool_host]
     p_host, d_host = (mapping[role][0] for role in ('p', 'd'))
@@ -30,14 +33,40 @@ def build_plan(args):
         args.role.removeprefix('trace') if args.role.startswith('trace') else gate_host)
     ip = HOSTS[host]
     device = mapping[args.role][1] if args.role in mapping else None
-    bm = dict(device_id=0, rank_id=rank.get(args.role, 0), world_size=3,
+    p_default = list(range(8, 8 + tp_size))
+    d_default = list(range(10, 10 + tp_size))
+    if args.topology == 'T2':
+        p_default, d_default = d_default, p_default
+    if tp_size == 8:
+        p_default = list(range(0, 8)) if args.topology in ('T2', 'T3') else list(range(8, 16))
+        d_default = list(range(0, 8)) if args.topology == 'T1' else list(range(8, 16))
+    elif tp_size == 4 and args.topology == 'T3':
+        d_default = list(range(12, 16))
+    devices = {
+        'p': args.p_devices if args.p_devices is not None else p_default,
+        'd': args.d_devices if args.d_devices is not None else d_default,
+        'service': [args.pool_device],
+    }
+    for role in ('p', 'd'):
+        if len(devices[role]) != tp_size or len(set(devices[role])) != tp_size:
+            raise ValueError('P/D device lists must contain exactly TP distinct physical ids')
+    for left, right in (('p', 'd'), ('p', 'service'), ('d', 'service')):
+        if mapping[left][0] == mapping[right][0] and set(devices[left]) & set(devices[right]):
+            raise ValueError('Roles on one host must use disjoint physical devices')
+    physical_devices = devices.get(args.role, [])
+    if physical_devices:
+        device = physical_devices[0] if len(physical_devices) == 1 else physical_devices
+    if args.role == 'd':
+        rank['d'] = 1 + tp_size
+    bm = dict(device_id=0, rank_id=rank.get(args.role, 0), world_size=1 + 2 * tp_size,
               pool_gb=args.pool_gb, init_timeout=300, store_url=f'tcp://{owner}:28695')
     env = dict(PYTHONPATH=f'{examples}:{ascend}:{core}', OMP_NUM_THREADS='1',
+               LD_LIBRARY_PATH=str(ascend / 'lmcache_ascend'),
                TOKENIZERS_PARALLELISM='false', VLLM_WORKER_MULTIPROC_METHOD='spawn',
                TORCH_DEVICE_BACKEND_AUTOLOAD='0', LMCACHE_MP_TRANSFER_MODE='auto',
                LMCACHE_REQUEST_TELEMETRY_TYPE='noop', LMCACHE_REQUEST_TELEMETRY_ENDPOINT='')
     if device is not None:
-        env['ASCEND_RT_VISIBLE_DEVICES'] = str(device)
+        env['ASCEND_RT_VISIBLE_DEVICES'] = ','.join(map(str, physical_devices))
     python = args.python
     config = None
     if args.role in mapping and args.stage != 'inference' and args.role != 'service':
@@ -60,12 +89,16 @@ def build_plan(args):
         else:
             config = dict(module_path='lmcache_ascend.v1.distributed.memfabric_direct_server',
                           config=dict(bm, slot_size_mb=32))
+            if tp_size > 1:
+                config['config']['tp_size'] = tp_size
             argv = [python, '-u', '-m', 'lmcache.cli.main', 'server', '--host', owner,
                     '--port', '25595', '--http-host', owner, '--http-port', '28195',
                     '--chunk-size', '128', '--l1-size-gb', '1', '--eviction-policy', 'LRU',
-                    '--supported-transfer-mode', 'lmcache_driven', '--max-gpu-workers', '2',
+                    '--supported-transfer-mode', 'lmcache_driven', '--max-gpu-workers', str(2 * tp_size),
                     '--server-module', json.dumps(config)]
     elif args.role in ('p', 'd'):
+        if tp_size > 1:
+            bm.update(tp_size=tp_size, device_ids=list(range(tp_size)))
         extra = {'lmcache.mp.host': f'tcp://{owner}', 'lmcache.mp.port': 25595,
                  'lmcache.mp.autostart': False, 'lmcache.mp.mq_timeout': 360.0,
                  'lmcache.mp.mp_transfer_mode': 'auto', 'lmcache.mp.direct': bm}
@@ -79,7 +112,7 @@ def build_plan(args):
             env.update(LMCACHE_REQUEST_TELEMETRY_TYPE='fastapi',
                        LMCACHE_REQUEST_TELEMETRY_ENDPOINT=f'http://{HOSTS[gate_host]}:25809/api/v1/telemetry')
         argv = [python, '-m', 'vllm.entrypoints.cli.main', 'serve', args.model,
-                '--served-model-name', 'mf-direct', '--tensor-parallel-size', '1', '--seed', '1024',
+                '--served-model-name', 'mf-direct', '--tensor-parallel-size', str(tp_size), '--seed', '1024',
                 '--dtype', 'bfloat16', '--max-model-len', '4096', '--max-num-batched-tokens', '1024',
                 '--max-num-seqs', '1', '--block-size', '128', '--gpu-memory-utilization', '0.7',
                 '--enforce-eager', '--no-enable-prefix-caching', '--host', ip,
@@ -101,6 +134,7 @@ def build_plan(args):
                 '--p-trace-url', f'http://{HOSTS[p_host]}:29596/snapshot',
                 '--d-trace-url', f'http://{HOSTS[d_host]}:29596/snapshot',
                 '--session-id', args.session_id, '--require-direct-trace',
+                '--tp-size', str(tp_size),
                 '--expected-prompt-tokens', '1373', '--expected-copy-bytes', str(180 << 20),
                 '--max-tokens', '8', '--timeout', '360', '--output', str(case / 'gate')]
     else:
@@ -111,9 +145,23 @@ def build_plan(args):
     return dict(status='PLAN_ONLY', host=host, ip=ip, role=args.role, topology=args.topology,
                 stage=args.stage, session_id=args.session_id, cwd=str(ascend), argv=argv,
                 env=env, config=config, physical_device=device, logical_device=0 if device is not None else None,
+                physical_devices=physical_devices, tp_size=tp_size,
+                logical_devices=(list(range(tp_size)) if args.role in ('p', 'd')
+                                 else [0] if physical_devices else []),
+                requires_tp_candidate=tp_size > 1,
                 service_prestart_required=True, autostart=False,
                 expected_core_revision='8bc9edc', ascend_baseline_revision='7e5d40a',
                 data_path='synchronous_SDMA_L2G_G2L', evidence_boundary='NOT_VERIFIED_NPU_or_RPC')
+
+
+def execution_environment(plan, inherited):
+    """Prefix local sources/libs while retaining the host's verified ACL/CANN paths."""
+    env = dict(inherited, **plan['env'])
+    for name in ('PYTHONPATH', 'LD_LIBRARY_PATH'):
+        prior = inherited.get(name, '')
+        prefix = plan['env'].get(name, '')
+        env[name] = ':'.join(value for value in (prefix, prior) if value)
+    return env
 
 
 def main():
@@ -126,10 +174,19 @@ def main():
     parser.add_argument('--session-id', required=True)
     parser.add_argument('--model', default='/workspace/d00896497/models/Qwen3-8B')
     parser.add_argument('--pool-gb', type=int, default=1)
+    parser.add_argument('--tp-size', type=int, choices=(1, 2, 4, 8), default=1)
+    parser.add_argument('--p-devices', type=lambda value: [int(v) for v in value.split(',')])
+    parser.add_argument('--d-devices', type=lambda value: [int(v) for v in value.split(',')])
+    parser.add_argument('--pool-device', type=int, default=8)
     parser.add_argument('--skip-blocks', type=int, choices=(0, 1), default=0)
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--allow-npu', action='store_true')
     args = parser.parse_args()
+    if args.tp_size > 1 and args.stage != 'inference':
+        parser.error('The synthetic primitive/context script is TP1 only; TP candidates require inference stage')
+    if args.pool_gb < 1 or any(v < 0 or v > 15 for v in
+            (args.p_devices or []) + (args.d_devices or []) + [args.pool_device]):
+        parser.error('Invalid capacity or physical devices')
     if not args.session_id or any(not (c.isalnum() or c in '-_') for c in args.session_id):
         parser.error('session-id must be a new simple attempt identifier')
     plan = build_plan(args)
@@ -137,7 +194,7 @@ def main():
     if args.run:
         if plan['physical_device'] is not None and not args.allow_npu:
             parser.error('device roles require --allow-npu')
-        env = dict(os.environ, **plan['env'])
+        env = execution_environment(plan, os.environ)
         os.chdir(plan['cwd'])
         os.execvpe(plan['argv'][0], plan['argv'], env)
 

@@ -35,6 +35,7 @@ def parse_args():
     parser.add_argument("--session-id", help="Required for remote host-local trace snapshots")
     parser.add_argument("--expected-prompt-tokens", type=int)
     parser.add_argument("--expected-copy-bytes", type=int)
+    parser.add_argument("--tp-size", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--model", default="mf-direct")
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--timeout", type=float, default=180)
@@ -102,10 +103,89 @@ def active_trace(records, since_ns):
     return [record for record in records if record["mono_ns"] >= since_ns]
 
 
-def verify_trace(records, since_ns):
+def worker_roster(records, tp_size):
+    roster = {}
+    for record in records:
+        if record["kind"] != "trace_installed":
+            continue
+        shard = record.get("worker_shard", 0)
+        assert record.get("tp_size", 1) == tp_size, "Worker TP size differs"
+        assert record.get("vllm_worker_id", shard) == shard, "vLLM rank differs from shard"
+        identity = (record.get("host_id"), record["pid"])
+        key = (record["role"], shard)
+        assert key not in roster or roster[key] == identity, "Duplicate worker for one shard"
+        roster[key] = identity
+    assert set(roster) == {(role, shard) for role in ("P", "D")
+                          for shard in range(tp_size)}, "Missing real P/D worker shard"
+    for role in ("P", "D"):
+        assert len({identity for (worker_role, _), identity in roster.items()
+                    if worker_role == role}) == tp_size, "One process cannot represent multiple TP shards"
+    for record in records:
+        if tp_size > 1:
+            assert all(field in record for field in ("worker_shard", "tp_size", "vllm_worker_id")), "Missing actual TP worker identity"
+        key = (record["role"], record.get("worker_shard", 0))
+        assert key in roster and roster[key] == (record.get("host_id"), record["pid"]), "Worker identity changed"
+        if record["kind"] == "bm_copy":
+            base = 1 if record["role"] == "P" else 1 + tp_size
+            if tp_size > 1:
+                assert "bm_rank" in record, "Missing actual BM rank"
+            # TP1 old traces already carry bm_rank; retain compatibility with
+            # standalone historical CPU trace fixtures that omitted it.
+            assert record.get("bm_rank", base) == base + key[1], "BM rank differs from real worker shard"
+    return roster
+
+
+def rank_copy_summary(records, since_ns, tp_size, role, direction):
+    worker_roster(records, tp_size)
+    active = active_trace(records, since_ns)
+    result = {}
+    for shard in range(tp_size):
+        copies = [record for record in active if record["kind"] == "bm_copy"
+                  and record["role"] == role and record.get("worker_shard", 0) == shard]
+        assert not any(record["phase"] == "error" for record in copies), "Rank transfer error"
+        assert all(record["direction"] == direction for record in copies), "Unexpected rank direction"
+        identity = lambda record: (record["local_ptr"], record["src"], record["dst"], record["bytes"])
+        begins = Counter(identity(record) for record in copies if record["phase"] == "begin")
+        done = [record for record in copies if record["phase"] == "complete"]
+        assert begins == Counter(identity(record) for record in done), "Rank copy still in flight"
+        assert done, "Worker shard completed no transfer"
+        result[str(shard)] = dict(copies=len(done), bytes=sum(record["bytes"] for record in done),
+                                  chunk_bytes=sorted({record["bytes"] for record in done}))
+    return result
+
+
+def verify_rank_counts(summary, chunks, total_bytes, tp_size):
+    assert set(summary) == {str(shard) for shard in range(tp_size)}, "Missing rank counters"
+    for item in summary.values():
+        assert item["copies"] == chunks, "Per-rank chunk count differs"
+        if total_bytes is not None:
+            assert total_bytes % tp_size == 0 and item["bytes"] == total_bytes // tp_size, "Per-rank bytes differ"
+            assert item["chunk_bytes"] == [total_bytes // tp_size // chunks], "Actual rank scratch/chunk bytes differ"
+
+
+def accept_store_receipt(receipts, payload, tp_size):
+    """Only a complete set of immutable real-rank receipts can open the gate."""
+    if (payload.get("event") != "request_store_finished"
+            or len(payload.get("request_ids_set", [])) != 1
+            or payload.get("world_size") != tp_size
+            or type(payload.get("kv_rank")) is not int
+            or not 0 <= payload["kv_rank"] < tp_size):
+        raise ValueError("Expected one request from a real TP worker shard")
+    shard = payload["kv_rank"]
+    for prior in receipts.values():
+        if prior["request_ids_set"] != payload["request_ids_set"]:
+            raise RuntimeError("Only one request is accepted")
+    if shard in receipts and receipts[shard] != payload:
+        raise RuntimeError("Conflicting immutable rank store receipt")
+    receipts[shard] = payload
+    return set(receipts) == set(range(tp_size))
+
+
+def verify_trace(records, since_ns, tp_size=1, expected_chunks=None, expected_bytes=None):
     """Check actual NPU pointers and completed copy/stage pairs, not API names."""
     installed = {r["role"] for r in records if r["kind"] == "trace_installed"}
     assert installed == {"P", "D"}, "Both real worker trace hooks must be active"
+    worker_roster(records, tp_size)
     scratch = {(r["role"], r["pid"], r["local_ptr"]): r for r in records
                if r["kind"] == "npu_scratch" and r["phase"] == "complete"}
     active = active_trace(records, since_ns)
@@ -219,10 +299,16 @@ def verify_trace(records, since_ns):
     native = [r for r in active if r["kind"] == "native_transfer"]
     assert len([r for r in native if r["phase"] == "begin"]) == len(
         [r for r in native if r["phase"] == "returned"]) >= len(gathers) + len(scatters)
+    per_rank = {}
+    for role, direction in (("P", "L2G"), ("D", "G2L")):
+        per_rank[role] = rank_copy_summary(records, since_ns, tp_size, role, direction)
+        chunks = expected_chunks if expected_chunks is not None else len(stores) // tp_size
+        verify_rank_counts(per_rank[role], chunks, expected_bytes, tp_size)
     return dict(p_l2g_copies=len(stores), d_g2l_copies=len(loads),
                 p_l2g_bytes=store_bytes, d_g2l_bytes=load_bytes,
                 p_gather_completions=len(gathers), d_scatter_completions=len(scatters),
                 actual_local_memory_type="npu", cpu_bm_copy_calls=0,
+                tp_size=tp_size, per_rank=per_rank,
                 boundary="Python/native-call trace; not a hardware DMA profiler")
 
 
@@ -250,7 +336,9 @@ def run(args):
                     "quarantined_slots")
         assert all(name in status for name in required), status
         assert status["transfer_ready"] and status["registration_ready"], status
-        assert status["storage_rank"] == 0 and status["world_size"] == 3, status
+        assert status["storage_rank"] == 0 and status["world_size"] == 1 + 2 * args.tp_size, status
+        if args.tp_size > 1:
+            assert status["tp_size"] == args.tp_size, status
         return status
 
     def check_http_status(status):
@@ -266,6 +354,7 @@ def run(args):
     trace_baseline = started_ns
     trace_hosts = {}
     causal_events = []
+    store_receipts = {}
 
     def read_traces(*, baseline=False):
         nonlocal trace_baseline
@@ -289,14 +378,22 @@ def run(args):
     async def on_store_finished(request: Request):
         async with gate_lock:
             payload = await request.json()
-            if (payload.get("event") != "request_store_finished"
-                    or len(payload.get("request_ids_set", [])) != 1
-                    or payload.get("world_size") != 1 or payload.get("kv_rank") != 0):
-                raise HTTPException(400, "Expected one TP1 store-finished request")
+            try:
+                all_receipts = accept_store_receipt(store_receipts, payload, args.tp_size)
+            except ValueError as error:
+                raise HTTPException(400, str(error)) from error
+            except RuntimeError as error:
+                raise HTTPException(409, str(error)) from error
+            save("p_store_receipts", store_receipts)
             if gate:
                 if payload["request_ids_set"][0] != gate["p_request_id"]:
                     raise HTTPException(409, "Only one request is accepted")
                 return gate["proxy_notification"]
+            # The upstream proxy wakes on ANY telemetry, without TP aggregation.
+            # Acknowledge early ranks locally; forward exactly once only after
+            # every distinct real shard completed and the pool gate below passes.
+            if not all_receipts:
+                return dict(notified=0, pending_worker_shards=sorted(set(range(args.tp_size)) - set(store_receipts)))
             save("p_store_event", payload)
             causal_events.append(dict(sequence=len(causal_events), event="p_store_finished_received",
                                       request_id=payload["request_ids_set"][0]))
@@ -323,9 +420,12 @@ def run(args):
                     assert not any(r["kind"] == "bm_copy" and r["role"] == "D"
                                    for r in active), "D transferred before the gate opened"
                     if args.require_direct_trace:
-                        assert any(r["kind"] == "bm_copy" and r["role"] == "P"
-                                   and r["direction"] == "L2G" and r["phase"] == "complete"
-                                   for r in active), "No actual P L2G completion"
+                        p_counts = rank_copy_summary(records, trace_baseline, args.tp_size, "P", "L2G")
+                        expected_chunks = (args.expected_prompt_tokens // args.chunk_size
+                                           if args.expected_prompt_tokens is not None
+                                           else p_counts["0"]["copies"])
+                        verify_rank_counts(p_counts, expected_chunks, args.expected_copy_bytes, args.tp_size)
+                        assert bm["objects"] == expected_chunks * args.tp_size, "Pool missing committed shards"
                     save("before_decode", dict(pool=bm, service=status,
                                                mono_ns=before_ns, trace=records))
                     causal_events.append(dict(sequence=len(causal_events), event="p_commits_confirmed",
@@ -333,6 +433,7 @@ def run(args):
                                               pending_writes=bm["pending_writes"]))
                     gate.update(p_request_id=payload["request_ids_set"][0],
                                 objects_before_d=bm["objects"],
+                                worker_shards=sorted(store_receipts),
                                 gate_open_mono_ns=before_ns)
                     print("MEMFABRIC_DIRECT_GATE_READY", json.dumps(gate), flush=True)
                     causal_events.append(dict(sequence=len(causal_events), event="release_d_notification_sent"))
@@ -399,7 +500,7 @@ def run(args):
             if args.expected_prompt_tokens is not None:
                 assert prompt_tokens == args.expected_prompt_tokens, (prompt_tokens, args.expected_prompt_tokens)
             chunks = prompt_tokens // args.chunk_size
-            assert gate["objects_before_d"] == chunks > 0
+            assert gate["objects_before_d"] == chunks * args.tp_size > 0
             def delta(role, name, label=None):
                 return metric(after[role], name, label) - metric(before[role], name, label)
 
@@ -455,9 +556,10 @@ def run(args):
             assert computed + external == prompt_tokens and prefix == 0
             records = read_traces()
             save("worker_trace", records)
-            trace_summary = verify_trace(records, trace_baseline) if args.require_direct_trace else None
+            trace_summary = verify_trace(records, trace_baseline, args.tp_size, chunks,
+                                         args.expected_copy_bytes) if args.require_direct_trace else None
             if trace_summary:
-                assert trace_summary["p_l2g_copies"] == trace_summary["d_g2l_copies"] == chunks
+                assert trace_summary["p_l2g_copies"] == trace_summary["d_g2l_copies"] == chunks * args.tp_size
                 if args.expected_copy_bytes is not None:
                     assert trace_summary["p_l2g_bytes"] == args.expected_copy_bytes, trace_summary
             summary = dict(
@@ -472,13 +574,15 @@ def run(args):
                 causal_gate_events=causal_events,
                 trace_time_domain="per_host_baselines" if args.p_trace_url else "local_host",
                 max_tokens=args.max_tokens,
+                tp_size=args.tp_size,
                 direct_path_without_trace="NOT_VERIFIED" if trace_summary is None else None,
                 note="Single-request gated correctness check; not a performance sample",
             )
             save("summary", summary)
             print("MEMFABRIC_DIRECT_PD_PASS", json.dumps(summary), flush=True)
     except Exception as exc:
-        save("failure", dict(error=repr(exc), gate=gate))
+        save("failure", dict(error=repr(exc), gate=gate, worker_store_receipts=store_receipts,
+                             missing_worker_shards=sorted(set(range(args.tp_size)) - set(store_receipts))))
         raise
     finally:
         server.should_exit = True
