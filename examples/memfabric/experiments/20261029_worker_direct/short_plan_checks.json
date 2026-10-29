@@ -1,0 +1,18 @@
+{
+  "status": "PASS",
+  "evidence_class": "CPU syntax and plan only; no dataset generation or NPU execution",
+  "checks": {
+    "A_default_plan_matches_private": true,
+    "A_short_all_bench_outputs_8": true,
+    "A_short_warmup_8": true,
+    "B_default_plan_matches_private": true,
+    "B_short_all_bench_outputs_8": true,
+    "B_short_warmup_8": true,
+    "C_default_plan_matches_private": true,
+    "C_short_all_bench_outputs_8": true,
+    "C_short_warmup_8": true,
+    "run_backend.py_syntax": true,
+    "prepare_short.py_syntax": true,
+    "prepare_short_plan_only": true
+  }
+}

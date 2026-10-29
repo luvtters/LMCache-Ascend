@@ -1,0 +1,41 @@
+{
+  "scope": "archive CPU checks only",
+  "npu_initialized": false,
+  "syntax_files": [
+    "bench_d.py",
+    "check_counted_direct_connector.py",
+    "check_diagnostic_direct_connector.py",
+    "control.py",
+    "counted_direct_connector.py",
+    "diagnostic_direct_connector.py",
+    "pool_cases.py",
+    "prepare_long.py",
+    "prepare_multi.py",
+    "run_backend.py",
+    "seed_check.py",
+    "service_entry.py",
+    "supervisor.py"
+  ],
+  "default_plans": [
+    "control.py",
+    "run_backend.py",
+    "prepare_multi.py",
+    "prepare_long.py",
+    "seed_check.py",
+    "bench_d.py",
+    "pool_cases.py"
+  ],
+  "counter_checks": {
+    "check_counted_direct_connector.py": {
+      "status": "PASS",
+      "evidence": "CPU fakes only"
+    },
+    "check_diagnostic_direct_connector.py": {
+      "status": "PASS",
+      "evidence": "CPU only; actual Future class AST"
+    }
+  },
+  "results_status": "NOT_FINISHED",
+  "path_parameterization_plan_equal_cases": 7,
+  "status": "PASS"
+}

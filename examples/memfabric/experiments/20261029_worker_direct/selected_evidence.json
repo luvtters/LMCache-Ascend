@@ -1,0 +1,257 @@
+{
+  "status": "PARTIAL_COMPLETION",
+  "date_beijing": "2026-10-29",
+  "source_core": "8bc9edc",
+  "source_ascend": "7e5d40a",
+  "compatibility_base_unchanged": "525a710",
+  "scope": "One exploratory deployment per backend, preseeded D-only, TP1 BF16; not a repeated production benchmark",
+  "exploratory_c1": [
+    {
+      "backend": "A",
+      "requests": 32,
+      "input_tokens": 1373,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "mean_ttft_ms": 158.90840292559005,
+      "mean_tpot_ms": 46.46840360745289,
+      "output_tokens_per_second": 21.119735472011268,
+      "execution_begin_beijing": "2026-10-29T02:08:12.875727+08:00",
+      "execution_end_beijing": "2026-10-29T02:11:39.434388+08:00",
+      "prompt_sources": {
+        "external_kv_transfer": 0.0,
+        "local_cache_hit": 0.0,
+        "local_compute": 43936.0
+      },
+      "completed_read_bytes": null,
+      "completed_write_bytes": null,
+      "counter_source": "not_observed",
+      "pool_gib": null,
+      "slot_mib": null,
+      "controlled_exit_contract": {
+        "service": {
+          "returncode": 130,
+          "child_exit_observed": true,
+          "normal_exit": false,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "service_sigint_cli_130"
+        },
+        "p": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        },
+        "d": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        },
+        "proxy": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        }
+      },
+      "window_checks_passed": true,
+      "subsequent_other_window_in_same_deployment_failed": false
+    },
+    {
+      "backend": "B",
+      "requests": 32,
+      "input_tokens": 1373,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "mean_ttft_ms": 128.9980476431083,
+      "mean_tpot_ms": 45.451137507893506,
+      "output_tokens_per_second": 21.68907974036728,
+      "execution_begin_beijing": "2026-10-29T02:00:48.950502+08:00",
+      "execution_end_beijing": "2026-10-29T02:04:10.863792+08:00",
+      "prompt_sources": {
+        "external_kv_transfer": 40960.0,
+        "local_cache_hit": 0.0,
+        "local_compute": 2976.0
+      },
+      "completed_read_bytes": 6039797760,
+      "completed_write_bytes": 0,
+      "counter_source": "l2_adapter_completed_load_bytes",
+      "pool_gib": 1,
+      "slot_mib": 32,
+      "controlled_exit_contract": {
+        "service": {
+          "returncode": 130,
+          "child_exit_observed": true,
+          "normal_exit": false,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "service_sigint_cli_130"
+        },
+        "member": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": false,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        },
+        "p": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        },
+        "d": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        },
+        "proxy": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        }
+      },
+      "window_checks_passed": true,
+      "subsequent_other_window_in_same_deployment_failed": true
+    },
+    {
+      "backend": "C",
+      "requests": 32,
+      "input_tokens": 1373,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "mean_ttft_ms": 121.46771504194476,
+      "mean_tpot_ms": 44.81263980879009,
+      "output_tokens_per_second": 22.01972611765745,
+      "execution_begin_beijing": "2026-10-29T01:51:24.690635+08:00",
+      "execution_end_beijing": "2026-10-29T01:54:44.054430+08:00",
+      "prompt_sources": {
+        "external_kv_transfer": 40960.0,
+        "local_cache_hit": 0.0,
+        "local_compute": 2976.0
+      },
+      "completed_read_bytes": 6039797760,
+      "completed_write_bytes": 0,
+      "counter_source": "worker_completed_bm_copy_counters",
+      "pool_gib": 1,
+      "slot_mib": 32,
+      "controlled_exit_contract": {
+        "service": {
+          "returncode": 130,
+          "child_exit_observed": true,
+          "normal_exit": false,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "service_sigint_cli_130"
+        },
+        "p": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        },
+        "d": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        },
+        "proxy": {
+          "returncode": 0,
+          "child_exit_observed": true,
+          "normal_exit": true,
+          "runner_sigint_observed": true,
+          "expected_controlled_exit": true,
+          "classification": "normal_zero"
+        }
+      },
+      "window_checks_passed": true,
+      "subsequent_other_window_in_same_deployment_failed": false
+    }
+  ],
+  "direct_gate": {
+    "status": "DIRECT_POOL_PATH_PASS",
+    "prompt_tokens": 1373,
+    "d_external_tokens": 1280.0,
+    "d_computed_tokens": 93.0,
+    "d_local_prefix_tokens": 0.0,
+    "pool_objects_before_d": 10,
+    "answer": "ORCHID",
+    "final_pool_pins": 0,
+    "manual_l1_clear": false,
+    "pool_observation_transport": "http_status",
+    "direct_trace": {
+      "p_l2g_copies": 10,
+      "d_g2l_copies": 10,
+      "p_l2g_bytes": 188743680,
+      "d_g2l_bytes": 188743680,
+      "p_gather_completions": 10,
+      "d_scatter_completions": 10,
+      "actual_local_memory_type": "npu",
+      "cpu_bm_copy_calls": 0,
+      "boundary": "Python/native-call trace; not a hardware DMA profiler"
+    },
+    "direct_path_without_trace": null,
+    "note": "Single-request gated correctness check; not a performance sample"
+  },
+  "synthetic_nonzero_skip_status": {
+    "p": "PASS",
+    "d": "PASS"
+  },
+  "sampling": {
+    "windows_including_pilot": 30,
+    "window_admission_pass": 29,
+    "window_admission_fail": 1,
+    "completed_requests_including_pilot": 932,
+    "repeated_primary_comparison_completed": false,
+    "short_output_executed": false
+  },
+  "shutdown": {
+    "timed_deployments_observed": 17,
+    "all_observed_contracts_passed": true,
+    "service_sigint_returncode": 130,
+    "service_130_is_not_zero": true,
+    "historical_sigkill_root_cause_resolved": false
+  },
+  "release": {
+    "container_stopped_beijing": "2026-10-29T05:40:30.434160+08:00",
+    "deadline_guard_returncode": 0,
+    "independently_checked_stopped_after_window": true,
+    "container_exit_code_is_separate_from_service_exit": true
+  },
+  "not_executed": [
+    "two-slot NPU capacity and eviction",
+    "mixed P write and D read requests",
+    "HTTP request cancellation",
+    "worker RPC timing diagnostic",
+    "peer-left metadata rejection probe",
+    "output-8 benchmark"
+  ],
+  "boundary": [
+    "No physical HCCS-byte profiling",
+    "No cross-server or TP>1 claim",
+    "Early monitoring did not establish continuous whole-machine exclusivity",
+    "Repeated external launches contaminated later windows; raw admission flags were not rewritten",
+    "Old matrix was deliberately stopped after its current group; the replacement did not start"
+  ]
+}

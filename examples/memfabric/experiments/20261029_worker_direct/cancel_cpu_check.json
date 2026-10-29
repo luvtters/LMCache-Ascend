@@ -1,0 +1,19 @@
+{
+  "status": "PASS",
+  "checks": {
+    "known_idle": true,
+    "missing_request_gauges_unknown": true,
+    "missing_rpc_gauges_unknown": true,
+    "active_copy_not_idle": true,
+    "actual_bytes_not_token_estimate": true,
+    "no_native_errors": true,
+    "abort_and_generation_deltas": true,
+    "counter_reset_not_accepted": true,
+    "native_failure_observed": true,
+    "metric_labels_and_nan": true,
+    "real_loopback_connection_close": true,
+    "headers_only_http_200": true,
+    "literal_payload_and_close_timing": true
+  },
+  "boundary": "CPU parser and local-loopback transport only; no inference or NPU validation"
+}

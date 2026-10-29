@@ -1,0 +1,18 @@
+{
+  "status": "PASS",
+  "checks": {
+    "six_distinct_first_chunks": true,
+    "new_prompts_not_old": true,
+    "exact_mixed_window_passes": true,
+    "wrong_bytes_rejected": true,
+    "unknown_producer_rpc_not_idle": true,
+    "producer_counter_reset_rejected": true,
+    "eviction_rejected": true,
+    "inflight_not_idle": true,
+    "barrier_two_writes_eight_reads": true,
+    "actual_client_interval_overlap": true,
+    "no_dma_overlap_claim": true,
+    "no_device_modules_imported": true
+  },
+  "boundary": "CPU fake tokenizer, counters and barrier only; no HTTP/NPU/model verification"
+}
