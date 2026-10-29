@@ -4,6 +4,7 @@ Run with the matching, independently supervised pool_member.py on the other host
 The outer supervisor must retain this process's actual wait result.
 """
 import argparse
+import ctypes
 import importlib
 import json
 import os
@@ -24,8 +25,14 @@ def run(cfg):
     for path in (cfg["core_path"], cfg["ascend_path"]):
         sys.path.insert(0, path)
     import torch
+    import torch_npu  # noqa: F401
+    # LMCache selects its platform at first import. Match the successful
+    # shared-L1 diagnostic's ordering and establish this thread's ACL device.
+    torch.npu.set_device(cfg["driver_bm_device"])
     from lmcache.v1.distributed.api import ObjectKey
     from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata, TensorMemoryObj
+    from lmcache.v1.platform import current_device_spec
+    from lmcache.v1.platform.torch_ops import mem_alloc
     from lmcache_ascend.v1.distributed.memfabric_l2_adapter import MemFabricL2Adapter
 
     events = (out / "events.jsonl").open("x", encoding="utf-8", buffering=1)
@@ -45,6 +52,21 @@ def run(cfg):
 
     adapter = None
     try:
+        logical = torch.npu.current_device()
+        acl = ctypes.CDLL("libascendcl.so")
+        acl.aclrtGetPhyDevIdByLogicDevId.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        acl.aclrtGetPhyDevIdByLogicDevId.restype = ctypes.c_int
+        physical = ctypes.c_int(-1)
+        rc = acl.aclrtGetPhyDevIdByLogicDevId(logical, ctypes.byref(physical))
+        selection = dict(visible_devices=os.environ["ASCEND_RT_VISIBLE_DEVICES"],
+                         logical_device=logical, physical_query_returncode=rc,
+                         physical_device=physical.value, lmcache_device_type=current_device_spec.device_type,
+                         lmcache_device_spec=type(current_device_spec).__module__ + "." + type(current_device_spec).__name__)
+        write_json(out / "device_selection.json", selection)
+        emit("DEVICE_SELECTION", **selection)
+        assert logical == cfg["driver_bm_device"] and rc == 0, selection
+        assert physical.value == cfg["driver_devices"][logical], selection
+        assert current_device_spec.device_type == "npu", selection
         emit("initializing", store_url=cfg["store_url"], bm_rank=0, storage_rank=1)
         adapter = MemFabricL2Adapter(adapter_config(cfg, driver=True)["adapter_params"])
         write_json(out / "loaded_modules.json", {name: importlib.import_module(name).__file__
@@ -97,6 +119,22 @@ def run(cfg):
         expected = torch.arange(size, dtype=torch.int32).remainder_(251).to(torch.uint8)
         source = memory(expected.clone())
         target = memory(torch.zeros(size, dtype=torch.uint8))
+        # These are raw diagnostics, not claims that absence from one registry
+        # proves absence of all possible native registrations.
+        backend = getattr(current_device_spec, "_pin_backend_cache", None)
+        allocation = dict(memory_kind="torch", shared_l1=False,
+            allocator="torch CPU tensor; TensorMemoryObj parent_allocator=None",
+            pinned_ptr_registry=dict(getattr(mem_alloc, "_pinned_ptr_registry", {})),
+            pin_backend_class=None if backend is None else type(backend).__module__ + "." + type(backend).__name__,
+            pin_backend_registered_bases=dict(getattr(backend, "_registered_bases", {})),
+            objects=[dict(role=role, address=obj.data_ptr, bytes=obj.get_size(),
+                          format=str(obj.get_memory_format()), shapes=[list(s) for s in obj.get_shapes()],
+                          dtypes=[str(t) for t in obj.get_dtypes()],
+                          torch_is_pinned=bool(obj.raw_tensor.is_pinned()),
+                          parent_allocator=None if obj.parent_allocator is None else type(obj.parent_allocator).__name__)
+                     for role, obj in (("source", source), ("target", target))])
+        write_json(out / "allocation_query.json", allocation)
+        emit("ALLOCATION_QUERY", **allocation)
         key = ObjectKey(bytes(range(32)), "cross-host-" + cfg["run_id"], 0)
         torch.save(expected, out / "expected.pt")
         result = submit("store", [key], [source])

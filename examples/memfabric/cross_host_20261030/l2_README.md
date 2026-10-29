@@ -30,6 +30,8 @@
 
 无模型 rank0：`python -u l2_driver.py --config run.json`。远端同时启动冻结版 `examples/memfabric/pool_member.py --device 0 --rank 1 --world-size 2 --pool-gb 1 --store-url tcp://192.168.0.223:28580`。两端紧邻发起，不要等 member READY 后才启动 rank0。driver 通过真实 adapter/store/lookup/load/unlock/delete；18 MiB 全内容比对，同时留存 `expected.pt`、`actual.pt`、差异、原始 status、STORE/LOAD 与 wait/close 日志。外部控制器必须真实 wait 两端，脚本内功能 PASS 不等于生命周期通过。
 
+driver 在首次导入 LMCache 前显式加载 torch_npu 并选择本轮逻辑设备，保存 ACL 物理映射与 LMCache 平台选择。此入口保持普通 torch CPU 缓冲；`allocation_query.json` 原样查询 MemoryObj 格式/地址/大小、torch pin 查询和当前分配器注册表，不把单张注册表的缺项解释为所有原生注册均不存在。真实 shared-L1 对照复用已验 `l2_api_bench.py --memory-kind shared`，不在此复制另一套分配实现。正对照可将外部 member 放到同机另一获准 GPU；仍使用新 BM 组和结果目录。
+
 模型计划：`python l2_model.py --config model-run.json --plan-only`。实际执行去掉 `--plan-only`，外部控制器同时启动同一组远端 member。supervisor 前台启动 service、P、D、原 proxy、严格 gate，最后逐角色停止并真实 wait；`processes.json` 原样记录返回码和发送信号，不把 SIGABRT/SIGKILL 改为正常退出。无自动重启。`l2_model.py --role service` 也是独立角色 CLI，但通常由 supervisor 调用。
 
 请求 gate 的退出码单独保留为 `gate_exit`。任一角色异常退出、清理强杀或未完成 wait 都写入 `lifecycle_errors`，使 supervisor 非零退出；本轮发送 SIGINT 后收到 130/-2 单列为受控退出，不称自然退出 0。默认每角色 `stop_timeout=18` 秒，全部角色共享 `shutdown_timeout=90` 秒上限（均不能配置超过 90）；外部 hostcontroller 给 supervisor 至少 120 秒 grace，不能 30 秒便强杀父进程。全部角色各自进程组的 wait 和发送信号原样归档；远端 member 的退出另行核验。
