@@ -40,7 +40,9 @@ def command(argv, cwd):
                 script = cwd / script
             if not script.is_file():
                 raise ValueError("Missing script: " + token)
-    return [str(executable.resolve()) if executable.is_file() else shutil.which(argv[0]), *argv[1:]]
+    # Keep a venv's Python symlink as the entrypoint. Resolving it to the base
+    # interpreter silently drops that venv's package search path.
+    return [str(executable.absolute()) if executable.is_file() else shutil.which(argv[0]), *argv[1:]]
 
 
 def validate(path):
