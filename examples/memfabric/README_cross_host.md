@@ -1,5 +1,15 @@
 # Cross-host worker-direct role contract
 
+The independent HBM candidate accepts `--pool-memory-type device` for inference
+roles only. Use the same option on service/P/D and all helper role plans. Objects
+select the SDK DEVICE pool; every BM rank still declares **1 GiB DRAM plus
+pool_gb GiB HBM**, matching the verified media probe. This is not a pure-HBM
+allocation and does not repair or validate the failed cross-host HOST DRAM route.
+Default `host` retains the existing DRAM-only behavior. Status reports the
+selected medium and both per-rank declarations. Physical device lists remain
+explicitly overridable; no new allocation, reservation or hardware permission is
+implied by a generated role plan.
+
 These are experiment-only launchers for fixed core `8bc9edc` and Ascend baseline
 `7e5d40a` plus the current cross-host changes. CPU checks do not validate RPC,
 MemFabric, NPU, SDMA reachability, inference, or native shutdown.

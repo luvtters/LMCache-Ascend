@@ -13,7 +13,9 @@ class BMSession:
     _active = False
 
     def __init__(self, *, device_id, rank_id, world_size, pool_gb, store_url,
-                 init_timeout=90):
+                 init_timeout=90, pool_memory_type="host"):
+        if pool_memory_type not in ("host", "device"):
+            raise ValueError("pool_memory_type must be host or device")
         if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
             raise ValueError("BM init_timeout must be an integer in [1, 3600] seconds")
         if not (0 <= rank_id < world_size and device_id >= 0 and pool_gb >= 1):
@@ -28,6 +30,11 @@ class BMSession:
             BMSession._active = True
         self.thread_id = threading.get_ident()
         self.rank_id = rank_id
+        self.pool_memory_type = pool_memory_type
+        # The first device-pool candidate deliberately preserves the 1 GiB
+        # DRAM contribution used by the verified media probe on every rank.
+        self.local_dram_bytes = (pool_gb if pool_memory_type == "host" else 1) << 30
+        self.local_hbm_bytes = (pool_gb << 30) if pool_memory_type == "device" else 0
         self.departed_rank = None
         self.peer_departed = threading.Event()
         self.handle = None
@@ -55,9 +62,11 @@ class BMSession:
             self.check(bm.initialize(store_url, world_size, device_id, config),
                        "bm.initialize")
             self.initialized = True
-            self.handle = bm.create2(id=0, local_dram_size=pool_gb << 30,
-                                     max_dram_size=pool_gb << 30,
-                                     data_op_type=bm.BmDataOpType.SDMA)
+            memory = (dict(local_dram_size=self.local_dram_bytes, max_dram_size=self.local_dram_bytes)
+                      if pool_memory_type == "host" else
+                      dict(local_dram_size=self.local_dram_bytes, max_dram_size=self.local_dram_bytes,
+                           local_hbm_size=self.local_hbm_bytes, max_hbm_size=self.local_hbm_bytes))
+            self.handle = bm.create2(id=0, data_op_type=bm.BmDataOpType.SDMA, **memory)
             if self.handle is None:
                 raise RuntimeError("BM returned an empty handle")
             self.handle.set_group_event_handler(self._on_group_event)
@@ -74,7 +83,7 @@ class BMSession:
                        for peer in range(world_size) if peer != rank_id):
                     break
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("BM peer DRAM mappings did not become ready")
+                    raise TimeoutError(f"BM peer {self.pool_memory_type} pool mappings did not become ready")
                 self.peer_departed.wait(0.1)
             if self.peer_departed.is_set():
                 raise RuntimeError("BM peer left while the fixed group was joining")
@@ -100,9 +109,11 @@ class BMSession:
 
     def peer_address(self, rank):
         self._check_thread()
-        address = self.handle.peer_rank_ptr(rank, self.bm.BmMemType.HOST)
+        memory_type = (self.bm.BmMemType.HOST if self.pool_memory_type == "host"
+                       else self.bm.BmMemType.DEVICE)
+        address = self.handle.peer_rank_ptr(rank, memory_type)
         if not address:
-            raise RuntimeError(f"No DRAM mapping for BM rank {rank}")
+            raise RuntimeError(f"No {self.pool_memory_type} pool mapping for BM rank {rank}")
         return address
 
     def copy(self, src, dst, size, *, store):

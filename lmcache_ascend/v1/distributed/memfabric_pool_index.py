@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Volatile metadata for a fixed BM DRAM pool; never owns KV payloads.
+"""Volatile metadata for a fixed BM pool; never owns KV payloads.
 
 No expiry reclaims reservations or pins: only an explicit DMA completion may
 make their slots reusable. A fixed-group failure requires a coordinated restart.
@@ -21,7 +21,10 @@ class _Entry:
 
 class PoolIndex:
     def __init__(self, *, pool_bytes, slot_size, storage_rank, world_size,
-                 ready=True, tp_size=1):
+                 ready=True, tp_size=1, pool_memory_type="host"):
+        if pool_memory_type not in ("host", "device"):
+            raise ValueError("pool_memory_type must be host or device")
+        self.pool_memory_type = pool_memory_type
         values = (pool_bytes, slot_size, storage_rank, world_size)
         if (any(type(v) is not int for v in values) or pool_bytes <= 0
                 or slot_size <= 0 or pool_bytes % slot_size
@@ -89,8 +92,11 @@ class PoolIndex:
             self._ready = False
             return self.status()
 
-    def register(self, *, rank, member_id, shard=0, tp_size=1, layout=None, size=None):
+    def register(self, *, rank, member_id, shard=0, tp_size=1, layout=None, size=None,
+                 pool_memory_type="host"):
         self._shard(shard, tp_size)
+        if pool_memory_type != self.pool_memory_type:
+            raise ValueError("Worker and service pool memory types differ")
         with self._lock:
             if self._closed or self._error:
                 self._available()
@@ -118,6 +124,7 @@ class PoolIndex:
         return dict(epoch=self.epoch, slot=slot, generation=self._generation[slot],
                     key=key, shard=shard, tp_size=tp_size, size=size,
                     offset=slot * self.slot_size, storage_rank=self.storage_rank,
+                    pool_memory_type=self.pool_memory_type,
                     layout=deepcopy(layout))
 
     def prepare_store(self, *, epoch, rank, member_id, key, size, layout=None,
@@ -276,6 +283,10 @@ class PoolIndex:
                         transfer_ready=self._ready and not self._closed and not self._error,
                         closed=self._closed, last_error=self._error, protocol="SDMA",
                         storage_rank=self.storage_rank, world_size=self.world_size,
+                        pool_memory_type=self.pool_memory_type,
+                        pool_selected_sdk_memory_type="HOST" if self.pool_memory_type == "host" else "DEVICE",
+                        bm_declared_local_dram_bytes=self.pool_bytes if self.pool_memory_type == "host" else 1 << 30,
+                        bm_declared_local_hbm_bytes=0 if self.pool_memory_type == "host" else self.pool_bytes,
                         tp_size=self.tp_size, layout=deepcopy(self._layout), direct_chunk_bytes=self._chunk_size,
                         pool_bytes=self.pool_bytes, slot_size=self.slot_size,
                         objects=len(self._entries), free_slots=len(self._free),

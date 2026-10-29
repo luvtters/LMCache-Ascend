@@ -22,6 +22,11 @@ def build_plan(args):
     case = root / 'runs' / args.session_id
     mapping = TOPOLOGIES[args.topology]
     tp_size = args.tp_size
+    pool_memory_type = getattr(args, 'pool_memory_type', 'host')
+    if pool_memory_type not in ('host', 'device'):
+        raise ValueError('pool_memory_type must be host or device')
+    if args.stage != 'inference' and pool_memory_type != 'host':
+        raise ValueError('Device-selected pool is an inference candidate; primitive/context roles remain host')
     if args.stage == 'inference' and tp_size > 1 and args.pool_gb * (1 << 30) < (1373 // 128) * tp_size * (32 << 20):
         raise ValueError('Pool capacity cannot hold this frozen TP prefix with 32 MiB slots')
     pool_host = mapping['service'][0]
@@ -65,6 +70,8 @@ def build_plan(args):
         rank['d'] = 1 + tp_size
     bm = dict(device_id=0, rank_id=rank.get(args.role, 0), world_size=1 + 2 * tp_size,
               pool_gb=args.pool_gb, init_timeout=300, store_url=f'tcp://{owner}:28695')
+    if pool_memory_type == 'device':
+        bm['pool_memory_type'] = 'device'
     env = dict(PYTHONPATH=f'{examples}:{ascend}:{core}', OMP_NUM_THREADS='1',
                LD_LIBRARY_PATH=str(ascend / 'lmcache_ascend'),
                TOKENIZERS_PARALLELISM='false', VLLM_WORKER_MULTIPROC_METHOD='spawn',
@@ -141,6 +148,7 @@ def build_plan(args):
                 '--session-id', args.session_id, '--require-direct-trace',
                 '--tp-size', str(tp_size),
                 '--expected-prompt-tokens', '1373', '--expected-copy-bytes', str(180 << 20),
+                '--expected-pool-memory-type', pool_memory_type,
                 '--max-tokens', '8', '--timeout', '360', '--output', str(case / 'gate')]
     else:
         argv = [python, '-u', str(examples / 'direct_coordination.py'), '--bind', ip,
@@ -150,6 +158,9 @@ def build_plan(args):
     return dict(status='PLAN_ONLY', host=host, ip=ip, role=args.role, topology=args.topology,
                 comparison_scope='single_host_positive_control' if args.topology == 'T0' else 'cross_host',
                 stage=args.stage, session_id=args.session_id, cwd=str(ascend), argv=argv,
+                pool_memory_type=pool_memory_type,
+                declared_dram_bytes_per_rank=(args.pool_gb if pool_memory_type == 'host' else 1) << 30,
+                declared_hbm_bytes_per_rank=(args.pool_gb << 30) if pool_memory_type == 'device' else 0,
                 env=env, config=config, physical_device=device, logical_device=0 if device is not None else None,
                 physical_devices=physical_devices, tp_size=tp_size,
                 logical_devices=(list(range(tp_size)) if args.role in ('p', 'd')
@@ -180,6 +191,8 @@ def main():
     parser.add_argument('--session-id', required=True)
     parser.add_argument('--model', default='/workspace/d00896497/models/Qwen3-8B')
     parser.add_argument('--pool-gb', type=int, default=1)
+    parser.add_argument('--pool-memory-type', choices=('host', 'device'), default='host',
+                        help='Selected object pool; device also declares 1 GiB DRAM per rank')
     parser.add_argument('--tp-size', type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument('--p-devices', type=lambda value: [int(v) for v in value.split(',')])
     parser.add_argument('--d-devices', type=lambda value: [int(v) for v in value.split(',')])

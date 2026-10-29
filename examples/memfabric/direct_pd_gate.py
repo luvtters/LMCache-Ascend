@@ -35,6 +35,7 @@ def parse_args():
     parser.add_argument("--session-id", help="Required for remote host-local trace snapshots")
     parser.add_argument("--expected-prompt-tokens", type=int)
     parser.add_argument("--expected-copy-bytes", type=int)
+    parser.add_argument("--expected-pool-memory-type", choices=("host", "device"), default="host")
     parser.add_argument("--tp-size", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--model", default="mf-direct")
     parser.add_argument("--chunk-size", type=int, default=128)
@@ -337,6 +338,7 @@ def run(args):
         assert all(name in status for name in required), status
         assert status["transfer_ready"] and status["registration_ready"], status
         assert status["storage_rank"] == 0 and status["world_size"] == 1 + 2 * args.tp_size, status
+        assert status.get("pool_memory_type", "host") == args.expected_pool_memory_type, "Unexpected pool medium"
         if args.tp_size > 1:
             assert status["tp_size"] == args.tp_size, status
         return status
@@ -575,6 +577,10 @@ def run(args):
                 trace_time_domain="per_host_baselines" if args.p_trace_url else "local_host",
                 max_tokens=args.max_tokens,
                 tp_size=args.tp_size,
+                pool_memory_type=bm.get("pool_memory_type", "host"),
+                pool_selected_sdk_memory_type=bm.get("pool_selected_sdk_memory_type", "HOST"),
+                bm_declared_local_dram_bytes=bm.get("bm_declared_local_dram_bytes"),
+                bm_declared_local_hbm_bytes=bm.get("bm_declared_local_hbm_bytes"),
                 direct_path_without_trace="NOT_VERIFIED" if trace_summary is None else None,
                 note="Single-request gated correctness check; not a performance sample",
             )

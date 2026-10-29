@@ -104,6 +104,9 @@ class MemFabricDirectTransferContext(TransferContext):
         self.control = _Control(req_client, mq_timeout)
         self.tokens_per_chunk = tokens_per_chunk
         self.config = dict(extra_config.get("lmcache.mp.direct", {}))
+        self.pool_memory_type = self.config.get("pool_memory_type", "host")
+        if self.pool_memory_type not in ("host", "device"):
+            raise ValueError("pool_memory_type must be host or device")
         self.member_id = self.config.pop("member_id", f"worker-{instance_id}")
         self.tp_size = getattr(parallel_strategy, "tp_size", 1)
         self.shard = getattr(parallel_strategy, "kv_worker_id", 0)
@@ -167,7 +170,7 @@ class MemFabricDirectTransferContext(TransferContext):
         if lmcache_chunk_tokens not in (None, self.tokens_per_chunk):
             raise ValueError("Direct chunk token count differs from adapter")
         required = {"device_id", "rank_id", "world_size", "pool_gb", "store_url"}
-        if not required <= set(self.config) or set(self.config) - required - {"init_timeout"}:
+        if not required <= set(self.config) or set(self.config) - required - {"init_timeout", "pool_memory_type"}:
             raise ValueError(f"Direct BM config requires {sorted(required)} and optional init_timeout")
         init_timeout = self.config.get("init_timeout", 90)
         if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
@@ -195,7 +198,8 @@ class MemFabricDirectTransferContext(TransferContext):
         try:
             registration = {
                 "rank": self.config["rank_id"], "member_id": self.member_id,
-                "shard": self.shard, "tp_size": self.tp_size}
+                "shard": self.shard, "tp_size": self.tp_size,
+                "pool_memory_type": self.pool_memory_type}
             if self.tp_size > 1:
                 registration.update(layout=self.transfer.layout, size=self.transfer.size)
             self.registration = self.control.call("register", registration)
@@ -230,6 +234,7 @@ class MemFabricDirectTransferContext(TransferContext):
         expected = self.registration
         if (descriptor["epoch"] != expected["epoch"]
                 or descriptor["storage_rank"] != expected["storage_rank"]
+                or descriptor.get("pool_memory_type", "host") != self.pool_memory_type
                 or descriptor["key"] != key or descriptor["shard"] != self.shard
                 or descriptor["tp_size"] != self.tp_size or descriptor["size"] != self.transfer.size
                 or descriptor.get("layout") != self.transfer.layout

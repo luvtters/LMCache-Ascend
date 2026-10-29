@@ -5,6 +5,8 @@ Configure via --server-module with this module_path and explicit config fields:
 device_id, rank_id (storage rank), world_size, pool_gb, slot_size_mb, store_url.
 Optional init_timeout extends BM startup/join waiting for cold-loading workers;
 it defaults to 90 seconds and does not change copy-operation timeouts.
+Optional pool_memory_type is host (default) or device (HBM pool); all BM ranks
+must use the same medium and per-rank contribution size.
 Only metadata crosses the JSON control interface. The BM pool owns payloads;
 the server's CPU L1 allocator is never used by this module.
 """
@@ -27,7 +29,7 @@ class MemFabricDirectServerModule(DiscoverableModule):
 
     def __init__(self, context, config, *, session_factory=None):
         fields = {"device_id", "rank_id", "world_size", "pool_gb", "slot_size_mb", "store_url"}
-        if not fields <= set(config) or set(config) - fields - {"init_timeout", "tp_size"}:
+        if not fields <= set(config) or set(config) - fields - {"init_timeout", "tp_size", "pool_memory_type"}:
             raise ValueError("MemFabric direct config requires %s and optional init_timeout" % sorted(fields))
         init_timeout = config.get("init_timeout", 90)
         if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
@@ -43,7 +45,8 @@ class MemFabricDirectServerModule(DiscoverableModule):
                                 slot_size=config["slot_size_mb"] << 20,
                                 storage_rank=config["rank_id"],
                                 world_size=config["world_size"], ready=False,
-                                tp_size=config.get("tp_size", 1))
+                                tp_size=config.get("tp_size", 1),
+                                pool_memory_type=config.get("pool_memory_type", "host"))
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._owner_thread = threading.Thread(target=self._run_pool,
@@ -66,6 +69,8 @@ class MemFabricDirectServerModule(DiscoverableModule):
                 session_factory = BMSession
             config = self._config
             optional = {"init_timeout": config["init_timeout"]} if "init_timeout" in config else {}
+            if "pool_memory_type" in config:
+                optional["pool_memory_type"] = config["pool_memory_type"]
             session = session_factory(device_id=config["device_id"],
                                       rank_id=config["rank_id"],
                                       world_size=config["world_size"],
