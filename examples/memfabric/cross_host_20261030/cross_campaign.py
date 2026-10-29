@@ -192,7 +192,7 @@ def l2_case(ident, kind, reverse, tp, evidence, member_host=None, member_device=
         cleanup(reversed(started),evidence,lambda i:120 if i==driver else 20)
 
 
-def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_devices=None, d_devices=None, pool_device=None, pool_memory_type='host', skip_blocks=0):
+def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_devices=None, d_devices=None, pool_device=None, pool_memory_type='host', skip_blocks=0, followup_argv=None):
     role_root=Path(role_root) if role_root else ROOT if tp==1 else ROOT/'tp_candidate'
     runner=role_root/'src/ascend_direct/examples/memfabric/cross_host_role.py'
     spec=importlib.util.spec_from_file_location('role_'+ident,runner)
@@ -234,13 +234,17 @@ def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_d
         if stage=='inference':
             result=wait('137',ident+'-gate',600,evidence)
             if result['returncode']!=0: raise RuntimeError('Direct gate failed')
+            if followup_argv:
+                start('137',ident+'-followups',followup_argv,active=active,evidence=evidence)
+                followup=wait('137',ident+'-followups',600,evidence)
+                if followup['returncode']!=0:raise RuntimeError('Direct follow-up cases failed')
         else:
             for role in ('p','d'):
                 result=wait(plans[role]['host'],ident+'-'+role,420,evidence)
                 if result['returncode']!=0: raise RuntimeError('Direct '+role+' failed')
         function_result=dict(function='PASSED',lifecycle='CONTROLLED_WAIT_CODES_RECORDED')
     finally:
-        priority={'gate':0,'proxy':1,'d':2,'p':3,'service':4,'trace137':5,'trace12':5,'coordinator':5}
+        priority={'gate':0,'followups':0,'proxy':1,'d':2,'p':3,'service':4,'trace137':5,'trace12':5,'coordinator':5}
         cleanup(sorted(active,key=lambda pair:priority[pair[1].removeprefix(ident+'-')]),evidence,lambda i:60,direct=True)
     return function_result
 
