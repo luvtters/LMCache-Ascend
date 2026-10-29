@@ -192,14 +192,15 @@ def l2_case(ident, kind, reverse, tp, evidence, member_host=None, member_device=
         cleanup(reversed(started),evidence,lambda i:120 if i==driver else 20)
 
 
-def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_devices=None, d_devices=None, pool_device=None, pool_memory_type='host', skip_blocks=0, followup_argv=None):
+def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_devices=None, d_devices=None, pool_device=None, pool_memory_type='host', skip_blocks=0, followup_argv=None, gate_request=None, gate_answer='ORCHID', cold_reference=False):
     role_root=Path(role_root) if role_root else ROOT if tp==1 else ROOT/'tp_candidate'
     runner=role_root/'src/ascend_direct/examples/memfabric/cross_host_role.py'
     spec=importlib.util.spec_from_file_location('role_'+ident,runner)
     module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     parser=argparse.Namespace(root=str(role_root),python=PY,topology=topology,stage=stage,
           session_id=ident,model='/workspace/d00896497/models/Qwen3-8B',pool_gb=1 if tp==1 else 2,
-          skip_blocks=skip_blocks,tp_size=tp,p_devices=p_devices,d_devices=d_devices,pool_device=pool_device,pool_memory_type=pool_memory_type)
+          skip_blocks=skip_blocks,tp_size=tp,p_devices=p_devices,d_devices=d_devices,pool_device=pool_device,pool_memory_type=pool_memory_type,
+          context_question_request=gate_request,expected_answer=gate_answer,cold_reference=cold_reference)
     mapping=module.TOPOLOGIES[topology]
     roles=['coordinator'] if stage!='inference' else ['trace'+h for h in sorted({v[0] for v in mapping.values()})]
     roles+=['service','p','d']
@@ -217,6 +218,9 @@ def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_d
             if pool_device is not None: argv += ['--pool-device',str(pool_device)]
             if pool_memory_type!='host': argv += ['--pool-memory-type',pool_memory_type]
             if skip_blocks: argv += ['--skip-blocks',str(skip_blocks)]
+            if role=='gate' and gate_request:
+                argv += ['--context-question-request',str(gate_request),'--expected-answer',gate_answer]
+                if cold_reference:argv += ['--cold-reference']
             if plan['physical_device'] is not None: argv+=['--allow-npu']
             if role=='proxy':
                 for engine in ('p','d'):
