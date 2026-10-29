@@ -24,31 +24,43 @@ BLOCK_SIZE = 64
 SOURCE_BLOCKS = [3, 1]
 TARGET_BLOCKS = [4, 2]
 MODEL = 'qwen3-synthetic-real-tp-context'
+HOSTS = {'137': '192.168.0.223', '12': '192.168.0.50'}
 _FAILED_KEEPALIVE = []
 
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--role', choices=('service', 'p', 'd'), required=True)
-    parser.add_argument('--tp-size', type=int, choices=(2, 4), required=True)
+    parser.add_argument('--tp-size', type=int, choices=(2, 4, 8), required=True)
     parser.add_argument('--shard', type=int, default=0)
     parser.add_argument('--pool-physical-device', type=int, default=0,
                         help='Plan/manifest only; caller applies this service device mask')
+    parser.add_argument('--pool-host', choices=tuple(HOSTS), default='12')
+    parser.add_argument('--p-host', choices=tuple(HOSTS), default='12')
+    parser.add_argument('--d-host', choices=tuple(HOSTS), default='12')
+    parser.add_argument('--p-devices', type=lambda value: [int(v) for v in value.split(',')])
+    parser.add_argument('--d-devices', type=lambda value: [int(v) for v in value.split(',')])
+    parser.add_argument('--pool-memory-type', choices=('host', 'device'), default='host')
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--ascend-source', type=Path, required=True)
     parser.add_argument('--core-source', type=Path, required=True)
     parser.add_argument('--layers', type=int, choices=(4, 36), default=36)
     parser.add_argument('--slot-size-mb', type=int, default=32)
-    parser.add_argument('--store-url', default='tcp://192.168.0.50:28717')
-    parser.add_argument('--server-url', default='tcp://192.168.0.50:25717')
+    parser.add_argument('--store-url')
+    parser.add_argument('--server-url')
     parser.add_argument('--service-http-port', type=int, default=28117)
-    parser.add_argument('--coord-url', default='http://192.168.0.50:29617')
+    parser.add_argument('--coord-url')
     parser.add_argument('--timeout', type=float, default=360)
     parser.add_argument('--init-timeout', type=int, default=300)
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--allow-npu', action='store_true')
     args = parser.parse_args(argv)
+    args.store_url = args.store_url or f'tcp://{HOSTS[args.pool_host]}:28717'
+    args.server_url = args.server_url or f'tcp://{HOSTS[args.pool_host]}:25717'
+    args.coord_url = args.coord_url or f'http://{HOSTS[args.pool_host]}:29617'
+    args.p_devices = args.p_devices or (list(range(8)) if args.tp_size == 8 else [2,3,4,5][:args.tp_size])
+    args.d_devices = args.d_devices or [8,9,10,11,12,13,14,15][:args.tp_size]
     if (not 0 <= args.shard < args.tp_size or args.pool_physical_device < 0 or args.timeout <= 0 or
             not 1 <= args.init_timeout <= 3600 or not args.run_id or
             not args.run_id.isascii() or len(args.run_id) > 80 or
@@ -59,6 +71,16 @@ def arguments(argv=None):
     if (args.slot_size_mb < 1 or 1024 % args.slot_size_mb or
             1024 // args.slot_size_mb < args.tp_size):
         parser.error('Pool slots must divide 1 GiB and fit the complete TP shard set')
+    for devices in (args.p_devices, args.d_devices):
+        if (len(devices) != args.tp_size or len(set(devices)) != args.tp_size
+                or any(not 0 <= device < 16 for device in devices)):
+            parser.error('Each role needs exactly TP distinct physical devices in 0..15')
+    placements = [(args.pool_host, [args.pool_physical_device]),
+                  (args.p_host, args.p_devices), (args.d_host, args.d_devices)]
+    for i, (host, devices) in enumerate(placements):
+        for other_host, other_devices in placements[i + 1:]:
+            if host == other_host and set(devices) & set(other_devices):
+                parser.error('Roles on one host must use disjoint physical devices')
     if (urlparse(args.server_url).scheme != 'tcp' or not urlparse(args.server_url).port
             or not args.store_url.startswith('tcp://')
             or not args.coord_url.startswith(('http://', 'https://'))):
@@ -76,6 +98,8 @@ def build_plan(args):
     service = dict(device_id=0, rank_id=0, world_size=1 + 2 * tp,
         tp_size=tp, pool_gb=1, slot_size_mb=args.slot_size_mb, store_url=args.store_url,
         init_timeout=args.init_timeout)
+    if args.pool_memory_type == 'device':
+        direct['pool_memory_type'] = service['pool_memory_type'] = 'device'
     url = urlparse(args.server_url)
     server_argv = [sys.executable, '-u', '-m', 'lmcache.cli.main', 'server',
         '--host', url.hostname, '--port', str(url.port), '--http-host', url.hostname,
@@ -91,12 +115,18 @@ def build_plan(args):
         payload_bytes_per_shard=2 * args.layers * TOKENS * (8 // tp) * 128 * 2,
         run_id=args.run_id, direct_config=direct, service_config=service,
         service_argv=server_argv, source_blocks=SOURCE_BLOCKS, target_blocks=TARGET_BLOCKS,
-        source_baseline='7d04959', baseline_verified_by_probe=False,
+        source_baseline=('352f3c8/8b0c7e1' if args.pool_memory_type == 'device' else '7d04959'),
+        baseline_verified_by_probe=False, pool_memory_type=args.pool_memory_type,
         ascend_source=str(args.ascend_source), core_source=str(args.core_source),
         visible_devices=os.environ.get('ASCEND_RT_VISIBLE_DEVICES'),
         model_weights_loaded=False, model_inference_verified=False,
-        rpc_payload=False, physical_plan=dict(service=[args.pool_physical_device], p=[2, 3, 4, 5][:tp],
-                                            d=[8, 9, 10, 11][:tp]),
+        rpc_payload=False, physical_plan=dict(service=[args.pool_physical_device],
+            p=args.p_devices, d=args.d_devices),
+        placement=dict(service=dict(host=args.pool_host, physical_devices=[args.pool_physical_device]),
+            p=dict(host=args.p_host, physical_devices=args.p_devices),
+            d=dict(host=args.d_host, physical_devices=args.d_devices)),
+        selected_pool_boundary=('DEVICE-selected pool; each rank contributes fixed 1GiB DRAM plus 1GiB HBM'
+                                if args.pool_memory_type == 'device' else 'HOST-selected DRAM pool'),
         external_real_process_wait_required=True)
 
 
@@ -210,7 +240,11 @@ def worker_probe(args, report, record):
             layout_hints={'kv_layout': 'NHD'}, lmcache_chunk_tokens=TOKENS)
         report.update(registration=worker.registration, actual_bm_rank=worker.config['rank_id'],
             actual_local_kv_heads=worker.transfer.layout['num_heads'],
-            actual_layout=worker.transfer.layout, actual_chunk_bytes=worker.transfer.size)
+            actual_layout=worker.transfer.layout, actual_chunk_bytes=worker.transfer.size,
+            actual_pool_memory_type=worker.registration.get('pool_memory_type', 'host'),
+            owner_pool_gva=int(worker.base))
+        if report['actual_pool_memory_type'] != args.pool_memory_type:
+            raise AssertionError('Registered service pool medium differs from requested medium')
         if (worker.config['rank_id'] != report['bm_rank'] or
                 worker.transfer.size != report['payload_bytes_per_shard']):
             raise AssertionError('Actual registration differs from TP plan')

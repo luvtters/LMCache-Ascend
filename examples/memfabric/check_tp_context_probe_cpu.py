@@ -28,6 +28,7 @@ class TPProbeChecks(unittest.TestCase):
                     self.assertEqual(config['world_size'], 1 + 2 * tp)
                     self.assertEqual(config['device_ids'], list(range(tp)))
                     self.assertEqual(config['total_kv_heads'], 8)
+                    self.assertNotIn('pool_memory_type', config)
                     ranks.append(plan['bm_rank'])
             self.assertEqual(sorted(ranks), list(range(1, 1 + 2 * tp)))
             self.assertEqual(probe.build_plan(self.args(tp, 'service'))['service_config']['tp_size'], tp)
@@ -77,6 +78,34 @@ class TPProbeChecks(unittest.TestCase):
             probe.arguments(['--role', 'service', '--tp-size', '4', '--run-id', 'too-small',
                 '--output-dir', 'unused', '--ascend-source', '/a', '--core-source', '/c',
                 '--slot-size-mb', '512'])
+
+    def test_tp8_cross_host_device_pool_plan(self):
+        ranks = []
+        for role in ('service', 'p', 'd'):
+            for shard in range(1 if role == 'service' else 8):
+                args = probe.arguments(['--role', role, '--tp-size', '8', '--shard', str(shard),
+                    '--run-id', 'tp8-hbm-plan', '--output-dir', 'unused', '--ascend-source', '/hbm',
+                    '--core-source', '/core', '--pool-host', '137', '--pool-physical-device', '6',
+                    '--p-host', '12', '--d-host', '12', '--pool-memory-type', 'device'])
+                plan = probe.build_plan(args)
+                self.assertEqual(plan['world_size'], 17)
+                self.assertEqual(plan['local_kv_heads'], 1)
+                self.assertEqual(plan['payload_bytes_per_shard'], 2359296)
+                self.assertEqual(plan['direct_config']['pool_memory_type'], 'device')
+                self.assertEqual(plan['service_config']['pool_memory_type'], 'device')
+                self.assertEqual(plan['placement']['service'], {'host': '137', 'physical_devices': [6]})
+                self.assertEqual(plan['placement']['p'], {'host': '12', 'physical_devices': list(range(8))})
+                self.assertEqual(plan['placement']['d'], {'host': '12', 'physical_devices': list(range(8, 16))})
+                self.assertEqual(args.server_url, 'tcp://192.168.0.223:25717')
+                ranks.append(plan['bm_rank'])
+        self.assertEqual(sorted(ranks), list(range(17)))
+        self.assertEqual(probe.validate_restored_set([
+            dict(shard=i, restored_tokens=128, full_content_equal=True) for i in range(8)], 8), [128] * 8)
+
+    def test_same_host_overlapping_devices_rejected_before_import(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            probe.arguments(['--role', 'p', '--tp-size', '8', '--run-id', 'overlap',
+                '--output-dir', 'unused', '--ascend-source', '/a', '--core-source', '/c'])
 
 
 if __name__ == '__main__':
