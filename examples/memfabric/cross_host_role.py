@@ -8,6 +8,7 @@ import sys
 
 HOSTS = {'137': '192.168.0.223', '12': '192.168.0.50'}
 TOPOLOGIES = {
+    'T0': {'service': ('137', 12), 'p': ('137', 8), 'd': ('137', 10)},
     'T1': {'service': ('12', 8), 'p': ('137', 8), 'd': ('12', 10)},
     'T2': {'service': ('137', 8), 'p': ('137', 10), 'd': ('12', 8)},
     'T3': {'service': ('12', 8), 'p': ('137', 8), 'd': ('137', 10)},
@@ -31,6 +32,8 @@ def build_plan(args):
     host = mapping[args.role][0] if args.role in mapping else (
         pool_host if args.role == 'coordinator' else
         args.role.removeprefix('trace') if args.role.startswith('trace') else gate_host)
+    if args.topology == 'T0':
+        host = '137'  # Diagnostic positive control; never a cross-host result.
     ip = HOSTS[host]
     device = mapping[args.role][1] if args.role in mapping else None
     p_default = list(range(8, 8 + tp_size))
@@ -42,10 +45,12 @@ def build_plan(args):
         d_default = list(range(0, 8)) if args.topology == 'T1' else list(range(8, 16))
     elif tp_size == 4 and args.topology == 'T3':
         d_default = list(range(12, 16))
+    if tp_size == 4 and args.topology == 'T0':
+        p_default, d_default = [2, 3, 4, 5], [8, 9, 10, 11]
     devices = {
         'p': args.p_devices if args.p_devices is not None else p_default,
         'd': args.d_devices if args.d_devices is not None else d_default,
-        'service': [args.pool_device],
+        'service': [args.pool_device if args.pool_device is not None else mapping['service'][1]],
     }
     for role in ('p', 'd'):
         if len(devices[role]) != tp_size or len(set(devices[role])) != tp_size:
@@ -143,6 +148,7 @@ def build_plan(args):
                 '--directory', str(case / ('coord' if args.role == 'coordinator' else 'trace-events')),
                 '--run-id', args.session_id, '--trace-dir', str(case / 'trace')]
     return dict(status='PLAN_ONLY', host=host, ip=ip, role=args.role, topology=args.topology,
+                comparison_scope='single_host_positive_control' if args.topology == 'T0' else 'cross_host',
                 stage=args.stage, session_id=args.session_id, cwd=str(ascend), argv=argv,
                 env=env, config=config, physical_device=device, logical_device=0 if device is not None else None,
                 physical_devices=physical_devices, tp_size=tp_size,
@@ -177,7 +183,7 @@ def main():
     parser.add_argument('--tp-size', type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument('--p-devices', type=lambda value: [int(v) for v in value.split(',')])
     parser.add_argument('--d-devices', type=lambda value: [int(v) for v in value.split(',')])
-    parser.add_argument('--pool-device', type=int, default=8)
+    parser.add_argument('--pool-device', type=int, help='Defaults to T0=12, other topologies=8')
     parser.add_argument('--skip-blocks', type=int, choices=(0, 1), default=0)
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--allow-npu', action='store_true')
@@ -185,7 +191,8 @@ def main():
     if args.tp_size > 1 and args.stage != 'inference':
         parser.error('The synthetic primitive/context script is TP1 only; TP candidates require inference stage')
     if args.pool_gb < 1 or any(v < 0 or v > 15 for v in
-            (args.p_devices or []) + (args.d_devices or []) + [args.pool_device]):
+            (args.p_devices or []) + (args.d_devices or []) +
+            ([] if args.pool_device is None else [args.pool_device])):
         parser.error('Invalid capacity or physical devices')
     if not args.session_id or any(not (c.isalnum() or c in '-_') for c in args.session_id):
         parser.error('session-id must be a new simple attempt identifier')

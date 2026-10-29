@@ -105,7 +105,7 @@ class Contracts(unittest.TestCase):
                 args = argparse.Namespace(root='/private', python='/venv/python',
                     topology=topology, stage='inference', role=role, session_id='cpu-case',
                     pool_gb=1, skip_blocks=0, model='/readonly/model', tp_size=1,
-                    p_devices=None, d_devices=None, pool_device=8)
+                    p_devices=None, d_devices=None, pool_device=None)
                 plan = roles.build_plan(args)
                 if role in ('p', 'd'):
                     extra = plan['config']['kv_connector_extra_config']
@@ -117,6 +117,29 @@ class Contracts(unittest.TestCase):
                     self.assertEqual(plan['argv'][plan['argv'].index('--max-tokens') + 1], '8')
         self.assertEqual(roles.TOPOLOGIES['T3'],
                          {'service': ('12', 8), 'p': ('137', 8), 'd': ('137', 10)})
+
+    def test_t0_single_host_positive_control_default_and_explicit_devices(self):
+        expected = {1: {'p': [8], 'd': [10]},
+                    2: {'p': [8, 9], 'd': [10, 11]},
+                    4: {'p': [2, 3, 4, 5], 'd': [8, 9, 10, 11]}}
+        for tp_size in (1, 2, 4):
+            for role in ('service', 'p', 'd', 'proxy', 'gate', 'coordinator', 'trace137', 'trace12'):
+                args = argparse.Namespace(root='/private', python='/venv/python',
+                    topology='T0', stage='inference', role=role, session_id='cpu-case',
+                    pool_gb=2, skip_blocks=0, model='/readonly/model', tp_size=tp_size,
+                    p_devices=None, d_devices=None, pool_device=None)
+                plan = roles.build_plan(args)
+                self.assertEqual(plan['host'], '137')
+                self.assertEqual(plan['comparison_scope'], 'single_host_positive_control')
+                if role == 'service':
+                    self.assertEqual(plan['physical_devices'], [12])
+                elif role in ('p', 'd'):
+                    self.assertEqual(plan['physical_devices'], expected[tp_size][role])
+                elif role == 'gate':
+                    self.assertEqual(plan['argv'][plan['argv'].index('--service-http') + 1],
+                                     'http://192.168.0.223:28195')
+            args.role, args.tp_size, args.pool_device = 'service', 1, 13
+            self.assertEqual(roles.build_plan(args)['physical_devices'], [13])
 
     def test_tp_candidate_role_config_real_device_lists(self):
         for tp_size in (2, 4, 8):
