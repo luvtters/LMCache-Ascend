@@ -65,6 +65,19 @@ class TPProbeChecks(unittest.TestCase):
         self.assertEqual(plan['physical_plan']['service'], [6])
         self.assertEqual(plan['service_config']['device_id'], 0)
 
+    def test_exact_group_capacity_and_too_small_rejection(self):
+        for tp, slot in [(4, 256), (2, 512)]:
+            args = probe.arguments(['--role', 'service', '--tp-size', str(tp),
+                '--run-id', 'capacity', '--output-dir', 'unused', '--ascend-source', '/a',
+                '--core-source', '/c', '--slot-size-mb', str(slot)])
+            plan = probe.build_plan(args)
+            self.assertEqual(plan['service_config']['slot_size_mb'], slot)
+            self.assertEqual(1024 // slot, tp)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            probe.arguments(['--role', 'service', '--tp-size', '4', '--run-id', 'too-small',
+                '--output-dir', 'unused', '--ascend-source', '/a', '--core-source', '/c',
+                '--slot-size-mb', '512'])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

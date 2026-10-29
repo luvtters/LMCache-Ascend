@@ -39,6 +39,7 @@ def arguments(argv=None):
     parser.add_argument('--ascend-source', type=Path, required=True)
     parser.add_argument('--core-source', type=Path, required=True)
     parser.add_argument('--layers', type=int, choices=(4, 36), default=36)
+    parser.add_argument('--slot-size-mb', type=int, default=32)
     parser.add_argument('--store-url', default='tcp://192.168.0.50:28717')
     parser.add_argument('--server-url', default='tcp://192.168.0.50:25717')
     parser.add_argument('--service-http-port', type=int, default=28117)
@@ -55,6 +56,9 @@ def arguments(argv=None):
         parser.error('invalid shard, timeout, or run-id')
     if args.run and not args.allow_npu:
         parser.error('--run requires --allow-npu')
+    if (args.slot_size_mb < 1 or 1024 % args.slot_size_mb or
+            1024 // args.slot_size_mb < args.tp_size):
+        parser.error('Pool slots must divide 1 GiB and fit the complete TP shard set')
     if (urlparse(args.server_url).scheme != 'tcp' or not urlparse(args.server_url).port
             or not args.store_url.startswith('tcp://')
             or not args.coord_url.startswith(('http://', 'https://'))):
@@ -70,7 +74,7 @@ def build_plan(args):
         store_url=args.store_url, init_timeout=args.init_timeout,
         member_id=args.run_id + '-' + args.role)
     service = dict(device_id=0, rank_id=0, world_size=1 + 2 * tp,
-        tp_size=tp, pool_gb=1, slot_size_mb=32, store_url=args.store_url,
+        tp_size=tp, pool_gb=1, slot_size_mb=args.slot_size_mb, store_url=args.store_url,
         init_timeout=args.init_timeout)
     url = urlparse(args.server_url)
     server_argv = [sys.executable, '-u', '-m', 'lmcache.cli.main', 'server',
