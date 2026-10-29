@@ -48,4 +48,35 @@ One scheduling step containing two requests establishes engine scheduling
 overlap. Shared-scratch transfer work remains serialized; asynchronous BM,
 kernel/stream concurrency, bandwidth, speedup and long-term stability are not
 established. Internal host addresses, request identities and raw logs remain
-private. This record covers the two mixed-request groups only.
+private. The first validation above covers the two mixed-request groups.
+
+## Additional short repeated-retrieval validation
+
+Three independent Qwen3-8B groups each completed 500 HTTP requests: TP1 with
+max-num-seqs=1, TP4 with max-num-seqs=1, and TP4 with max-num-seqs=2. Each group
+used a fresh pool and retained its own complete responses, counters and waits.
+The first 250 requests were serial; the next 250 used two HTTP client threads.
+
+- Every response reproduced the first-chunk context marker: 1,364 prompt tokens
+  and five output tokens. Per-group metric deltas were prompt 682,000,
+  external 640,000, compute 42,000, and local-prefix 0.
+- TP1 completed 5,000 G2L operations of 18 MiB. Each of the four TP4 D shards
+  completed 5,000 operations of 4.5 MiB. Aggregate completed bytes were
+  94,371,840,000 (90,000 MiB) per group, matched independently to original
+  worker identities, native returns and scatter completions. P added no copy.
+- At every 50-request checkpoint, ordinary L1 held no objects and no L2 adapter was configured;
+  pins, pending writes and quarantine were zero. Client pending counts covered
+  this HTTP probe only; the internal engine RPC pending map was not exposed.
+- In the final TP4/max-num-seqs=2 group, original scheduler records matched
+  733 same-step pairs to successful HTTP requests in the two-client phase.
+  The first pair scheduled 84 tokens for each request. The strict complete-ID
+  contract above and both HTTP time intervals were checked independently.
+- Probes/gates/executors exited naturally with code 0, P/D/proxy via controlled
+  shutdown with 0, pool service via controlled SIGINT with 130, and trace
+  collectors with -2. Dispatcher shutdown preceded BM teardown.
+
+These are short functional samples. Timing was used to check the execution
+budget, without a performance comparison. Same-step admission does not establish
+asynchronous DMA or concurrent kernels. The production data path still uses
+per-chunk NPU scratch; the separately tested native raw-page batch primitive
+has not been integrated into that context.
