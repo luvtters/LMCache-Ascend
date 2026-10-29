@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in TP1 worker data plane and scheduler control plane for MemFabric.
+"""Opt-in homogeneous TP worker data plane and scheduler control plane.
 
 The server-module RPC carries JSON metadata only. No KV tensor is serialized,
 registered as CPU L1, or passed through shared host staging.
@@ -17,20 +17,25 @@ from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.protocols.server_module import ServerModuleCallRequest
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import TransferContext
 
-def chunk_keys(key, tokens_per_chunk):
+def chunk_keys(key, tokens_per_chunk, layout=None):
     """Identify chunks by full token prefix, model and salt, never request ID.
 
     ``request_configs`` is request metadata, not cache identity, matching
     IPCCacheServerKey. Layout compatibility is checked before any pool copy.
     """
-    if (key.world_size != 1 or key.worker_id not in (None, 0)
+    if (key.world_size not in (1, 2, 4, 8)
+            or key.worker_id not in (None, *range(key.world_size))
             or tokens_per_chunk <= 0 or key.start < 0
             or key.start % tokens_per_chunk or key.end < key.start
             or key.end % tokens_per_chunk
             or key.end * 4 > len(key.token_bytes)):
-        raise ValueError("Direct keys require TP1 and an aligned valid token range")
-    namespace = json.dumps([key.model_name, key.world_size, key.cache_salt,
-                            tokens_per_chunk], ensure_ascii=True,
+        raise ValueError("Direct keys require homogeneous TP and an aligned valid token range")
+    identity = [key.model_name, key.world_size, key.cache_salt, tokens_per_chunk]
+    if key.world_size > 1:
+        if not isinstance(layout, dict) or not layout:
+            raise ValueError("TP keys require the actual registered KV layout")
+        identity.append(layout)
+    namespace = json.dumps(identity, ensure_ascii=True, sort_keys=True,
                            separators=(",", ":")).encode()
     result = []
     for end in range(key.start + tokens_per_chunk,
@@ -44,10 +49,10 @@ def chunk_keys(key, tokens_per_chunk):
 
 
 def _validate_strategy(strategy):
-    if (strategy.tp_size != 1 or strategy.pp_size != 1
+    if (strategy.tp_size not in (1, 2, 4, 8) or strategy.pp_size != 1
             or strategy.dcp_size != 1 or strategy.n_servers != 1
-            or strategy.vllm_world_size != 1 or strategy.mla_only):
-        raise ValueError("MemFabric direct supports TP1/PP1/DCP1 GQA and one service only")
+            or strategy.vllm_world_size != strategy.tp_size or strategy.mla_only):
+        raise ValueError("MemFabric direct supports homogeneous TP1/2/4/8, PP1/DCP1 GQA and one service only")
 
 
 class _ControlRejectedError(RuntimeError):
@@ -94,12 +99,33 @@ def _failed(error):
 class MemFabricDirectTransferContext(TransferContext):
     def __init__(self, *, instance_id, req_client, tokens_per_chunk,
                  mq_timeout, extra_config, session_factory=None,
-                 transfer_factory=None, **_kwargs):
+                 transfer_factory=None, parallel_strategy=None, **_kwargs):
         super().__init__(instance_id, req_client)
         self.control = _Control(req_client, mq_timeout)
         self.tokens_per_chunk = tokens_per_chunk
         self.config = dict(extra_config.get("lmcache.mp.direct", {}))
         self.member_id = self.config.pop("member_id", f"worker-{instance_id}")
+        self.tp_size = getattr(parallel_strategy, "tp_size", 1)
+        self.shard = getattr(parallel_strategy, "kv_worker_id", 0)
+        configured_tp = self.config.pop("tp_size", 1)
+        self.total_kv_heads = self.config.pop("total_kv_heads", None)
+        if (configured_tp != self.tp_size or type(self.shard) is not int
+                or not 0 <= self.shard < self.tp_size):
+            raise ValueError("TP requires explicit matching lmcache.mp.direct.tp_size")
+        if self.tp_size > 1:
+            devices = self.config.pop("device_ids", None)
+            if (not isinstance(devices, list) or len(devices) != self.tp_size
+                    or any(type(d) is not int or d < 0 for d in devices)
+                    or len(set(devices)) != self.tp_size
+                    or self.config.get("rank_id") not in (1, 1 + self.tp_size)
+                    or self.config.get("world_size") != 1 + 2 * self.tp_size
+                    or type(self.total_kv_heads) is not int
+                    or self.total_kv_heads <= 0
+                    or self.total_kv_heads % self.tp_size):
+                raise ValueError("TP requires device_ids, real KV head count and owner/P/D fixed BM mapping")
+            self.config["device_id"] = devices[self.shard]
+            self.config["rank_id"] += self.shard
+            self.member_id += f"-tp{self.shard}"
         self.session = None
         self.transfer = None
         self.registration = None
@@ -136,8 +162,8 @@ class MemFabricDirectTransferContext(TransferContext):
                   lmcache_chunk_tokens):
         if self._is_closed() or self.session is not None:
             raise RuntimeError("Direct context is closed or already registered")
-        if world_size != 1 or len(engine_group_infos) > 1:
-            raise ValueError("Direct transfer supports one full-attention TP1 group")
+        if world_size != self.tp_size or len(engine_group_infos) > 1:
+            raise ValueError("Direct transfer requires its registered homogeneous TP group")
         if lmcache_chunk_tokens not in (None, self.tokens_per_chunk):
             raise ValueError("Direct chunk token count differs from adapter")
         required = {"device_id", "rank_id", "world_size", "pool_gb", "store_url"}
@@ -158,14 +184,21 @@ class MemFabricDirectTransferContext(TransferContext):
             self._session_factory = BMSession
         self.transfer = self._transfer_factory(kv_caches, self.tokens_per_chunk,
             blocks_in_chunk, layout_hints=layout_hints, engine_type=engine_type)
+        if self.tp_size > 1:
+            local_heads = self.transfer.layout.get("num_heads")
+            if type(local_heads) is not int or local_heads * self.tp_size != self.total_kv_heads:
+                raise ValueError("Actual KV heads do not match sharded model KV heads; replicated KV is unsupported")
         if self.transfer.device.index != self.config["device_id"]:
             raise ValueError("BM device_id must match the KV tensor logical NPU device")
         self.model_name = model_name
         self.session = self._session_factory(**self.config)
         try:
-            self.registration = self.control.call("register", {
+            registration = {
                 "rank": self.config["rank_id"], "member_id": self.member_id,
-                "shard": 0, "tp_size": 1})
+                "shard": self.shard, "tp_size": self.tp_size}
+            if self.tp_size > 1:
+                registration.update(layout=self.transfer.layout, size=self.transfer.size)
+            self.registration = self.control.call("register", registration)
             deadline = time.monotonic() + mq_timeout
             while not (self.registration["registration_ready"]
                        and self.registration["transfer_ready"]):
@@ -197,8 +230,8 @@ class MemFabricDirectTransferContext(TransferContext):
         expected = self.registration
         if (descriptor["epoch"] != expected["epoch"]
                 or descriptor["storage_rank"] != expected["storage_rank"]
-                or descriptor["key"] != key or descriptor["shard"] != 0
-                or descriptor["tp_size"] != 1 or descriptor["size"] != self.transfer.size
+                or descriptor["key"] != key or descriptor["shard"] != self.shard
+                or descriptor["tp_size"] != self.tp_size or descriptor["size"] != self.transfer.size
                 or descriptor.get("layout") != self.transfer.layout
                 or type(descriptor["offset"]) is not int
                 or not 0 <= descriptor["offset"] <= expected["pool_bytes"] - descriptor["size"]):
@@ -210,7 +243,9 @@ class MemFabricDirectTransferContext(TransferContext):
         if (len(block_ids) != 1 or blocks_in_chunk != self.transfer.blocks_per_chunk
                 or key.model_name != self.model_name):
             raise ValueError("Direct transfer requires the registered single group layout")
-        keys = chunk_keys(key, self.tokens_per_chunk)
+        if key.world_size != self.tp_size or key.worker_id != self.shard:
+            raise ValueError("Transfer key must identify this real TP worker")
+        keys = chunk_keys(key, self.tokens_per_chunk, self.transfer.layout)
         if len(block_ids[0]) != len(keys) * blocks_in_chunk:
             raise ValueError("Direct block IDs and token key must cover the same full chunks")
         return keys, [block_ids[0][i * blocks_in_chunk:(i + 1) * blocks_in_chunk]
@@ -238,7 +273,7 @@ class MemFabricDirectTransferContext(TransferContext):
         for object_key, ids in zip(keys, chunks):
             identity = self._identity()
             future = self.control.submit("prepare_store", dict(identity,
-                key=object_key, shard=0, tp_size=1, size=self.transfer.size,
+                key=object_key, shard=self.shard, tp_size=self.tp_size, size=self.transfer.size,
                 layout=self.transfer.layout))
             pending = (identity, future)
             self._prepares.append(pending)
@@ -296,7 +331,7 @@ class MemFabricDirectTransferContext(TransferContext):
             event.wait()
         self.transfer.synchronize()
         descriptors = self.control.call("lookup", {
-            "keys": keys, "shard": 0, "tp_size": 1})["descriptors"]
+            "keys": keys, "shard": self.shard, "tp_size": self.tp_size})["descriptors"]
         if len(descriptors) != len(keys):
             return _done(False)
         for index, (object_key, ids, descriptor) in enumerate(zip(keys, chunks, descriptors)):
@@ -451,7 +486,14 @@ class _Lookup:
         self.backend, self.key = backend, key
         self.timeout, self.blocking = timeout, blocking_lookup
         self.request_id = uuid.uuid4().hex
-        self.keys = chunk_keys(key, backend.tokens_per_chunk)
+        layout = None
+        if backend.tp_size > 1:
+            status = backend.control.call("status", {})
+            if (status.get("tp_size") != backend.tp_size
+                    or not status["registration_ready"] or not status["transfer_ready"]):
+                raise RuntimeError("Homogeneous TP pool is not fully registered and ready")
+            layout = status["layout"]
+        self.keys = chunk_keys(key, backend.tokens_per_chunk, layout)
         self.future = None
         self.result = None
         self.deadline = 0
@@ -463,7 +505,7 @@ class _Lookup:
                 raise RuntimeError("Direct lookup was already submitted")
             self.deadline = time.monotonic() + self.timeout
             self.future = self.backend.control.submit("lookup", {
-                "keys": self.keys, "shard": 0, "tp_size": 1,
+                "keys": self.keys, "shard": 0, "tp_size": self.backend.tp_size,
                 "request_id": self.request_id})
             self.backend.lookups.setdefault(self.key.request_id, []).append(self)
 
@@ -507,18 +549,19 @@ class MemFabricDirectSchedulerBackend:
             raise ValueError("MemFabric direct requires exactly one service")
         self.url, client = next(iter(req_clients.items()))
         self.control = _Control(client, mq_timeout)
+        self.tp_size = parallel_strategy.tp_size
         self.tokens_per_chunk = tokens_per_chunk
         self.lookups = {}
 
     def create_lookup(self, key, *, tp_size, tokens_per_chunk, timeout,
                       blocking_lookup):
-        if tp_size != 1 or tokens_per_chunk != self.tokens_per_chunk:
+        if tp_size != self.tp_size or tokens_per_chunk != self.tokens_per_chunk:
             raise ValueError("Direct lookup topology or chunk size changed")
         return _Lookup(self, key, timeout, blocking_lookup)
 
     def free_lookup_locks(self, key, tp_size, extra_ranges=()):
-        if tp_size != 1:
-            raise ValueError("Direct lookup locks require TP1")
+        if tp_size != self.tp_size:
+            raise ValueError("Direct lookup lock topology changed")
         ranges = ((key.start, key.end),) + tuple(extra_ranges)
         for lookup in self.lookups.get(key.request_id, ()):
             # Drain before releasing: a late lookup reply must not recreate
@@ -557,7 +600,7 @@ class MemFabricDirectSchedulerBackend:
 
 def create_worker_transfer_context(*, parallel_strategy, **kwargs):
     _validate_strategy(parallel_strategy)
-    return MemFabricDirectTransferContext(**kwargs)
+    return MemFabricDirectTransferContext(parallel_strategy=parallel_strategy, **kwargs)
 
 
 def create_scheduler_backend(**kwargs):

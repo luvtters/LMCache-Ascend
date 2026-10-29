@@ -27,7 +27,7 @@ class MemFabricDirectServerModule(DiscoverableModule):
 
     def __init__(self, context, config, *, session_factory=None):
         fields = {"device_id", "rank_id", "world_size", "pool_gb", "slot_size_mb", "store_url"}
-        if not fields <= set(config) or set(config) - fields - {"init_timeout"}:
+        if not fields <= set(config) or set(config) - fields - {"init_timeout", "tp_size"}:
             raise ValueError("MemFabric direct config requires %s and optional init_timeout" % sorted(fields))
         init_timeout = config.get("init_timeout", 90)
         if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
@@ -42,7 +42,8 @@ class MemFabricDirectServerModule(DiscoverableModule):
         self._index = PoolIndex(pool_bytes=config["pool_gb"] << 30,
                                 slot_size=config["slot_size_mb"] << 20,
                                 storage_rank=config["rank_id"],
-                                world_size=config["world_size"], ready=False)
+                                world_size=config["world_size"], ready=False,
+                                tp_size=config.get("tp_size", 1))
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._owner_thread = threading.Thread(target=self._run_pool,

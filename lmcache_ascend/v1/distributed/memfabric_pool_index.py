@@ -21,7 +21,7 @@ class _Entry:
 
 class PoolIndex:
     def __init__(self, *, pool_bytes, slot_size, storage_rank, world_size,
-                 ready=True):
+                 ready=True, tp_size=1):
         values = (pool_bytes, slot_size, storage_rank, world_size)
         if (any(type(v) is not int for v in values) or pool_bytes <= 0
                 or slot_size <= 0 or pool_bytes % slot_size
@@ -30,6 +30,14 @@ class PoolIndex:
         self.epoch = uuid.uuid4().hex
         self.pool_bytes, self.slot_size = pool_bytes, slot_size
         self.storage_rank, self.world_size = storage_rank, world_size
+        if type(tp_size) is not int or tp_size not in (1, 2, 4, 8):
+            raise ValueError("Only homogeneous TP1/2/4/8 is supported")
+        if tp_size > 1 and (storage_rank != 0 or world_size != 1 + 2 * tp_size):
+            raise ValueError("TP pool requires owner=0 and world_size=1+2*tp_size")
+        self.tp_size = tp_size
+        self._member_shards = {}
+        self._layout = None
+        self._chunk_size = None
         self._ready, self._closed, self._error = ready, False, ""
         self._lock = threading.RLock()
         self._members = {}
@@ -41,10 +49,20 @@ class PoolIndex:
         self._lookups = {}
         self._evictions = 0
 
-    @staticmethod
-    def _shard(shard=0, tp_size=1):
-        if type(shard) is not int or type(tp_size) is not int or (shard, tp_size) != (0, 1):
-            raise ValueError("Only TP1 shard=0,tp_size=1 is supported")
+    def _shard(self, shard=0, tp_size=1):
+        if (type(shard) is not int or type(tp_size) is not int
+                or tp_size != self.tp_size or not 0 <= shard < tp_size):
+            raise ValueError("Shard does not match the fixed homogeneous TP pool")
+
+    def _key(self, key, shard):
+        return key if self.tp_size == 1 else (key, shard)
+
+    def _group(self, key):
+        return [self._entries.get(self._key(key, s)) for s in range(self.tp_size)]
+
+    def _check_member_shard(self, rank, shard):
+        if self.tp_size > 1 and self._member_shards.get(rank) != shard:
+            raise ValueError("Worker cannot access another TP shard")
 
     def _available(self):
         if self._closed:
@@ -71,7 +89,7 @@ class PoolIndex:
             self._ready = False
             return self.status()
 
-    def register(self, *, rank, member_id, shard=0, tp_size=1):
+    def register(self, *, rank, member_id, shard=0, tp_size=1, layout=None, size=None):
         self._shard(shard, tp_size)
         with self._lock:
             if self._closed or self._error:
@@ -84,12 +102,21 @@ class PoolIndex:
             if old is not None and old != member_id:
                 self.invalidate("member replacement at rank %s" % rank)
                 raise RuntimeError("Fixed-group member replacement requires restart")
+            if tp_size > 1:
+                if (rank - 1) % tp_size != shard:
+                    raise ValueError("BM rank must identify the real TP shard")
+                if not isinstance(layout, dict) or type(size) is not int or not 0 < size <= self.slot_size:
+                    raise ValueError("TP registration requires actual layout and chunk size")
+                if self._layout is not None and (self._layout != layout or self._chunk_size != size):
+                    raise ValueError("All homogeneous TP members must have identical actual KV layouts")
+                self._layout, self._chunk_size = deepcopy(layout), size
             self._members[rank] = member_id
+            self._member_shards[rank] = shard
             return self.status()
 
-    def _descriptor(self, key, slot, size, layout):
+    def _descriptor(self, key, slot, size, layout, shard=0, tp_size=1):
         return dict(epoch=self.epoch, slot=slot, generation=self._generation[slot],
-                    key=key, shard=0, tp_size=1, size=size,
+                    key=key, shard=shard, tp_size=tp_size, size=size,
                     offset=slot * self.slot_size, storage_rank=self.storage_rank,
                     layout=deepcopy(layout))
 
@@ -101,23 +128,32 @@ class PoolIndex:
         with self._lock:
             self._available()
             self._owner(epoch, rank, member_id)
-            if key in self._entries:
-                entry = self._entries[key]
+            self._check_member_shard(rank, shard)
+            if tp_size > 1 and (layout != self._layout or size != self._chunk_size):
+                raise ValueError("Write differs from registered TP layout")
+            entry_key = self._key(key, shard)
+            if entry_key in self._entries:
+                entry = self._entries[entry_key]
                 if entry.descriptor["size"] != size or entry.layout != layout:
                     raise ValueError("Immutable key has a different size or layout")
-                self._entries.move_to_end(key)
+                self._entries.move_to_end(entry_key)
                 return dict(existing=True, descriptor=deepcopy(entry.descriptor), write_id=None)
-            if any(w["entry"].descriptor["key"] == key for w in self._writes.values()):
+            if any(self._key(w["entry"].descriptor["key"], w["entry"].descriptor["shard"]) == entry_key for w in self._writes.values()):
                 raise RuntimeError("Key already has an active or quarantined write")
             if not self._free:
-                victim = next((k for k, e in self._entries.items() if not e.pins), None)
+                victim = next((k for k, e in self._entries.items()
+                               if not any(x is not None and x.pins for x in self._group(e.descriptor["key"]))), None)
                 if victim is None:
                     raise RuntimeError("BM pool full: slots are writing, quarantined, or pinned")
-                self._free.append(self._entries.pop(victim).descriptor["slot"])
-                self._evictions += 1
+                victim_key = self._entries[victim].descriptor["key"]
+                for s in range(self.tp_size):
+                    removed = self._entries.pop(self._key(victim_key, s), None)
+                    if removed is not None:
+                        self._free.append(removed.descriptor["slot"])
+                        self._evictions += 1
             slot = self._free.pop()
             self._generation[slot] += 1
-            entry = _Entry(self._descriptor(key, slot, size, layout), deepcopy(layout))
+            entry = _Entry(self._descriptor(key, slot, size, layout, shard, tp_size), deepcopy(layout))
             write_id = uuid.uuid4().hex
             self._writes[write_id] = dict(entry=entry, owner=(rank, member_id), aborted=False)
             return dict(existing=False, descriptor=deepcopy(entry.descriptor), write_id=write_id)
@@ -136,7 +172,7 @@ class PoolIndex:
             if write["aborted"]:
                 raise RuntimeError("Cannot commit an aborted write")
             entry = write["entry"]
-            self._entries[entry.descriptor["key"]] = entry
+            self._entries[self._key(entry.descriptor["key"], entry.descriptor["shard"])] = entry
             del self._writes[write_id]
             return dict(descriptor=deepcopy(entry.descriptor))
 
@@ -162,24 +198,25 @@ class PoolIndex:
             self._available()
             if request_id in self._lookups:
                 old = self._lookups[request_id]
-                if old["keys"] != keys:
+                if old["keys"] != keys or old["shard"] != shard:
                     raise ValueError("Lookup request_id reused with different keys")
-                return dict(epoch=self.epoch, descriptors=[deepcopy(e.descriptor) for e in old["entries"]],
+                return dict(epoch=self.epoch, descriptors=[deepcopy(e.descriptor) for e in old["entries"] if e.descriptor["shard"] == shard],
                             lease_id=old["lease_id"])
             entries = []
             for key in keys:
-                entry = self._entries.get(key)
-                if entry is None:
+                group = self._group(key)
+                if any(entry is None for entry in group):
                     break
-                entries.append(entry)
-                self._entries.move_to_end(key)
+                entries.extend(group)
+                for s in range(self.tp_size):
+                    self._entries.move_to_end(self._key(key, s))
             lease_id = None
             if request_id is not None:
                 lease_id = uuid.uuid4().hex
                 for entry in entries:
                     entry.pins += 1
-                self._lookups[request_id] = dict(keys=list(keys), entries=entries, lease_id=lease_id)
-            return dict(epoch=self.epoch, descriptors=[deepcopy(e.descriptor) for e in entries],
+                self._lookups[request_id] = dict(keys=list(keys), entries=entries, lease_id=lease_id, shard=shard)
+            return dict(epoch=self.epoch, descriptors=[deepcopy(e.descriptor) for e in entries if e.descriptor["shard"] == shard],
                         lease_id=lease_id)
 
     def acquire(self, *, epoch, rank, member_id, descriptor):
@@ -188,12 +225,13 @@ class PoolIndex:
             self._owner(epoch, rank, member_id)
             if not isinstance(descriptor, dict):
                 raise ValueError("Expected object descriptor")
-            entry = self._entries.get(descriptor.get("key"))
+            self._check_member_shard(rank, descriptor.get("shard"))
+            entry = self._entries.get(self._key(descriptor.get("key"), descriptor.get("shard")))
             if entry is None or descriptor != entry.descriptor:
                 raise RuntimeError("Object descriptor is stale")
             lease_id = uuid.uuid4().hex
             entry.pins += 1
-            self._entries.move_to_end(descriptor["key"])
+            self._entries.move_to_end(self._key(descriptor["key"], descriptor["shard"]))
             self._leases[lease_id] = (entry, rank, member_id)
             return dict(lease_id=lease_id, descriptor=deepcopy(entry.descriptor))
 
@@ -238,6 +276,7 @@ class PoolIndex:
                         transfer_ready=self._ready and not self._closed and not self._error,
                         closed=self._closed, last_error=self._error, protocol="SDMA",
                         storage_rank=self.storage_rank, world_size=self.world_size,
+                        tp_size=self.tp_size, layout=deepcopy(self._layout), chunk_size=self._chunk_size,
                         pool_bytes=self.pool_bytes, slot_size=self.slot_size,
                         objects=len(self._entries), free_slots=len(self._free),
                         pending_writes=len(self._writes),

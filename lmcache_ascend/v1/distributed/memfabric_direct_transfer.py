@@ -50,7 +50,11 @@ class NpuDirectTransfer:
             device=self.device)
         self.size = self.buffer.numel() * self.buffer.element_size()
         self.layout = {"shape": list(self.buffer.shape),
-                       "dtype": str(dtype), "format": "2LTD"}
+                       "dtype": str(dtype), "format": "2LTD",
+                       "num_heads": utils.get_num_heads(self.kv, self.format),
+                       "head_size": utils.get_head_size(self.kv, self.format),
+                       "block_size": self.block_size,
+                       "layer_names": list(kv_caches)}
 
     def synchronize(self):
         self.torch.npu.synchronize(self.device)

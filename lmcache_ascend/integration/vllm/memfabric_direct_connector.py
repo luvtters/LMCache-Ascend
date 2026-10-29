@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in MP connector for synchronous TP1 NPU-to-MemFabric pool transfers.
+"""Opt-in MP connector for synchronous homogeneous TP NPU-to-pool transfers.
 
 Select ``MemFabricDirectConnector`` through vLLM's
 ``kv_connector_module_path``. This module requires the matching LMCache MP
@@ -64,17 +64,17 @@ def _direct_config(extra_config: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _validate_strategy(strategy: ParallelStrategy) -> None:
-    """Reject layouts outside the synchronous single-service TP1 scope."""
+    """Reject layouts outside homogeneous TP and one metadata service."""
     if (
-        strategy.tp_size != 1
+        strategy.tp_size not in (1, 2, 4, 8)
         or strategy.pp_size != 1
         or strategy.dcp_size != 1
-        or strategy.vllm_world_size != 1
+        or strategy.vllm_world_size != strategy.tp_size
         or strategy.n_servers != 1
         or strategy.mla_only
     ):
         raise ValueError(
-            "MemFabric direct supports TP1/PP1/DCP1 GQA and one service only"
+            "MemFabric direct supports homogeneous TP1/2/4/8, PP1/DCP1 GQA and one service only"
         )
 
 
@@ -103,6 +103,8 @@ class MemFabricDirectSchedulerAdapter(LMCacheMPSchedulerAdapter):
         if len(server_urls) != 1:
             raise ValueError("MemFabric direct requires exactly one service")
         self.direct_config = _direct_config(extra_config)
+        if self.direct_config["lmcache.mp.direct"].get("tp_size", 1) != parallel_strategy.tp_size:
+            raise ValueError("Homogeneous TP requires explicit matching direct.tp_size")
         super().__init__(
             server_urls,
             context,
@@ -201,9 +203,11 @@ class MemFabricDirectWorkerAdapter(LMCacheMPWorkerAdapter):
         enable_kv_events: bool = False,
         required_chunk_alignment: int | None = None,
     ) -> None:
-        """Construct an explicit TP1 adapter without selecting a stock mode."""
+        """Construct the explicit direct adapter without selecting a stock mode."""
         _validate_strategy(parallel_strategy)
         self.direct_config = _direct_config(extra_config)
+        if self.direct_config["lmcache.mp.direct"].get("tp_size", 1) != parallel_strategy.tp_size:
+            raise ValueError("Homogeneous TP requires explicit matching direct.tp_size")
         if enable_kv_events:
             raise ValueError("MemFabric direct does not support KV events")
         super().__init__(
@@ -279,6 +283,11 @@ class MemFabricDirectConnector(LMCacheMPConnector):
         if transfer_config is None:
             raise ValueError("MemFabric direct requires vLLM KV transfer configuration")
         _direct_config(transfer_config.kv_connector_extra_config)
+        direct = transfer_config.kv_connector_extra_config["lmcache.mp.direct"]
+        if direct.get("tp_size", 1) > 1:
+            # Source the total from the loaded model config, never a guessed
+            # TP1 chunk byte count or a replicated-head assumption.
+            direct["total_kv_heads"] = vllm_config.model_config.get_total_num_kv_heads()
         event_config = vllm_config.kv_events_config
         if event_config is not None and event_config.enable_kv_cache_events:
             raise ValueError("MemFabric direct does not support KV events")
