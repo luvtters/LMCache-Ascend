@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in 500-request TP1 HTTP correctness check against a resident D.
+"""Opt-in 500-request homogeneous TP1/2/4 HTTP check against a resident D.
 
 250 serial requests then 250 with two client threads; engine max_num_seqs may
 remain one. No engine launch, cache mutation, accelerator import or performance
@@ -73,6 +73,26 @@ def native_counts(before, after, chunks, pointer):
     return dict(native_returned=len(returns), scatter_completed=len(stages))
 
 
+def native_counts_by_shard(args, before, after, chunks):
+    assert before["host_id"] == after["host_id"], "Trace host changed"
+    roster = follow.d_roster(before, args)
+    assert follow.d_roster(after, args) == roster, "D workers or scratch changed"
+    active = [r for r in after["records"] if r["mono_ns"] >= before["mono_ns"]
+              and r["role"] == "D" and r["kind"] in ("native_transfer", "kv_stage")]
+    assert all(r.get("worker_shard", 0) in roster for r in active), "Unexpected D shard"
+    result = {}
+    for shard, (pid, pointer, chunk_bytes) in roster.items():
+        records = [r for r in active if r.get("worker_shard", 0) == shard]
+        assert all(r["pid"] == pid and r.get("tp_size", 1) == args.tp_size for r in records), "Wrong D worker"
+        assert all(r["bytes"] == chunk_bytes for r in records if r["kind"] == "kv_stage"), "Wrong stage size"
+        counts = native_counts(before, dict(records=records), chunks, pointer)
+        if args.tp_size > 1:
+            counts.update(pid=pid, local_ptr=pointer, actual_chunk_bytes=chunk_bytes)
+        result[str(shard)] = counts
+    # Retain the archived TP1 summary shape.
+    return result["0"] if args.tp_size == 1 else result
+
+
 def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     budget = Budget(args.duration_limit)
@@ -82,7 +102,7 @@ def run(args):
     started_unix_ns = time.time_ns()
     follow.save(args.output / "run_config.json", dict(
         decoder=args.decoder, service_http=args.service_http, trace_url=args.trace_url,
-        session_id=args.session_id, gate_dir=str(args.gate_dir), started_unix_ns=started_unix_ns,
+        session_id=args.session_id, tp_size=args.tp_size, gate_dir=str(args.gate_dir), started_unix_ns=started_unix_ns,
         duration_limit_seconds=args.duration_limit, requests=500, first_serial=250,
         last_client_concurrency=2, outer_hard_stop_seconds=600,
         pending_scope="This HTTP probe only; internal engine RPC pending map is not exposed"))
@@ -103,7 +123,7 @@ def run(args):
 
     def status_ok(before, after):
         follow.check_status(args, before, after)
-        assert after["is_healthy"] and after["objects"] == 10, "Expected fixed ten-object healthy pool"
+        assert after["is_healthy"] and after["objects"] == 10 * args.tp_size, "Expected ten objects per shard"
         assert after.get("active_prefetch_jobs", 0) == after.get("active_sessions", 0) == 0
         assert after.get("active_p2p_lookup_jobs", 0) == 0
 
@@ -121,7 +141,7 @@ def run(args):
         assert chunks == 10 and len(tokens) % args.chunk_size, "Requires the ten-chunk strong gate"
         before = snapshot(args.output / "before", with_trace=True)
         status_ok(before["status"], before["status"])
-        roster = follow.d_roster(before["trace"], args)
+        follow.d_roster(before["trace"], args)
         checkpoints = []
 
         def send(index):
@@ -186,7 +206,7 @@ def run(args):
         assert counts == dict(prompt=500 * len(tokens), external=external,
                               compute=500 * len(tokens) - external, local_prefix=0), counts
         copies = follow.trace_counts(args, before["trace"], after["trace"], 500 * chunks)
-        native = native_counts(before["trace"], after["trace"], 500 * chunks, roster[0][1])
+        native = native_counts_by_shard(args, before["trace"], after["trace"], 500 * chunks)
         budget.remaining()
         result = dict(status="SHORT_REPEAT_FUNCTION_PASS", completed_requests=len(rows),
             clients=state, request_identities=rows, checkpoints=checkpoints, metrics=counts,
@@ -211,6 +231,7 @@ def main(argv=None):
     parser.add_argument("--service-http", required=True)
     parser.add_argument("--trace-url", required=True)
     parser.add_argument("--session-id", required=True)
+    parser.add_argument("--tp-size", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-answer", default="VELM42")
     parser.add_argument("--expected-pool-memory-type", choices=("host", "device"), default="device")
@@ -220,10 +241,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 0 < args.timeout <= 15 or not 0 < args.duration_limit <= 570:
         parser.error("HTTP timeout must be <=15s; absolute budget <=570s within outer 600s guard")
-    args.tp_size, args.chunk_size = 1, 128
+    args.chunk_size = 128
     if not args.run:
         print(json.dumps(dict(status="PLAN_ONLY", requests=500, serial_requests=250,
             remaining_client_threads=2, checkpoint_every=50, total_budget=args.duration_limit,
+            tp_size=args.tp_size, objects=10 * args.tp_size, world_size=1 + 2 * args.tp_size,
             decoder=args.decoder, service_http=args.service_http, trace_url=args.trace_url,
             no_device_or_service_launch=True, original_worker_jsonl_required=True), indent=2))
         return
