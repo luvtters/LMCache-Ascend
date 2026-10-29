@@ -232,7 +232,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
         with self._state_lock:
             self._observe_peer_departure()
             if self._poisoned:
-                return found
+                raise RuntimeError(self._last_error or "BM is unavailable")
             for i, key in enumerate(keys):
                 entry = self._entries.get(key)
                 if entry is None or entry.delete_pending:
@@ -253,9 +253,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
         total = 0
         with self._state_lock:
             self._observe_peer_departure()
+            if self._poisoned:
+                raise RuntimeError(self._last_error or "BM is unavailable")
             for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
-                if self._poisoned:
-                    break
                 entry = self._entries.get(key)
                 if entry is None:
                     continue
@@ -272,6 +272,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
                 except Exception as exc:
                     self._last_error = str(exc)
                     logger.exception("MemFabric load failed")
+                    raise
             logger.info("MEMFABRIC_LOAD keys=%d bytes=%d rank=%d",
                         len(keys), total, self.storage_rank)
         return found
