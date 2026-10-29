@@ -4,28 +4,29 @@ This probe uses SDK `BigMemory.copy_data_batch` on original split-NHD NPU KV
 planes. There is no gather/scatter scratch and no production connector change.
 CPU checks and PLAN_ONLY output do not prove native batch or inference support.
 
-Run on 12 (`192.168.0.50`) inside the verified personal container, with the
-matching private core/Ascend sources on PYTHONPATH. Start a fresh CPU coordinator:
+Use the verified personal container and matching core/Ascend sources on
+PYTHONPATH. Set private endpoints and paths explicitly; start a fresh CPU coordinator:
 
 ```bash
-python examples/memfabric/direct_coordination.py --bind 192.168.0.50 --port 29615 \
-  --directory /workspace/d00896497/batch_probe/coord --run-id batch-l4-attempt01
+python examples/memfabric/direct_coordination.py --bind "$COORD_BIND" --port "$COORD_PORT" \
+  --directory "$PRIVATE_COORD_DIR" --run-id "$FRESH_RUN_ID"
 ```
 
 Launch three foreground roles concurrently, each in its own process/environment:
-pool physical6/rank0, P physical2/rank1, D physical4/rank2. Each process masks its
+pool/rank0, P/rank1, D/rank2. Each process masks its
 single physical card with `ASCEND_RT_VISIBLE_DEVICES`, then uses logical device0.
 The outer executor must verify this mapping and save PID/process group and wait.
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=6 python examples/memfabric/batch_direct_probe.py \
-  --role pool --run-id batch-l4-attempt01 --layers 4 \
-  --output-dir /workspace/d00896497/batch_probe/results --run --allow-npu
+ASCEND_RT_VISIBLE_DEVICES="$PHYSICAL_DEVICE" python examples/memfabric/batch_direct_probe.py \
+  --role "$ROLE" --run-id "$FRESH_RUN_ID" --layers 4 \
+  --store-url "$STORE_URL" --coord-url "$COORD_URL" \
+  --output-dir "$PRIVATE_RESULT_DIR" --run --allow-npu
 ```
 
-Use the same arguments with physical2/role p and physical4/role d. Default store
-is `tcp://192.168.0.50:28715`; coordinator is `http://192.168.0.50:29615`. Both are
-overridable. Default without `--run` is PLAN_ONLY. Runtime imports require the
+Use matching endpoint/run arguments with each role's selected physical device.
+Roles may run on different hosts; HTTP contains metadata only and paths are local
+to each host. Default without `--run` is PLAN_ONLY. Runtime imports require the
 existing SDK1.2.1/torch_npu/CANN environment; no installation is performed.
 
 First finish L4 (2MiB); then use a fresh coordinator/session/group for `--layers
@@ -48,3 +49,31 @@ wait/exit and device-release evidence. It is not a model inference result and
 does not mean LMCache has integrated batch transfers. No automatic restart.
 
 CPU check: `python examples/memfabric/check_batch_direct_probe_cpu.py`.
+
+## DEVICE selection and selected validation, 2026-10-30
+
+HOST remains the default. Select `--pool-memory-type device` explicitly and use
+a matching BMSession wrapper supporting DEVICE. Each DEVICE rank declares
+**1 GiB DRAM plus 1 GiB HBM**, not a pure-HBM allocation. The target is the owner's
+DEVICE peer pointer; its LOCAL_DEVICE mapping must become nonzero. HOST does
+not add this DEVICE mapping requirement. The 7 CPU checks cover this boundary.
+
+The original HOST probe passed same-host L4 and L36. Frozen DEVICE probe
+`fe14a5f` passed one independent cross-host L36 group: P and D on one host, an
+independent owner on another. Each direction submitted one 144-segment native
+batch covering 18 MiB, flags0/stream0. Every local pointer was distinct and
+checked against its retained tensor plane. All 72 K/V planes passed written-page,
+untouched-page and full-content checks (28,311,552 elements), without scratch.
+Native export/import logs confirmed owner DEVICE and separate 1 GiB DRAM/HBM
+segments; configuration alone was not used as proof.
+
+P, D and owner exited naturally 0 after wait/leave/destroy/uninit. The executor
+and isolated 75-second deadline guard exited 0; the guard cancelled after all
+role waits. The CPU coordinator received planned SIGINT and exited -2. Final
+readback found the three selected devices released. Native logs retain early
+mapping retries before readiness; these were not described as absent.
+
+This proves an independent original-page batch primitive, not production
+LMCache batch integration, model inference, multi-request IO aggregation,
+asynchronous DMA, overlap, link-byte attribution, performance or long-term
+stability. Cross-host HOST/DRAM failures remain unresolved.
