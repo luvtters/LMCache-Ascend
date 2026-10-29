@@ -35,13 +35,25 @@ Recorded real-NPU validation on 2026-10-30:
   showed the dispatcher thread stopped before BM group leave/uninitialization;
   shutdown had no thread errors or timeouts. Coordinators were explicitly
   stopped, every real wait was recorded, and allocated devices were released.
+- A separate strong-context question campaign used the same paired production
+  code with Qwen3-8B at TP1 and TP4. Both runs had 1,364 actual prompt tokens.
+  The cold D reference computed all 1,364 tokens, used no external KV and issued
+  no BM copy. The cached D run used 1,280 external tokens plus 84 computed tokens,
+  with zero local-prefix tokens, and returned the same hidden-code answer as
+  the cold reference. Per-rank completion traces totaled 180 MiB in each
+  direction; TP4 required all four shard receipts. P/D exited zero and the
+  service exited 130 after only its planned interrupt, with the dispatcher
+  stopped before BM teardown and no shutdown errors. The retrieved archive's
+  selected gate summaries, cold references, waits and shutdown logs were
+  checked before recording these results. Gate tooling is a separate harness.
 
 Scope: worker-direct services had empty ordinary built-in GPU registrations.
 This does not establish general shutdown safety with nonempty built-in contexts
 and outstanding device streams. Earlier service SIGSEGV and lock-error samples
 are retained; these results do not uniquely identify their native root cause.
-There is no model inference, throughput, physical-link byte, or long-duration
-stability claim here. DEVICE selection still contributes both DRAM and HBM;
+The model results are functional checks; there is no throughput, hardware-link
+byte, long-duration stability, or real-model TP8 claim. DEVICE selection still
+contributes both DRAM and HBM;
 the earlier remote HOST/DRAM failure remains unresolved.
 
 Internal raw logs and host identifiers are intentionally kept outside this
