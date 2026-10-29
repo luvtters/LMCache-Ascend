@@ -122,6 +122,8 @@ def worker_roster(records, tp_size):
         assert len({identity for (worker_role, _), identity in roster.items()
                     if worker_role == role}) == tp_size, "One process cannot represent multiple TP shards"
     for record in records:
+        if record["kind"] == "scheduler_step":
+            continue  # Actual scheduler PID is not a TP worker identity.
         if tp_size > 1:
             assert all(field in record for field in ("worker_shard", "tp_size", "vllm_worker_id")), "Missing actual TP worker identity"
         key = (record["role"], record.get("worker_shard", 0))

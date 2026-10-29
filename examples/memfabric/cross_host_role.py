@@ -22,6 +22,9 @@ def build_plan(args):
     case = root / 'runs' / args.session_id
     mapping = TOPOLOGIES[args.topology]
     tp_size = args.tp_size
+    max_num_seqs = getattr(args, 'max_num_seqs', 1)
+    if type(max_num_seqs) is not int or max_num_seqs not in (1, 2):
+        raise ValueError('Experimental max_num_seqs must be 1 or 2')
     pool_memory_type = getattr(args, 'pool_memory_type', 'host')
     if pool_memory_type not in ('host', 'device'):
         raise ValueError('pool_memory_type must be host or device')
@@ -124,7 +127,7 @@ def build_plan(args):
         argv = [python, '-m', 'vllm.entrypoints.cli.main', 'serve', args.model,
                 '--served-model-name', 'mf-direct', '--tensor-parallel-size', str(tp_size), '--seed', '1024',
                 '--dtype', 'bfloat16', '--max-model-len', '4096', '--max-num-batched-tokens', '1024',
-                '--max-num-seqs', '1', '--block-size', '128', '--gpu-memory-utilization', '0.7',
+                '--max-num-seqs', str(max_num_seqs), '--block-size', '128', '--gpu-memory-utilization', '0.7',
                 '--enforce-eager', '--no-enable-prefix-caching', '--host', ip,
                 '--port', '28401' if args.role == 'p' else '28402',
                 '--kv-transfer-config', json.dumps(config)]
@@ -210,6 +213,8 @@ def main():
     parser.add_argument('--pool-memory-type', choices=('host', 'device'), default='host',
                         help='Selected object pool; device also declares 1 GiB DRAM per rank')
     parser.add_argument('--tp-size', type=int, choices=(1, 2, 4, 8), default=1)
+    parser.add_argument('--max-num-seqs', type=int, choices=(1, 2), default=1,
+                        help='Experimental engine scheduling capacity; default remains one')
     parser.add_argument('--p-devices', type=lambda value: [int(v) for v in value.split(',')])
     parser.add_argument('--d-devices', type=lambda value: [int(v) for v in value.split(',')])
     parser.add_argument('--pool-device', type=int, help='Defaults to T0=12, other topologies=8')

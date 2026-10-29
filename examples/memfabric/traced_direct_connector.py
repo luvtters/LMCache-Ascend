@@ -168,3 +168,13 @@ class MemFabricDirectConnector(_DirectConnector):
     def create_lmcache_mp_worker_adapter(self, **adapter_kwargs):
         install_trace(adapter_kwargs.get("parallel_strategy"))
         return super().create_lmcache_mp_worker_adapter(**adapter_kwargs)
+
+    def build_connector_meta(self, scheduler_output):
+        # Scheduler diagnostics have their own actual PID, not a worker shard.
+        # Record the original schedule before delegating, without modifying it.
+        self._memfabric_scheduler_step = getattr(self, "_memfabric_scheduler_step", 0) + 1
+        tokens = {str(key): int(value) for key, value in scheduler_output.num_scheduled_tokens.items()}
+        emit("scheduler_step", "begin", scheduler_step=self._memfabric_scheduler_step,
+             num_scheduled_tokens=tokens,
+             scheduled_request_ids=[key for key, value in tokens.items() if value > 0])
+        return super().build_connector_meta(scheduler_output)
