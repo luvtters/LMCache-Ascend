@@ -80,8 +80,8 @@ def run_capacity_matrix(adapter, run_id, emit, timeout=30):
         assert [result.test(i) for i in range(len(indices))] == wanted
 
     def store(index):
-        # This write happens only after the previous task's SDK copy+wait has
-        # returned and its result was consumed. No batch shares mutable contents.
+        # Reuse only after the previous synchronous SDK copy returned and its
+        # future result was consumed. No batch shares mutable contents.
         assert source.get_ref_count() == 1
         torch.bitwise_xor(pattern, index, out=source.raw_tensor)
         emit("source_pattern_ready", key=index, address=source.data_ptr, bytes=SLOT)
