@@ -20,6 +20,56 @@ def load_bm():
 
 
 class HbmContracts(unittest.TestCase):
+    def test_synthetic_role_and_actual_constructors_receive_device_selection(self):
+        examples = Path(__file__).parents[3] / "examples/memfabric"
+        def load(name):
+            spec = importlib.util.spec_from_file_location(name, examples / (name + ".py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        role = load("cross_host_role")
+        synthetic = load("validate_direct_kv")
+        args = SimpleNamespace(root="/private", python="/venv/python", topology="T3",
+            tp_size=1, pool_gb=1, session_id="cpu-media", skip_blocks=0,
+            model="/readonly/model", p_devices=[2], d_devices=[10], pool_device=14,
+            pool_memory_type="device")
+        for stage in ("primitive", "context"):
+            args.stage = stage
+            for name in ("service", "p", "d"):
+                args.role = name
+                plan = role.build_plan(args)
+                if stage == "context" and name == "service":
+                    self.assertEqual(plan["config"]["config"]["pool_memory_type"], "device")
+                else:
+                    self.assertEqual(plan["argv"][plan["argv"].index("--pool-memory-type") + 1], "device")
+
+        class Captured(RuntimeError):
+            pass
+        received = []
+        def capture(**kwargs):
+            received.append(kwargs)
+            raise Captured()
+        synthetic.real_imports = lambda *a: (None, capture, None)
+        native_args = SimpleNamespace(role="pool", device=0, pool_gb=1, store_url="test",
+                                     init_timeout=90, pool_memory_type="device")
+        with self.assertRaises(Captured):
+            synthetic.primitive(native_args, {})
+        self.assertEqual(received[-1]["pool_memory_type"], "device")
+        synthetic.allocate_kv = lambda *a, **k: {}
+        native_args = SimpleNamespace(role="p", device=0, pool_gb=1, store_url="test",
+            init_timeout=90, pool_memory_type="device", server_url="test", tokens=128,
+            timeout=1, run_id="cpu-case")
+        modules = {
+            "lmcache.v1.multiprocess.custom_types": SimpleNamespace(IPCCacheServerKey=object),
+            "lmcache.v1.multiprocess.transport.factory": SimpleNamespace(
+                RequestClientFactory=SimpleNamespace(create=lambda *a: object())),
+            "lmcache_ascend.v1.distributed.memfabric_direct": SimpleNamespace(
+                MemFabricDirectTransferContext=capture, MemFabricDirectSchedulerBackend=object),
+        }
+        with patch.dict("sys.modules", modules), self.assertRaises(Captured):
+            synthetic.context_mode(native_args, {})
+        self.assertEqual(received[-1]["extra_config"]["lmcache.mp.direct"]["pool_memory_type"], "device")
+
     def test_role_threads_explicit_device_medium_and_gate_expectation(self):
         path = Path(__file__).parents[3] / "examples/memfabric/cross_host_role.py"
         spec = importlib.util.spec_from_file_location("role_media_cpu", path)

@@ -30,6 +30,7 @@ def arguments():
     parser.add_argument("--store-url", default="tcp://127.0.0.1:28680")
     parser.add_argument("--server-url", default="tcp://127.0.0.1:28681")
     parser.add_argument("--pool-gb", type=int, default=1)
+    parser.add_argument("--pool-memory-type", choices=("host", "device"), default="host")
     parser.add_argument("--layers", type=int, default=36)
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-size", type=int, default=128)
@@ -205,7 +206,8 @@ def primitive(args, report):
                           native_format=str(transfer.format), bytes=transfer.size)
         session = BMSession(device_id=args.device, rank_id={"pool": 0, "p": 1, "d": 2}[args.role],
                             world_size=3, pool_gb=args.pool_gb, store_url=args.store_url,
-                            init_timeout=args.init_timeout)
+                            init_timeout=args.init_timeout,
+                            **({"pool_memory_type": "device"} if args.pool_memory_type == "device" else {}))
         report["bm_join_complete"] = True
         marker(args, "joined-" + args.role)
         if args.role == "p":
@@ -269,6 +271,7 @@ def context_mode(args, report):
             "device_id": args.device, "rank_id": 1 if args.role == "p" else 2,
             "world_size": 3, "pool_gb": args.pool_gb, "store_url": args.store_url,
             "init_timeout": args.init_timeout,
+            **({"pool_memory_type": "device"} if args.pool_memory_type == "device" else {}),
             "member_id": args.run_id + "-" + args.role}})
     scheduler = None
     closed = False
@@ -352,6 +355,9 @@ def main():
         layers=args.layers, kv_heads=args.kv_heads, head_size=args.head_size,
         block_size=args.block_size, chunk_tokens=args.tokens, layout=args.layout,
         dtype="torch.bfloat16", planned_payload_bytes=args.payload_bytes,
+        pool_memory_type=args.pool_memory_type,
+        declared_dram_bytes_per_rank=(args.pool_gb if args.pool_memory_type == "host" else 1) << 30,
+        declared_hbm_bytes_per_rank=(args.pool_gb << 30) if args.pool_memory_type == "device" else 0,
         kv_origin="synthetic_qwen3_style_paged_tensors",
         model_weights_loaded=False, model_inference_verified=False,
         vllm_connector_or_worker_adapter_verified=False,

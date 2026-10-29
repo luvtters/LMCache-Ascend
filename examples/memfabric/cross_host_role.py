@@ -25,8 +25,6 @@ def build_plan(args):
     pool_memory_type = getattr(args, 'pool_memory_type', 'host')
     if pool_memory_type not in ('host', 'device'):
         raise ValueError('pool_memory_type must be host or device')
-    if args.stage != 'inference' and pool_memory_type != 'host':
-        raise ValueError('Device-selected pool is an inference candidate; primitive/context roles remain host')
     if args.stage == 'inference' and tp_size > 1 and args.pool_gb * (1 << 30) < (1373 // 128) * tp_size * (32 << 20):
         raise ValueError('Pool capacity cannot hold this frozen TP prefix with 32 MiB slots')
     pool_host = mapping['service'][0]
@@ -155,6 +153,9 @@ def build_plan(args):
                 '--port', '29595' if args.role == 'coordinator' else '29596',
                 '--directory', str(case / ('coord' if args.role == 'coordinator' else 'trace-events')),
                 '--run-id', args.session_id, '--trace-dir', str(case / 'trace')]
+    if (pool_memory_type == 'device' and args.stage != 'inference'
+            and (args.role in ('p', 'd') or (args.role == 'service' and args.stage == 'primitive'))):
+        argv += ['--pool-memory-type', 'device']
     return dict(status='PLAN_ONLY', host=host, ip=ip, role=args.role, topology=args.topology,
                 comparison_scope='single_host_positive_control' if args.topology == 'T0' else 'cross_host',
                 stage=args.stage, session_id=args.session_id, cwd=str(ascend), argv=argv,

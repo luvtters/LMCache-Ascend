@@ -1,7 +1,8 @@
 # Cross-host worker-direct role contract
 
 The independent HBM candidate accepts `--pool-memory-type device` for inference
-roles only. Use the same option on service/P/D and all helper role plans. Objects
+and TP1 synthetic primitive/context roles. Use the same option on service/P/D
+and all helper role plans. Objects
 select the SDK DEVICE pool; every BM rank still declares **1 GiB DRAM plus
 pool_gb GiB HBM**, matching the verified media probe. This is not a pure-HBM
 allocation and does not repair or validate the failed cross-host HOST DRAM route.
