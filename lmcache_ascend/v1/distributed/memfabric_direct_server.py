@@ -16,18 +16,23 @@ import threading
 
 from lmcache.v1.multiprocess.engine_module import DiscoverableModule
 from lmcache.v1.multiprocess.ext_server_module import server_module_handler
+from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import LMCacheDrivenTransferModule
 
 from lmcache_ascend.v1.distributed.memfabric_pool_index import PoolIndex
 
 
 class MemFabricDirectServerModule(DiscoverableModule):
     module_name = "memfabric_direct"
+    module_dependencies = (LMCacheDrivenTransferModule,)
 
     @classmethod
     def create(cls, build_ctx):
-        return cls(build_ctx.engine_context, dict(build_ctx.config_for(cls)))
+        transfer = build_ctx.require(LMCacheDrivenTransferModule)
+        return cls(build_ctx.engine_context, dict(build_ctx.config_for(cls)),
+                   quiesce_device_callbacks=transfer.quiesce_device_callbacks)
 
-    def __init__(self, context, config, *, session_factory=None):
+    def __init__(self, context, config, *, session_factory=None,
+                 quiesce_device_callbacks=None):
         fields = {"device_id", "rank_id", "world_size", "pool_gb", "slot_size_mb", "store_url"}
         if not fields <= set(config) or set(config) - fields - {"init_timeout", "tp_size", "pool_memory_type"}:
             raise ValueError("MemFabric direct config requires %s and optional init_timeout" % sorted(fields))
@@ -40,6 +45,7 @@ class MemFabricDirectServerModule(DiscoverableModule):
                 or not isinstance(config["store_url"], str) or not config["store_url"]):
             raise ValueError("Invalid BM device, rank, capacity or store URL")
         self._ctx = context
+        self._quiesce_device_callbacks = quiesce_device_callbacks
         self._config = dict(config)
         self._index = PoolIndex(pool_bytes=config["pool_gb"] << 30,
                                 slot_size=config["slot_size_mb"] << 20,
@@ -152,6 +158,10 @@ class MemFabricDirectServerModule(DiscoverableModule):
         return self._index.status()
 
     def close(self):
+        if self._quiesce_device_callbacks is not None:
+            # Stop/drain callbacks before BM tears down the device runtime.
+            # The built-in module retains its entries until its later close.
+            self._quiesce_device_callbacks()
         self._index.close()
         self._stop.set()
         self._wake.set()

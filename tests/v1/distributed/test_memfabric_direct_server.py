@@ -21,8 +21,10 @@ def load_server():
     engine.DiscoverableModule = type("DiscoverableModule", (), {})
     extension = types.ModuleType("lmcache.v1.multiprocess.ext_server_module")
     extension.server_module_handler = lambda name: lambda func: func
+    transfer = types.ModuleType("lmcache.v1.multiprocess.modules.lmcache_driven_transfer")
+    transfer.LMCacheDrivenTransferModule = type("LMCacheDrivenTransferModule", (), {})
     with patch.dict(sys.modules, {index_name: index, engine.__name__: engine,
-                                  extension.__name__: extension}):
+                                  extension.__name__: extension, transfer.__name__: transfer}):
         index_spec.loader.exec_module(index)
         spec = importlib.util.spec_from_file_location("memfabric_direct_server", directory / "memfabric_direct_server.py")
         module = importlib.util.module_from_spec(spec)
@@ -80,6 +82,35 @@ class ServerTests(unittest.TestCase):
         self.wait_ready(server)
         server.close()
         self.assertTrue(sessions[0].closed)
+
+    def test_device_callbacks_quiesce_before_bm_close_and_failure_retains_session(self):
+        events = []
+        class Session(FakeSession):
+            def close(self):
+                events.append('bm-wait-leave-uninit')
+                super().close()
+        def quiesce():
+            events.append('quiesce')
+        server = load_server()(None, self.config, session_factory=lambda **kw: Session(),
+                               quiesce_device_callbacks=quiesce)
+        self.wait_ready(server)
+        server.close()
+        self.assertEqual(events, ['quiesce', 'bm-wait-leave-uninit'])
+
+        def fail():
+            raise TimeoutError('dispatcher still alive')
+        sessions = []
+        def factory(**kw):
+            item = Session(); sessions.append(item); return item
+        server = load_server()(None, self.config, session_factory=factory,
+                               quiesce_device_callbacks=fail)
+        self.wait_ready(server)
+        with self.assertRaisesRegex(TimeoutError, 'dispatcher still alive'):
+            server.close()
+        self.assertFalse(sessions[0].closed)
+        self.assertFalse(server._stop.is_set())
+        server._quiesce_device_callbacks = quiesce
+        server.close()
 
     def test_startup_error_and_peer_departure_are_reported_unavailable(self):
         def fail(**kwargs):
