@@ -1,0 +1,10 @@
+{
+  "type": "mooncake_store",
+  "num_workers": 1,
+  "local_hostname": "127.0.0.1:28507",
+  "metadata_server": "http://127.0.0.1:28502/metadata",
+  "master_server_addr": "127.0.0.1:28501",
+  "global_segment_size": "16777216",
+  "local_buffer_size": "268435456",
+  "protocol": "tcp"
+}

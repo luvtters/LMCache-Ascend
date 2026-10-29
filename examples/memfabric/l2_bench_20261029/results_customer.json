@@ -1,0 +1,1323 @@
+{
+  "date": "2026-10-29",
+  "scope": "SELECTED_CUSTOMER_CROPPED_COMPATIBLE_L2_DIAGNOSTICS",
+  "compatible_revisions": {
+    "lmcache_core": "6913259",
+    "lmcache_ascend": "525a710"
+  },
+  "source_documents": [
+    "customer_final_summary.json",
+    "customer_final_validation.json",
+    "customer_prefetch_analysis_round01.json",
+    "strict_prefetch_audit.json",
+    "final_release.json"
+  ],
+  "protocols": {
+    "customer01": {
+      "mode": "natural P-to-D",
+      "completed_cases": 4,
+      "timed_requests": 64,
+      "literal_text_pairs_equal": 32,
+      "all_l2_route_gate": "FAIL_SHORT_STORE_D_8_MIXED_RECORDS_OTHER_120_ZERO_L1"
+    },
+    "customer02_strict": {
+      "mode": "P event then service L1/store/prefetch drain before D; same C1 shim for both arms",
+      "completed_cases": 3,
+      "timed_requests": 48,
+      "literal_text_pairs_equal": 24,
+      "prefetch_records": 96,
+      "zero_l1_records": 96,
+      "all_l2_route_gate": "PASS_RECORDED_THREE_128_OUTPUT_CASES",
+      "in16384_p90_out1000": "NOT_RUN"
+    }
+  },
+  "aggregation": "within each tag only; no cross-protocol pooling, averaging, subtraction-as-copy-cost, or significance claim",
+  "coverage": {
+    "actual_case_arm_records": 14,
+    "timed_requests": 112,
+    "failed_requests": 0,
+    "literal_text_equal": 56,
+    "literal_text_compared": 56,
+    "base_plus_customer_timed_requests": 688,
+    "base_plus_customer_failed_requests": 0,
+    "base_literal_text_equal": 286,
+    "base_literal_text_compared": 288,
+    "base_mismatches_retained": 2
+  },
+  "configuration": {
+    "pool_bytes": 68719476736,
+    "slot_bytes": 33554432,
+    "l1_bytes": 8589934592,
+    "max_model_len": 32768,
+    "model_max_context": 40960,
+    "seed_requests_per_case": 2,
+    "timed_requests_per_case_arm": 8,
+    "timed_concurrency": 1,
+    "memory_reservation_difference": "BM 64 GiB per rank x2; Store owner 64 GiB plus client segment 16 MiB; not equal aggregate retained memory",
+    "prompt_only_design_unique_slots_four_cases": 1680,
+    "prompt_only_design_slot_bytes_four_cases": 56371445760
+  },
+  "runtime_routes": [
+    {
+      "tag": "customer01",
+      "arm": "memfabric",
+      "actual_runtime_route": "MemFabric BM SDMA, rank1",
+      "mc_use_tent_literal_zero_does_not_override_runtime_tent_log": false
+    },
+    {
+      "tag": "customer02_strict",
+      "arm": "memfabric",
+      "actual_runtime_route": "MemFabric BM SDMA, rank1",
+      "mc_use_tent_literal_zero_does_not_override_runtime_tent_log": false
+    },
+    {
+      "tag": "customer01",
+      "arm": "store",
+      "actual_runtime_route": "AscendDirectTransport + runtime TENT + LocalCommRes1.2 + BufferPool4:8",
+      "mc_use_tent_literal_zero_does_not_override_runtime_tent_log": true
+    },
+    {
+      "tag": "customer02_strict",
+      "arm": "store",
+      "actual_runtime_route": "AscendDirectTransport + runtime TENT + LocalCommRes1.2 + BufferPool4:8",
+      "mc_use_tent_literal_zero_does_not_override_runtime_tent_log": true
+    }
+  ],
+  "records": [
+    {
+      "tag": "customer01",
+      "case_id": "in4096_p50_out128",
+      "arm": "memfabric",
+      "input_tokens": 4096,
+      "prefix_tokens": 2048,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 19.816648108384836,
+        "duration_seconds": 51.67372374981642,
+        "mean_ttft_ms": 399.6786626521498,
+        "mean_tpot_ms": 47.70907279430324
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 16384.0,
+          "local_compute": 16384.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 32760.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 128,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 16,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 256,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 32,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": null,
+      "timed_adapter_counters": {
+        "load_bytes_delta": 7247757312,
+        "store_bytes_delta": 2415919104,
+        "evicted_objects_delta": 0,
+        "objects_after": 192,
+        "free_slots_after": 1856,
+        "locked_objects_before_after": [
+          0,
+          0
+        ],
+        "pins_before_after": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "tag": "customer01",
+      "case_id": "in4096_p50_out128",
+      "arm": "store",
+      "input_tokens": 4096,
+      "prefix_tokens": 2048,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 18.881449834303933,
+        "duration_seconds": 54.23312346171588,
+        "mean_ttft_ms": 544.1292956238613,
+        "mean_tpot_ms": 49.090165790632426
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 16384.0,
+          "local_compute": 16384.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 32760.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 128,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 16,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 64,
+          "matched_l2_chunks": 192,
+          "observed_splits": [
+            {
+              "l1_chunks": 8,
+              "l2_chunks": 24,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": false,
+      "missing_store_byte_counters": "UNKNOWN_NOT_INFERRED",
+      "timed_adapter_counters": null
+    },
+    {
+      "tag": "customer01",
+      "case_id": "in16384_p50_out128",
+      "arm": "memfabric",
+      "input_tokens": 16384,
+      "prefix_tokens": 8192,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 16.763295024269073,
+        "duration_seconds": 61.085842521861196,
+        "mean_ttft_ms": 1471.545834094286,
+        "mean_tpot_ms": 48.532899515886655
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 65536.0,
+          "local_compute": 65536.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 512,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 64,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": null,
+      "timed_adapter_counters": {
+        "load_bytes_delta": 28991029248,
+        "store_bytes_delta": 9663676416,
+        "evicted_objects_delta": 0,
+        "objects_after": 960,
+        "free_slots_after": 1088,
+        "locked_objects_before_after": [
+          0,
+          0
+        ],
+        "pins_before_after": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "tag": "customer01",
+      "case_id": "in16384_p50_out128",
+      "arm": "store",
+      "input_tokens": 16384,
+      "prefix_tokens": 8192,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 15.484724500887943,
+        "duration_seconds": 66.12968799937516,
+        "mean_ttft_ms": 1956.8187007680535,
+        "mean_tpot_ms": 49.67577193174365
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 65536.0,
+          "local_compute": 65536.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 512,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 64,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": "UNKNOWN_NOT_INFERRED",
+      "timed_adapter_counters": null
+    },
+    {
+      "tag": "customer01",
+      "case_id": "in16384_p90_out128",
+      "arm": "memfabric",
+      "input_tokens": 16384,
+      "prefix_tokens": 14720,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 18.880987448911807,
+        "duration_seconds": 54.234451602213085,
+        "mean_ttft_ms": 787.968558142893,
+        "mean_tpot_ms": 47.17199121671545
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 117760.0,
+          "local_compute": 13312.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 920,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 115,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": null,
+      "timed_adapter_counters": {
+        "load_bytes_delta": 36691771392,
+        "store_bytes_delta": 1962934272,
+        "evicted_objects_delta": 0,
+        "objects_after": 1320,
+        "free_slots_after": 728,
+        "locked_objects_before_after": [
+          0,
+          0
+        ],
+        "pins_before_after": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "tag": "customer01",
+      "case_id": "in16384_p90_out128",
+      "arm": "store",
+      "input_tokens": 16384,
+      "prefix_tokens": 14720,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 16.690400581621862,
+        "duration_seconds": 61.352631711401045,
+        "mean_ttft_ms": 1419.4011762738228,
+        "mean_tpot_ms": 49.2057717894754
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 117760.0,
+          "local_compute": 13312.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 920,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 115,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": "UNKNOWN_NOT_INFERRED",
+      "timed_adapter_counters": null
+    },
+    {
+      "tag": "customer01",
+      "case_id": "in16384_p90_out1000",
+      "arm": "memfabric",
+      "input_tokens": 16384,
+      "prefix_tokens": 14720,
+      "output_tokens": 1000,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 8000,
+      "metrics": {
+        "output_token_s": 19.596524850035927,
+        "duration_seconds": 408.23564694356173,
+        "mean_ttft_ms": 800.0789681682363,
+        "mean_tpot_ms": 50.279149325686625
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 117760.0,
+          "local_compute": 13312.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 920,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 115,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": null,
+      "timed_adapter_counters": {
+        "load_bytes_delta": 36691771392,
+        "store_bytes_delta": 1962934272,
+        "evicted_objects_delta": 0,
+        "objects_after": 1680,
+        "free_slots_after": 368,
+        "locked_objects_before_after": [
+          0,
+          0
+        ],
+        "pins_before_after": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "tag": "customer01",
+      "case_id": "in16384_p90_out1000",
+      "arm": "store",
+      "input_tokens": 16384,
+      "prefix_tokens": 14720,
+      "output_tokens": 1000,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 8000,
+      "metrics": {
+        "output_token_s": 18.504011939973893,
+        "duration_seconds": 432.33867476694286,
+        "mean_ttft_ms": 1446.9583597965539,
+        "mean_tpot_ms": 52.647470756344404
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 117760.0,
+          "local_compute": 13312.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 920,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 115,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": "UNKNOWN_NOT_INFERRED",
+      "timed_adapter_counters": null
+    },
+    {
+      "tag": "customer02_strict",
+      "case_id": "in4096_p50_out128",
+      "arm": "memfabric",
+      "input_tokens": 4096,
+      "prefix_tokens": 2048,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 18.579008719802513,
+        "duration_seconds": 55.115965304896235,
+        "mean_ttft_ms": 459.12200526800007,
+        "mean_tpot_ms": 50.62896728709956
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 16384.0,
+          "local_compute": 16384.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 32760.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 128,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 16,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 256,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 32,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": null,
+      "timed_adapter_counters": {
+        "load_bytes_delta": 7247757312,
+        "store_bytes_delta": 2415919104,
+        "evicted_objects_delta": 0,
+        "objects_after": 192,
+        "free_slots_after": 1856,
+        "locked_objects_before_after": [
+          0,
+          0
+        ],
+        "pins_before_after": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "tag": "customer02_strict",
+      "case_id": "in4096_p50_out128",
+      "arm": "store",
+      "input_tokens": 4096,
+      "prefix_tokens": 2048,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 17.053053703027683,
+        "duration_seconds": 60.0478962790221,
+        "mean_ttft_ms": 749.7055938001722,
+        "mean_tpot_ms": 53.19503270819285
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 16384.0,
+          "local_compute": 16384.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 32760.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 128,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 16,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 256,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 32,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": "UNKNOWN_NOT_INFERRED",
+      "timed_adapter_counters": null
+    },
+    {
+      "tag": "customer02_strict",
+      "case_id": "in16384_p50_out128",
+      "arm": "memfabric",
+      "input_tokens": 16384,
+      "prefix_tokens": 8192,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 15.899462946368208,
+        "duration_seconds": 64.40469111781567,
+        "mean_ttft_ms": 1528.5008591599762,
+        "mean_tpot_ms": 51.3511948786148
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 65536.0,
+          "local_compute": 65536.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 512,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 64,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": null,
+      "timed_adapter_counters": {
+        "load_bytes_delta": 28991029248,
+        "store_bytes_delta": 9663676416,
+        "evicted_objects_delta": 0,
+        "objects_after": 960,
+        "free_slots_after": 1088,
+        "locked_objects_before_after": [
+          0,
+          0
+        ],
+        "pins_before_after": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "tag": "customer02_strict",
+      "case_id": "in16384_p50_out128",
+      "arm": "store",
+      "input_tokens": 16384,
+      "prefix_tokens": 8192,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 14.285498350309211,
+        "duration_seconds": 71.68108349386603,
+        "mean_ttft_ms": 2494.145549251698,
+        "mean_tpot_ms": 50.90916429198985
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 65536.0,
+          "local_compute": 65536.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 512,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 64,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": "UNKNOWN_NOT_INFERRED",
+      "timed_adapter_counters": null
+    },
+    {
+      "tag": "customer02_strict",
+      "case_id": "in16384_p90_out128",
+      "arm": "memfabric",
+      "input_tokens": 16384,
+      "prefix_tokens": 14720,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 17.331971946991985,
+        "duration_seconds": 59.08156343270093,
+        "mean_ttft_ms": 853.0015805736184,
+        "mean_tpot_ms": 51.43063865220687
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 117760.0,
+          "local_compute": 13312.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 920,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 115,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": null,
+      "timed_adapter_counters": {
+        "load_bytes_delta": 36691771392,
+        "store_bytes_delta": 1962934272,
+        "evicted_objects_delta": 0,
+        "objects_after": 1320,
+        "free_slots_after": 728,
+        "locked_objects_before_after": [
+          0,
+          0
+        ],
+        "pins_before_after": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "tag": "customer02_strict",
+      "case_id": "in16384_p90_out128",
+      "arm": "store",
+      "input_tokens": 16384,
+      "prefix_tokens": 14720,
+      "output_tokens": 128,
+      "concurrency": 1,
+      "rounds": 1,
+      "completed": 8,
+      "failed": 0,
+      "total_actual_output_tokens": 1024,
+      "metrics": {
+        "output_token_s": 15.126394762031582,
+        "duration_seconds": 67.6962366849184,
+        "mean_ttft_ms": 2069.9725814629346,
+        "mean_tpot_ms": 50.326879700007815
+      },
+      "request_source_and_drain_checks_passed": true,
+      "observed_source_deltas": {
+        "p": {
+          "external_kv_transfer": 117760.0,
+          "local_compute": 13312.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 131064.0,
+          "local_compute": 8.0,
+          "local_cache_hit": 0.0
+        }
+      },
+      "native_prefetch_route": {
+        "p": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 920,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 115,
+              "records": 8
+            }
+          ]
+        },
+        "d": {
+          "prefetch_count": 8,
+          "matched_l1_chunks": 0,
+          "matched_l2_chunks": 1024,
+          "observed_splits": [
+            {
+              "l1_chunks": 0,
+              "l2_chunks": 128,
+              "records": 8
+            }
+          ]
+        }
+      },
+      "all_l2_route_passed": true,
+      "missing_store_byte_counters": "UNKNOWN_NOT_INFERRED",
+      "timed_adapter_counters": null
+    }
+  ],
+  "memfabric_whole_run_cumulative_seed_and_timed": [
+    {
+      "tag": "customer01",
+      "counter_scope": "whole run cumulative, includes seed and timed requests; not per-case timed deltas",
+      "final_adapter": {
+        "is_healthy": true,
+        "protocol": "SDMA",
+        "storage_rank": 1,
+        "objects": 1680,
+        "free_slots": 368,
+        "locked_objects": 0,
+        "total_pins": 0,
+        "evicted_objects": 0,
+        "store_bytes": 31708938240,
+        "load_bytes": 125325803520,
+        "last_error": ""
+      },
+      "actual_load_log_sum": {
+        "records": 72,
+        "keys": 6640,
+        "bytes": 125325803520
+      },
+      "actual_store_log_sum": {
+        "records": 216,
+        "keys": 1680,
+        "bytes": 31708938240
+      },
+      "load_and_store_log_sums_match_status": true,
+      "eviction_observed": false
+    },
+    {
+      "tag": "customer02_strict",
+      "counter_scope": "whole run cumulative, includes seed and timed requests; not per-case timed deltas",
+      "final_adapter": {
+        "is_healthy": true,
+        "protocol": "SDMA",
+        "storage_rank": 1,
+        "objects": 1320,
+        "free_slots": 728,
+        "locked_objects": 0,
+        "total_pins": 0,
+        "evicted_objects": 0,
+        "store_bytes": 24914165760,
+        "load_bytes": 83802193920,
+        "last_error": ""
+      },
+      "actual_load_log_sum": {
+        "records": 54,
+        "keys": 4440,
+        "bytes": 83802193920
+      },
+      "actual_store_log_sum": {
+        "records": 168,
+        "keys": 1320,
+        "bytes": 24914165760
+      },
+      "load_and_store_log_sums_match_status": true,
+      "eviction_observed": false
+    }
+  ],
+  "store_independent_owner_placement_summary": [
+    {
+      "tag": "customer01",
+      "queried_keys": 1680,
+      "complete_memory_replicas": 1680,
+      "replica_size_bytes": 18874368,
+      "all_recorded_keys_queried_once_and_owner_placed": true,
+      "independent_owner_endpoint_differs_from_service": true,
+      "owner_segment_bytes": 68719476736,
+      "sdk_distribution": "mooncake-transfer-engine-npu",
+      "sdk_version": "0.3.11.post1",
+      "query_api": "MooncakeDistributedStore.get_replica_desc(key)"
+    },
+    {
+      "tag": "customer02_strict",
+      "queried_keys": 1320,
+      "complete_memory_replicas": 1320,
+      "replica_size_bytes": 18874368,
+      "all_recorded_keys_queried_once_and_owner_placed": true,
+      "independent_owner_endpoint_differs_from_service": true,
+      "owner_segment_bytes": 68719476736,
+      "sdk_distribution": "mooncake-transfer-engine-npu",
+      "sdk_version": "0.3.11.post1",
+      "query_api": "MooncakeDistributedStore.get_replica_desc(key)"
+    }
+  ],
+  "strict_c1_barrier_summary": [
+    {
+      "arm": "memfabric",
+      "actual_barrier_count": 30,
+      "manifest_seed_requests": 6,
+      "manifest_timed_requests": 24,
+      "phase_split_basis": "manifest request totals; barrier messages are not independently phase-labelled",
+      "all_logged_drain_fields_zero": true,
+      "wait_ms_min": 54.16627414524555,
+      "wait_ms_max": 60.71936804801226,
+      "wait_ms_mean": 56.298597094913326,
+      "poll_count_min": 1,
+      "poll_count_max": 1
+    },
+    {
+      "arm": "store",
+      "actual_barrier_count": 30,
+      "manifest_seed_requests": 6,
+      "manifest_timed_requests": 24,
+      "phase_split_basis": "manifest request totals; barrier messages are not independently phase-labelled",
+      "all_logged_drain_fields_zero": true,
+      "wait_ms_min": 53.91791183501482,
+      "wait_ms_max": 141.1160994321108,
+      "wait_ms_mean": 57.51540533577403,
+      "poll_count_min": 1,
+      "poll_count_max": 14
+    }
+  ],
+  "strict_timing_boundary": "All status HTTP checks and drain waits are inside client end-to-end TTFT. Barrier logs are not individually seed/timed-labelled.",
+  "prefetch_timing_boundary": "native Prefetch request completed elapsed is not pure copy bandwidth or independent end-to-end H2D completion proof",
+  "process_exit_evidence": [
+    {
+      "tag": "customer01",
+      "component": "memfabric",
+      "processes": [
+        {
+          "name": "proxy",
+          "exit_code": 0,
+          "normalized_returncode": 0
+        },
+        {
+          "name": "d",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "p",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "member",
+          "exit_code": 0,
+          "normalized_returncode": 0
+        },
+        {
+          "name": "service",
+          "exit_code": 130,
+          "normalized_returncode": 130
+        }
+      ]
+    },
+    {
+      "tag": "customer02_strict",
+      "component": "memfabric",
+      "processes": [
+        {
+          "name": "proxy",
+          "exit_code": 0,
+          "normalized_returncode": 0
+        },
+        {
+          "name": "d",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "p",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "member",
+          "exit_code": 0,
+          "normalized_returncode": 0
+        },
+        {
+          "name": "service",
+          "signal": 15,
+          "normalized_returncode": -15
+        }
+      ]
+    },
+    {
+      "tag": "customer01",
+      "component": "store",
+      "processes": [
+        {
+          "name": "proxy",
+          "exit_code": 0,
+          "normalized_returncode": 0
+        },
+        {
+          "name": "d",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "p",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "service",
+          "signal": 11,
+          "normalized_returncode": -11
+        }
+      ]
+    },
+    {
+      "tag": "customer02_strict",
+      "component": "store",
+      "processes": [
+        {
+          "name": "proxy",
+          "exit_code": 0,
+          "normalized_returncode": 0
+        },
+        {
+          "name": "d",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "p",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "service",
+          "signal": 11,
+          "normalized_returncode": -11
+        }
+      ]
+    },
+    {
+      "tag": "customer01",
+      "component": "store_owner_master",
+      "processes": [
+        {
+          "name": "owner",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "master",
+          "signal": 2,
+          "normalized_returncode": -2
+        }
+      ]
+    },
+    {
+      "tag": "customer02_strict",
+      "component": "store_owner_master",
+      "processes": [
+        {
+          "name": "owner",
+          "signal": 6,
+          "normalized_returncode": -6
+        },
+        {
+          "name": "master",
+          "signal": 2,
+          "normalized_returncode": -2
+        }
+      ]
+    }
+  ],
+  "clean_lifecycle_gate_passed": false,
+  "release": {
+    "time_asia_shanghai": "2026-10-29T20:05:28.959003+08:00",
+    "container_running": false,
+    "container_host_pid": 0,
+    "npu_processes_observed": false,
+    "guard_and_monitor_stopped": true
+  },
+  "overall_status": "DIAGNOSTIC_ONLY_BASE_TEXT_MISMATCH_NATURAL_SHORT_MIXED_ROUTE_AND_LIFECYCLE_FAILURES",
+  "overall_accepted": false,
+  "not_verified": [
+    "cause of larger Store strict prefetch timings",
+    "cause of process shutdown heap corruption",
+    "pure copy bandwidth or H2D completion time from prefetch/Retrieved logs",
+    "HCCS or RoCE link byte speedup",
+    "eviction behavior when final evicted_objects=0",
+    "token-ID and KV numerical equivalence",
+    "stability or causal service speedup"
+  ]
+}

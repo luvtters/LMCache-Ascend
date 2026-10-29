@@ -1,0 +1,696 @@
+{
+  "date": "2026-10-29",
+  "scope": "SELECTED_BASIC_WARM_READ_OFFLINE_ARCHIVE_DIAGNOSTIC",
+  "compatible_revisions": {
+    "lmcache_core": "6913259",
+    "lmcache_ascend": "525a710"
+  },
+  "data_path": "NPU KV <-> CPU L1 staging <-> L2; skip_l1; no worker-direct",
+  "store_route_configuration": {
+    "transport": "existing Ascend relay",
+    "ASCEND_LOCAL_COMM_RES": "1.2",
+    "ASCEND_BUFFER_POOL": "4:8",
+    "production_connector_modified": false
+  },
+  "source_documents": [
+    "basic_complete_summary.json",
+    "basic_complete_analysis.json"
+  ],
+  "coverage": {
+    "expected_conditions": 6,
+    "actual_conditions": 6,
+    "expected_rounds": 18,
+    "actual_rounds": 18,
+    "completed_requests": 576,
+    "failed_requests": 0,
+    "actual_output_tokens": 18432,
+    "all_rounds_32_requests_32_output_tokens": true,
+    "all_p_and_d_sources_and_l1_checks_passed": true,
+    "all_independent_aggregates_match_existing_summary": true,
+    "counts_exclude_seed_and_warmup_rounds": true
+  },
+  "aggregation": {
+    "output_token_s": "sum(actual output tokens) / sum(native duration seconds)",
+    "mean_ttft_and_tpot": "request-count weighted means of native round means",
+    "ttft_p95": "pooled complete per-request arrays",
+    "tpot_p95": "range of native round p95 values; never averaged",
+    "missing_byte_counters": "null means unknown; never inferred from chunks or tensor sizes"
+  },
+  "conditions": [
+    {
+      "prefix_tokens": 1024,
+      "input_tokens_per_request": 1151,
+      "output_tokens_per_request": 32,
+      "arm": "memfabric",
+      "concurrency": 1,
+      "rounds": [
+        1,
+        2,
+        3
+      ],
+      "completed_requests": 96,
+      "failed_requests": 0,
+      "actual_output_tokens": 3072,
+      "duration_seconds": 154.1832807706669,
+      "output_token_s": 19.924339297004003,
+      "mean_ttft_ms": 212.39581346162595,
+      "mean_tpot_ms": 44.94325696335485,
+      "per_round_output_token_s": [
+        19.752069102366892,
+        19.61175851406361,
+        20.42809751062066
+      ],
+      "ttft_pooled_p95_ms": 223.1288398616016,
+      "tpot_round_p95_range_ms": [
+        45.71030735518903,
+        49.01993379537617
+      ],
+      "all_request_and_source_checks_passed": true,
+      "all_round_l1_before_after_empty": true,
+      "actual_load_byte_deltas_per_round": [
+        9663676416,
+        9663676416,
+        9663676416
+      ],
+      "actual_store_byte_deltas_per_round": [
+        0,
+        0,
+        0
+      ],
+      "evicted_object_deltas_per_round": [
+        0,
+        0,
+        0
+      ],
+      "l2_completed_chunk_deltas_per_round": [
+        512.0,
+        512.0,
+        512.0
+      ],
+      "store_byte_counter_state": "OBSERVED_ADAPTER_COUNTER",
+      "lifecycle_gate": "FAILED_PD_SIGABRT_BOTH_ARMS",
+      "observed_sources_per_role_each_round": {
+        "p": {
+          "external_kv_transfer": 32768.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 32768.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        }
+      }
+    },
+    {
+      "prefix_tokens": 1024,
+      "input_tokens_per_request": 1151,
+      "output_tokens_per_request": 32,
+      "arm": "store",
+      "concurrency": 1,
+      "rounds": [
+        1,
+        2,
+        3
+      ],
+      "completed_requests": 96,
+      "failed_requests": 0,
+      "actual_output_tokens": 3072,
+      "duration_seconds": 169.77481248416007,
+      "output_token_s": 18.094556872425446,
+      "mean_ttft_ms": 232.1824003108001,
+      "mean_tpot_ms": 49.54409063856307,
+      "per_round_output_token_s": [
+        18.090501403358214,
+        18.048735453102225,
+        18.144689512919086
+      ],
+      "ttft_pooled_p95_ms": 240.79921329393983,
+      "tpot_round_p95_range_ms": [
+        52.09510987173886,
+        53.425532729635314
+      ],
+      "all_request_and_source_checks_passed": true,
+      "all_round_l1_before_after_empty": true,
+      "actual_load_byte_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "actual_store_byte_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "evicted_object_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "l2_completed_chunk_deltas_per_round": [
+        512.0,
+        512.0,
+        512.0
+      ],
+      "store_byte_counter_state": "UNAVAILABLE_NOT_INFERRED",
+      "lifecycle_gate": "FAILED_PD_SIGABRT_BOTH_ARMS",
+      "observed_sources_per_role_each_round": {
+        "p": {
+          "external_kv_transfer": 32768.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 32768.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        }
+      }
+    },
+    {
+      "prefix_tokens": 3072,
+      "input_tokens_per_request": 3199,
+      "output_tokens_per_request": 32,
+      "arm": "memfabric",
+      "concurrency": 1,
+      "rounds": [
+        1,
+        2,
+        3
+      ],
+      "completed_requests": 96,
+      "failed_requests": 0,
+      "actual_output_tokens": 3072,
+      "duration_seconds": 163.07783568557352,
+      "output_token_s": 18.83763043018948,
+      "mean_ttft_ms": 268.504590416948,
+      "mean_tpot_ms": 46.122070601565504,
+      "per_round_output_token_s": [
+        18.847128142036535,
+        19.067354799069047,
+        18.604111984377
+      ],
+      "ttft_pooled_p95_ms": 276.0900682769716,
+      "tpot_round_p95_range_ms": [
+        48.018622261682346,
+        51.374987407677594
+      ],
+      "all_request_and_source_checks_passed": true,
+      "all_round_l1_before_after_empty": true,
+      "actual_load_byte_deltas_per_round": [
+        28991029248,
+        28991029248,
+        28991029248
+      ],
+      "actual_store_byte_deltas_per_round": [
+        0,
+        0,
+        0
+      ],
+      "evicted_object_deltas_per_round": [
+        0,
+        0,
+        0
+      ],
+      "l2_completed_chunk_deltas_per_round": [
+        1536.0,
+        1536.0,
+        1536.0
+      ],
+      "store_byte_counter_state": "OBSERVED_ADAPTER_COUNTER",
+      "lifecycle_gate": "FAILED_PD_SIGABRT_BOTH_ARMS",
+      "observed_sources_per_role_each_round": {
+        "p": {
+          "external_kv_transfer": 98304.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 98304.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        }
+      }
+    },
+    {
+      "prefix_tokens": 3072,
+      "input_tokens_per_request": 3199,
+      "output_tokens_per_request": 32,
+      "arm": "memfabric",
+      "concurrency": 4,
+      "rounds": [
+        1,
+        2,
+        3
+      ],
+      "completed_requests": 96,
+      "failed_requests": 0,
+      "actual_output_tokens": 3072,
+      "duration_seconds": 52.07183698564768,
+      "output_token_s": 58.99542205216846,
+      "mean_ttft_ms": 494.9558864173014,
+      "mean_tpot_ms": 53.16399188645895,
+      "per_round_output_token_s": [
+        58.80862369583546,
+        61.604303174382395,
+        56.77153178816776
+      ],
+      "ttft_pooled_p95_ms": 615.3544657863677,
+      "tpot_round_p95_range_ms": [
+        54.05004673727578,
+        58.65499546991721
+      ],
+      "all_request_and_source_checks_passed": true,
+      "all_round_l1_before_after_empty": true,
+      "actual_load_byte_deltas_per_round": [
+        28991029248,
+        28991029248,
+        28991029248
+      ],
+      "actual_store_byte_deltas_per_round": [
+        0,
+        0,
+        0
+      ],
+      "evicted_object_deltas_per_round": [
+        0,
+        0,
+        0
+      ],
+      "l2_completed_chunk_deltas_per_round": [
+        1536.0,
+        1536.0,
+        1536.0
+      ],
+      "store_byte_counter_state": "OBSERVED_ADAPTER_COUNTER",
+      "lifecycle_gate": "FAILED_PD_SIGABRT_BOTH_ARMS",
+      "observed_sources_per_role_each_round": {
+        "p": {
+          "external_kv_transfer": 98304.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 98304.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        }
+      }
+    },
+    {
+      "prefix_tokens": 3072,
+      "input_tokens_per_request": 3199,
+      "output_tokens_per_request": 32,
+      "arm": "store",
+      "concurrency": 1,
+      "rounds": [
+        1,
+        2,
+        3
+      ],
+      "completed_requests": 96,
+      "failed_requests": 0,
+      "actual_output_tokens": 3072,
+      "duration_seconds": 176.1044958345592,
+      "output_token_s": 17.444188380550944,
+      "mean_ttft_ms": 304.787278456691,
+      "mean_tpot_ms": 49.32899588577559,
+      "per_round_output_token_s": [
+        17.290249157995728,
+        17.566126075245155,
+        17.47847416852599
+      ],
+      "ttft_pooled_p95_ms": 311.6312751080841,
+      "tpot_round_p95_range_ms": [
+        52.09833786282087,
+        52.90241638769305
+      ],
+      "all_request_and_source_checks_passed": true,
+      "all_round_l1_before_after_empty": true,
+      "actual_load_byte_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "actual_store_byte_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "evicted_object_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "l2_completed_chunk_deltas_per_round": [
+        1536.0,
+        1536.0,
+        1536.0
+      ],
+      "store_byte_counter_state": "UNAVAILABLE_NOT_INFERRED",
+      "lifecycle_gate": "FAILED_PD_SIGABRT_BOTH_ARMS",
+      "observed_sources_per_role_each_round": {
+        "p": {
+          "external_kv_transfer": 98304.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 98304.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        }
+      }
+    },
+    {
+      "prefix_tokens": 3072,
+      "input_tokens_per_request": 3199,
+      "output_tokens_per_request": 32,
+      "arm": "store",
+      "concurrency": 4,
+      "rounds": [
+        1,
+        2,
+        3
+      ],
+      "completed_requests": 96,
+      "failed_requests": 0,
+      "actual_output_tokens": 3072,
+      "duration_seconds": 57.134530435316265,
+      "output_token_s": 53.76783490813676,
+      "mean_ttft_ms": 544.3368239502888,
+      "mean_tpot_ms": 58.26224917664833,
+      "per_round_output_token_s": [
+        52.86516095417022,
+        54.688140582057656,
+        53.78110677733106
+      ],
+      "ttft_pooled_p95_ms": 712.7245056908578,
+      "tpot_round_p95_range_ms": [
+        60.88518570027043,
+        64.72985951169845
+      ],
+      "all_request_and_source_checks_passed": true,
+      "all_round_l1_before_after_empty": true,
+      "actual_load_byte_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "actual_store_byte_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "evicted_object_deltas_per_round": [
+        null,
+        null,
+        null
+      ],
+      "l2_completed_chunk_deltas_per_round": [
+        1536.0,
+        1536.0,
+        1536.0
+      ],
+      "store_byte_counter_state": "UNAVAILABLE_NOT_INFERRED",
+      "lifecycle_gate": "FAILED_PD_SIGABRT_BOTH_ARMS",
+      "observed_sources_per_role_each_round": {
+        "p": {
+          "external_kv_transfer": 98304.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        },
+        "d": {
+          "external_kv_transfer": 98304.0,
+          "local_compute": 4064.0,
+          "local_cache_hit": 0.0
+        }
+      }
+    }
+  ],
+  "literal_output_text_comparison": {
+    "short": {
+      "compared": 96,
+      "equal": 96
+    },
+    "long": {
+      "compared": 192,
+      "equal": 190
+    },
+    "total_compared": 288,
+    "total_equal": 286,
+    "mismatches": [
+      {
+        "input_tokens": 3199,
+        "concurrency": 4,
+        "round": 1,
+        "request_index_zero_based": 6,
+        "difference": "one period in the leading response line; remainder identical",
+        "cause": "NOT_DETERMINED"
+      },
+      {
+        "input_tokens": 3199,
+        "concurrency": 4,
+        "round": 3,
+        "request_index_zero_based": 6,
+        "difference": "one period in the leading response line; remainder identical",
+        "cause": "NOT_DETERMINED"
+      }
+    ],
+    "strict_text_gate_passed": false,
+    "token_id_and_kv_numerical_equivalence": "NOT_VERIFIED"
+  },
+  "formal_process_exit_evidence": [
+    {
+      "arm": "memfabric",
+      "prefix_tokens": 1024,
+      "processes": {
+        "proxy": {
+          "exit_code": 0,
+          "exit_interpretation": "EXIT_0",
+          "normalized_returncode": 0
+        },
+        "d": {
+          "signal": 6,
+          "exit_interpretation": "SIGNAL_6",
+          "normalized_returncode": -6
+        },
+        "p": {
+          "signal": 6,
+          "exit_interpretation": "SIGNAL_6",
+          "normalized_returncode": -6
+        },
+        "member": {
+          "exit_code": 0,
+          "exit_interpretation": "EXIT_0",
+          "normalized_returncode": 0
+        },
+        "service": {
+          "signal": 15,
+          "exit_interpretation": "SIGNAL_15",
+          "normalized_returncode": -15
+        }
+      }
+    },
+    {
+      "arm": "memfabric",
+      "prefix_tokens": 3072,
+      "processes": {
+        "proxy": {
+          "exit_code": 0,
+          "exit_interpretation": "EXIT_0",
+          "normalized_returncode": 0
+        },
+        "d": {
+          "signal": 6,
+          "exit_interpretation": "SIGNAL_6",
+          "normalized_returncode": -6
+        },
+        "p": {
+          "signal": 6,
+          "exit_interpretation": "SIGNAL_6",
+          "normalized_returncode": -6
+        },
+        "member": {
+          "exit_code": 0,
+          "exit_interpretation": "EXIT_0",
+          "normalized_returncode": 0
+        },
+        "service": {
+          "exit_code": 130,
+          "exit_interpretation": "EXIT_130",
+          "normalized_returncode": 130
+        }
+      }
+    },
+    {
+      "arm": "store",
+      "prefix_tokens": 1024,
+      "processes": {
+        "proxy": {
+          "exit_code": 0,
+          "exit_interpretation": "EXIT_0",
+          "normalized_returncode": 0
+        },
+        "d": {
+          "signal": 6,
+          "exit_interpretation": "SIGNAL_6",
+          "normalized_returncode": -6
+        },
+        "p": {
+          "signal": 6,
+          "exit_interpretation": "SIGNAL_6",
+          "normalized_returncode": -6
+        },
+        "service": {
+          "exit_interpretation": "FINAL_EXIT_NOT_RECORDED",
+          "normalized_returncode": null
+        }
+      }
+    },
+    {
+      "arm": "store",
+      "prefix_tokens": 3072,
+      "processes": {
+        "proxy": {
+          "exit_code": 0,
+          "exit_interpretation": "EXIT_0",
+          "normalized_returncode": 0
+        },
+        "d": {
+          "signal": 6,
+          "exit_interpretation": "SIGNAL_6",
+          "normalized_returncode": -6
+        },
+        "p": {
+          "signal": 6,
+          "exit_interpretation": "SIGNAL_6",
+          "normalized_returncode": -6
+        },
+        "service": {
+          "signal": 11,
+          "exit_interpretation": "SIGNAL_11",
+          "normalized_returncode": -11
+        }
+      }
+    }
+  ],
+  "supplemental_store_exit_observations": {
+    "native_probe": "SIGABRT",
+    "owner": "SIGABRT",
+    "scope": "separate observed processes; not formal short-service final status"
+  },
+  "overall_status": "PERFORMANCE_DIAGNOSTIC_ONLY_EXIT_GATE_FAILED_BOTH_ARMS_OUTPUT_TEXT_GATE_NOT_FULLY_MATCHED",
+  "overall_accepted": false,
+  "not_verified": [
+    "both-arm clean lifecycle",
+    "cause of shutdown heap corruption",
+    "cause of two long-C4 generated-text differences",
+    "KV numerical equivalence or token-ID equivalence",
+    "chain-level HCCS or RoCE byte savings"
+  ],
+  "native_prefetch_route_audit": {
+    "formal_rounds": 18,
+    "condition_count": 6,
+    "prefetch_count": 1152,
+    "matched_l2_chunks": 21504,
+    "mixed_l1_chunks": 0,
+    "rounds_with_l1_hits": [],
+    "all_rounds_have_exactly64_prefetch_records": true,
+    "all_retained_chunks_are_log_observed_l2": true,
+    "groups": [
+      {
+        "prefix_tokens": 1024,
+        "concurrency": 1,
+        "arm": "memfabric",
+        "round_ids": [
+          1,
+          2,
+          3
+        ],
+        "prefetch_count": 192,
+        "matched_l2_chunks": 1536,
+        "mixed_l1_chunks": 0,
+        "mixed_l1_l2_prefetch_count": 0,
+        "rounds_with_l1_hits": []
+      },
+      {
+        "prefix_tokens": 1024,
+        "concurrency": 1,
+        "arm": "store",
+        "round_ids": [
+          1,
+          2,
+          3
+        ],
+        "prefetch_count": 192,
+        "matched_l2_chunks": 1536,
+        "mixed_l1_chunks": 0,
+        "mixed_l1_l2_prefetch_count": 0,
+        "rounds_with_l1_hits": []
+      },
+      {
+        "prefix_tokens": 3072,
+        "concurrency": 1,
+        "arm": "memfabric",
+        "round_ids": [
+          1,
+          2,
+          3
+        ],
+        "prefetch_count": 192,
+        "matched_l2_chunks": 4608,
+        "mixed_l1_chunks": 0,
+        "mixed_l1_l2_prefetch_count": 0,
+        "rounds_with_l1_hits": []
+      },
+      {
+        "prefix_tokens": 3072,
+        "concurrency": 1,
+        "arm": "store",
+        "round_ids": [
+          1,
+          2,
+          3
+        ],
+        "prefetch_count": 192,
+        "matched_l2_chunks": 4608,
+        "mixed_l1_chunks": 0,
+        "mixed_l1_l2_prefetch_count": 0,
+        "rounds_with_l1_hits": []
+      },
+      {
+        "prefix_tokens": 3072,
+        "concurrency": 4,
+        "arm": "memfabric",
+        "round_ids": [
+          1,
+          2,
+          3
+        ],
+        "prefetch_count": 192,
+        "matched_l2_chunks": 4608,
+        "mixed_l1_chunks": 0,
+        "mixed_l1_l2_prefetch_count": 0,
+        "rounds_with_l1_hits": []
+      },
+      {
+        "prefix_tokens": 3072,
+        "concurrency": 4,
+        "arm": "store",
+        "round_ids": [
+          1,
+          2,
+          3
+        ],
+        "prefetch_count": 192,
+        "matched_l2_chunks": 4608,
+        "mixed_l1_chunks": 0,
+        "mixed_l1_l2_prefetch_count": 0,
+        "rounds_with_l1_hits": []
+      }
+    ],
+    "method": "UTC service prefetch logs within each timed before/after Unix window; direct per-record sources, not inferred from L1 snapshots or successful chunks",
+    "source_document": "customer_prefetch_analysis_round01.json"
+  }
+}
