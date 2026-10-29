@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from urllib.parse import urlparse
 
 
 def parse_args():
@@ -26,6 +27,14 @@ def parse_args():
     parser.add_argument("--proxy-telemetry",
                         default="http://127.0.0.1:25768/api/v1/telemetry")
     parser.add_argument("--telemetry-port", type=int, default=25769)
+    parser.add_argument("--telemetry-bind", default="127.0.0.1")
+    parser.add_argument("--telemetry-advertise", help="Reachable full HTTP callback URL configured on P")
+    parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--p-trace-url", help="P host's CPU /snapshot endpoint")
+    parser.add_argument("--d-trace-url", help="D host's CPU /snapshot endpoint")
+    parser.add_argument("--session-id", help="Required for remote host-local trace snapshots")
+    parser.add_argument("--expected-prompt-tokens", type=int)
+    parser.add_argument("--expected-copy-bytes", type=int)
     parser.add_argument("--model", default="mf-direct")
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--timeout", type=float, default=180)
@@ -33,8 +42,17 @@ def parse_args():
     parser.add_argument("--require-direct-trace", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.require_direct_trace and args.trace_dir is None:
-        parser.error("--require-direct-trace needs --trace-dir")
+    remote = bool(args.p_trace_url or args.d_trace_url)
+    if remote and not (args.p_trace_url and args.d_trace_url and args.session_id):
+        parser.error("remote trace needs both trace URLs and --session-id")
+    if args.require_direct_trace and args.trace_dir is None and not remote:
+        parser.error("--require-direct-trace needs --trace-dir or both remote trace URLs")
+    if args.max_tokens < 1:
+        parser.error("--max-tokens must be positive")
+    if args.telemetry_advertise:
+        parsed = urlparse(args.telemetry_advertise)
+        if parsed.scheme != "http" or not parsed.hostname or parsed.hostname in ("0.0.0.0", "::"):
+            parser.error("telemetry-advertise must be a reachable HTTP URL, not a wildcard")
     return args
 
 
@@ -72,13 +90,25 @@ def trace_records(directory):
     return records
 
 
+def active_trace(records, since_ns):
+    """A dictionary contains independent cutoffs sampled on each worker host."""
+    if isinstance(since_ns, dict):
+        for record in records:
+            baseline = since_ns[record["role"]]
+            assert record.get("host_id") == baseline["host_id"], "Trace host changed"
+            assert record.get("session_id") == baseline["run_id"], "Trace session changed"
+        return [record for record in records
+                if record["mono_ns"] >= since_ns[record["role"]]["mono_ns"]]
+    return [record for record in records if record["mono_ns"] >= since_ns]
+
+
 def verify_trace(records, since_ns):
     """Check actual NPU pointers and completed copy/stage pairs, not API names."""
     installed = {r["role"] for r in records if r["kind"] == "trace_installed"}
     assert installed == {"P", "D"}, "Both real worker trace hooks must be active"
     scratch = {(r["role"], r["pid"], r["local_ptr"]): r for r in records
                if r["kind"] == "npu_scratch" and r["phase"] == "complete"}
-    active = [r for r in records if r["mono_ns"] >= since_ns]
+    active = active_trace(records, since_ns)
     assert not any(r["kind"] == "cpu_bm_copy" for r in records), "CPU BM staging observed"
     assert not any(r["phase"] == "error" for r in active), "Transfer error in worker trace"
     copies = [r for r in active if r["kind"] == "bm_copy"]
@@ -97,7 +127,7 @@ def verify_trace(records, since_ns):
     streams = {}
     events = sorted((r for r in active
                      if r["kind"] in ("kv_stage", "native_transfer", "bm_copy")),
-                    key=lambda r: r["mono_ns"])
+                    key=lambda r: (r["role"], r["pid"], r["thread_id"], r["mono_ns"]))
     for record in events:
         stream = (record["role"], record["pid"], record["thread_id"])
         state = streams.setdefault(stream, dict(
@@ -233,6 +263,27 @@ def run(args):
     gate_lock = asyncio.Lock()
     started_ns = time.monotonic_ns()
     epoch = None
+    trace_baseline = started_ns
+    trace_hosts = {}
+    causal_events = []
+
+    def read_traces(*, baseline=False):
+        nonlocal trace_baseline
+        if not args.p_trace_url:
+            return trace_records(args.trace_dir)
+        from direct_coordination import http_json
+        records = []
+        for role, url in (("P", args.p_trace_url), ("D", args.d_trace_url)):
+            snapshot = http_json(url)
+            assert snapshot["run_id"] == args.session_id, "Remote trace session mismatch"
+            if baseline:
+                trace_hosts[role] = {key: snapshot[key] for key in ("host_id", "run_id", "mono_ns")}
+            else:
+                assert snapshot["host_id"] == trace_hosts[role]["host_id"], "Remote host changed"
+            records.extend(record for record in snapshot["records"] if record["role"] == role)
+            save("trace_snapshot_" + role + ("_baseline" if baseline else "_latest"), snapshot)
+        trace_baseline = trace_hosts
+        return records
 
     @app.post("/api/v1/telemetry")
     async def on_store_finished(request: Request):
@@ -247,6 +298,8 @@ def run(args):
                     raise HTTPException(409, "Only one request is accepted")
                 return gate["proxy_notification"]
             save("p_store_event", payload)
+            causal_events.append(dict(sequence=len(causal_events), event="p_store_finished_received",
+                                      request_id=payload["request_ids_set"][0]))
             try:
                 deadline = time.monotonic() + 45
                 async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
@@ -265,8 +318,8 @@ def run(args):
                             raise TimeoutError("Direct commits did not settle")
                         await asyncio.sleep(0.05)
                     before_ns = time.monotonic_ns()
-                    records = trace_records(args.trace_dir)
-                    active = [r for r in records if r["mono_ns"] >= started_ns]
+                    records = await asyncio.to_thread(read_traces)
+                    active = active_trace(records, trace_baseline)
                     assert not any(r["kind"] == "bm_copy" and r["role"] == "D"
                                    for r in active), "D transferred before the gate opened"
                     if args.require_direct_trace:
@@ -275,10 +328,15 @@ def run(args):
                                    for r in active), "No actual P L2G completion"
                     save("before_decode", dict(pool=bm, service=status,
                                                mono_ns=before_ns, trace=records))
+                    causal_events.append(dict(sequence=len(causal_events), event="p_commits_confirmed",
+                                              epoch=bm["epoch"], objects=bm["objects"],
+                                              pending_writes=bm["pending_writes"]))
                     gate.update(p_request_id=payload["request_ids_set"][0],
                                 objects_before_d=bm["objects"],
                                 gate_open_mono_ns=before_ns)
                     print("MEMFABRIC_DIRECT_GATE_READY", json.dumps(gate), flush=True)
+                    causal_events.append(dict(sequence=len(causal_events), event="release_d_notification_sent"))
+                    save("causal_gate_events", causal_events)
                     response = await client.post(args.proxy_telemetry, json=payload)
                     response.raise_for_status()
                     notification = response.json()
@@ -291,7 +349,7 @@ def run(args):
                 raise HTTPException(502, str(exc)) from exc
 
     server = uvicorn.Server(uvicorn.Config(
-        app, host="127.0.0.1", port=args.telemetry_port, log_level="info"))
+        app, host=args.telemetry_bind, port=args.telemetry_port, log_level="info"))
     thread = threading.Thread(target=server.run, daemon=True)
     before, after = {}, {}
     try:
@@ -306,15 +364,19 @@ def run(args):
             assert initial_pool["objects"] == initial_pool["pending_writes"] == 0
             assert initial_pool["total_pins"] == initial_pool["quarantined_slots"] == 0
             epoch = initial_pool["epoch"]
+            initial_records = read_traces(baseline=True)
             save("initial", dict(pool=initial_pool, service=initial_http,
-                                 trace=trace_records(args.trace_dir)))
+                                 trace=initial_records, trace_baseline=trace_baseline,
+                                 telemetry_bind=args.telemetry_bind,
+                                 telemetry_advertise=args.telemetry_advertise,
+                                 max_tokens=args.max_tokens))
             for role, engine in (("p", args.prefiller), ("d", args.decoder)):
                 response = client.get(engine + "/metrics")
                 response.raise_for_status()
                 before[role] = response.text
                 (args.output / f"{role}_metrics_before.txt").write_text(
                     response.text, encoding="utf-8")
-            body = dict(model=args.model, temperature=0, max_tokens=32,
+            body = dict(model=args.model, temperature=0, max_tokens=args.max_tokens,
                         chat_template_kwargs={"enable_thinking": False}, messages=[
                             dict(role="system", content="Reply with exactly ORCHID."),
                             dict(role="user", content="\n".join(
@@ -334,6 +396,8 @@ def run(args):
             assert gate, "P telemetry never passed through the direct gate"
             assert result["choices"][0]["message"]["content"].strip() == "ORCHID", result
             prompt_tokens = result["usage"]["prompt_tokens"]
+            if args.expected_prompt_tokens is not None:
+                assert prompt_tokens == args.expected_prompt_tokens, (prompt_tokens, args.expected_prompt_tokens)
             chunks = prompt_tokens // args.chunk_size
             assert gate["objects_before_d"] == chunks > 0
             def delta(role, name, label=None):
@@ -389,11 +453,13 @@ def run(args):
             assert delta("p", "vllm:generation_tokens_total") == 1
             assert external == expected_external_tokens(prompt_tokens, args.chunk_size) > 0
             assert computed + external == prompt_tokens and prefix == 0
-            records = trace_records(args.trace_dir)
+            records = read_traces()
             save("worker_trace", records)
-            trace_summary = verify_trace(records, started_ns) if args.require_direct_trace else None
+            trace_summary = verify_trace(records, trace_baseline) if args.require_direct_trace else None
             if trace_summary:
                 assert trace_summary["p_l2g_copies"] == trace_summary["d_g2l_copies"] == chunks
+                if args.expected_copy_bytes is not None:
+                    assert trace_summary["p_l2g_bytes"] == args.expected_copy_bytes, trace_summary
             summary = dict(
                 status="DIRECT_POOL_PATH_PASS" if trace_summary else "FUNCTIONAL_POOL_REUSE_PASS",
                 p_request_id=gate["p_request_id"], d_request_id=result["id"],
@@ -403,6 +469,9 @@ def run(args):
                 final_pool_pins=bm["total_pins"], manual_l1_clear=False,
                 pool_observation_transport="http_status",
                 direct_trace=trace_summary,
+                causal_gate_events=causal_events,
+                trace_time_domain="per_host_baselines" if args.p_trace_url else "local_host",
+                max_tokens=args.max_tokens,
                 direct_path_without_trace="NOT_VERIFIED" if trace_summary is None else None,
                 note="Single-request gated correctness check; not a performance sample",
             )

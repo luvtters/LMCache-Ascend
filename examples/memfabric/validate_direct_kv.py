@@ -25,6 +25,7 @@ def arguments():
     parser.add_argument("--ascend-source", type=Path, required=True)
     parser.add_argument("--core-source", type=Path, required=True)
     parser.add_argument("--coord-dir", type=Path, required=True)
+    parser.add_argument("--coord-url", help="CPU HTTP event server; coord-dir remains host-local reports")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--store-url", default="tcp://127.0.0.1:28680")
     parser.add_argument("--server-url", default="tcp://127.0.0.1:28681")
@@ -40,6 +41,7 @@ def arguments():
     parser.add_argument("--layout", choices=("stacked-nhd", "split-nhd"),
                         default="split-nhd")
     parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--init-timeout", type=int, default=300)
     parser.add_argument("--allow-npu", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -49,7 +51,7 @@ def arguments():
         parser.error("context mode uses an externally started LMCache pool service")
     if (min(args.layers, args.kv_heads, args.head_size, args.block_size,
             args.num_blocks, args.pool_gb) < 1 or args.device < 0
-            or args.timeout <= 0):
+            or args.timeout <= 0 or not 1 <= args.init_timeout <= 3600):
         parser.error("geometry, device, pool and timeout must be valid")
     if (not args.source_blocks or len(args.source_blocks) != len(args.target_blocks)
             or len(set(args.target_blocks)) != len(args.target_blocks)
@@ -80,10 +82,21 @@ def write_json(path, data):
 
 
 def marker(args, name, **extra):
-    write_json(args.run_dir / (name + ".json"), dict(name=name, **extra))
+    value = dict(name=name, **extra)
+    if args.coord_url:
+        from direct_coordination import publish
+        publish(args.coord_url, args.run_id, name, value, min(5, args.timeout))
+    else:
+        path = args.run_dir / (name + ".json")
+        if path.exists() and json.loads(path.read_text(encoding="utf-8")) != value:
+            raise RuntimeError("immutable event conflict: " + name)
+        write_json(path, value)
 
 
 def wait_for(args, name):
+    if args.coord_url:
+        from direct_coordination import wait_event
+        return wait_event(args.coord_url, args.run_id, name, args.timeout)
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         failures = list(args.run_dir.glob("failed-*.json"))
@@ -191,7 +204,8 @@ def primitive(args, report):
                           scratch_shape=list(transfer.buffer.shape),
                           native_format=str(transfer.format), bytes=transfer.size)
         session = BMSession(device_id=args.device, rank_id={"pool": 0, "p": 1, "d": 2}[args.role],
-                            world_size=3, pool_gb=args.pool_gb, store_url=args.store_url)
+                            world_size=3, pool_gb=args.pool_gb, store_url=args.store_url,
+                            init_timeout=args.init_timeout)
         report["bm_join_complete"] = True
         marker(args, "joined-" + args.role)
         if args.role == "p":
@@ -254,6 +268,7 @@ def context_mode(args, report):
         mq_timeout=args.timeout, extra_config={"lmcache.mp.direct": {
             "device_id": args.device, "rank_id": 1 if args.role == "p" else 2,
             "world_size": 3, "pool_gb": args.pool_gb, "store_url": args.store_url,
+            "init_timeout": args.init_timeout,
             "member_id": args.run_id + "-" + args.role}})
     scheduler = None
     closed = False
@@ -342,10 +357,12 @@ def main():
         vllm_connector_or_worker_adapter_verified=False,
         actual_device_initialized=False,
         rpc_coverage=("NOT_EXECUTED" if args.mode == "context"
-                      else "NOT_VERIFIED_file_metadata_rendezvous_only"),
+                      else "NOT_VERIFIED_primitive_metadata_rendezvous_only"),
+        coordination_transport="http_metadata" if args.coord_url else "local_files",
+        coordination_url=args.coord_url, run_id=args.run_id,
         cpu_payload_staging_in_harness=False,
         native_internal_staging_runtime_traced=False,
-        direct_parent_revision="be90c96",
+        direct_parent_revision="7e5d40a",
         source_revision_verified_by_script=False,
         ascend_source=str(args.ascend_source.resolve()),
         core_source=str(args.core_source.resolve()),
@@ -359,14 +376,19 @@ def main():
     started = args.run_dir / ("started-" + args.role + ".json")
     if started.exists():
         raise RuntimeError("role already started; use a fresh run-id")
-    write_json(started, dict(pid=os.getpid(), role=args.role))
+    marker(args, "started-" + args.role, pid=os.getpid())
+    if args.coord_url:
+        write_json(started, dict(pid=os.getpid(), role=args.role))
     began = time.monotonic()
     try:
         (primitive if args.mode == "primitive" else context_mode)(args, report)
         report["status"] = "PASS"
     except BaseException as error:
         report.update(status="FAIL", error=str(error), traceback=traceback.format_exc())
-        marker(args, "failed-" + args.role, error=str(error))
+        try:
+            marker(args, "failed-" + args.role, error=str(error))
+        except Exception as coordination_error:
+            report["failure_publication_error"] = repr(coordination_error)
         raise
     finally:
         report["elapsed_seconds"] = time.monotonic() - began

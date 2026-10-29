@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import threading
 import time
+from direct_coordination import host_identity
 
 from lmcache_ascend.integration.vllm.memfabric_direct_connector import (
     MemFabricDirectConnector as _DirectConnector,
@@ -32,6 +33,7 @@ def emit(kind, phase, **fields):
     path = Path(directory)
     path.mkdir(parents=True, exist_ok=True)
     record = dict(kind=kind, phase=phase, role=role, pid=os.getpid(),
+                  host_id=host_identity(), session_id=os.environ.get("MF_DIRECT_SESSION_ID"),
                   thread_id=threading.get_ident(), mono_ns=time.monotonic_ns(),
                   **fields)
     data = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
