@@ -31,6 +31,7 @@ def arguments(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--layers", type=int, choices=(4, 36), default=4)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--pool-memory-type", choices=("host", "device"), default="host")
     parser.add_argument("--store-url", default="tcp://192.168.0.50:28715")
     parser.add_argument("--coord-url", default="http://192.168.0.50:29615")
     parser.add_argument("--init-timeout", type=int, default=300)
@@ -60,8 +61,30 @@ def plan(args):
         expected_segments=4 * args.layers,
         device=args.device, store_url=args.store_url, coord_url=args.coord_url,
         physical_device_mask=os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+        pool_memory_type=args.pool_memory_type,
+        declared_dram_bytes_per_rank=1 << 30,
+        declared_hbm_bytes_per_rank=(1 << 30) if args.pool_memory_type == "device" else 0,
         scratch_allocated=False, production_integration=False,
         native_batch_verified=False, process_exit="NOT_OBSERVED_BY_SELF")
+
+
+def session_config(args):
+    config = dict(device_id=args.device, rank_id={"pool": 0, "p": 1, "d": 2}[args.role],
+        world_size=3, pool_gb=1, store_url=args.store_url, init_timeout=args.init_timeout)
+    if args.pool_memory_type == "device":
+        config["pool_memory_type"] = "device"
+    return config
+
+
+def validate_local_segments(planes, segments, expected):
+    if len(segments) != expected or len({s['src'] for s in segments}) != expected:
+        raise AssertionError('Batch needs distinct original local page pointers')
+    allocated = {(p['component'], p['layer']): p for p in planes}
+    for segment in segments:
+        plane = allocated[(segment['component'], segment['layer'])]
+        if not (plane['base_ptr'] <= segment['src'] < segment['src'] + segment['size'] <=
+                plane['base_ptr'] + plane['num_blocks'] * plane['block_stride_bytes']):
+            raise AssertionError('Segment extends beyond its retained original NPU plane')
 
 
 def batch_arrays(segments, *, retrieve=False):
@@ -143,16 +166,24 @@ def execute(args, report, record):
             pages = allocate_pages(torch, args)
             report["plane_metadata"] = describe_pages(pages)
         record("bm_init", "begin")
-        session = BMSession(device_id=args.device, rank_id=report["rank"], world_size=3,
-            pool_gb=1, store_url=args.store_url, init_timeout=args.init_timeout)
+        session = BMSession(**session_config(args))
+        report['session_pool_memory_type'] = getattr(session, 'pool_memory_type', 'host')
+        if report['session_pool_memory_type'] != args.pool_memory_type:
+            raise AssertionError('BM wrapper selected a different pool memory type')
         record("bm_init", "complete")
         publish(args.coord_url, args.run_id, "joined-" + args.role,
                 dict(name="joined-" + args.role, rank=report["rank"], layers=args.layers))
         if args.role != "pool":
+            owner_gva = int(session.peer_address(0))
+            owner_va = int(session.handle.gva_to_va(owner_gva, bm.BmMemType.LOCAL_DEVICE))
+            if not owner_va:
+                raise RuntimeError('Selected owner pool has no actual LOCAL_DEVICE mapping')
+            report.update(owner_gva=owner_gva, owner_local_device_va=owner_va)
             segments = plan_segments(report["plane_metadata"],
                 SOURCE_BLOCKS if args.role == "p" else TARGET_BLOCKS,
                 block_size=64, token_start=0, token_count=128,
-                pool_base=int(session.peer_address(0)), pool_bytes=1 << 30)
+                pool_base=owner_gva, pool_bytes=1 << 30)
+            validate_local_segments(report['plane_metadata'], segments, report['expected_segments'])
             report["segments"] = segments
             if len(segments) != report["expected_segments"]:
                 raise AssertionError("Unexpected actual plane/block segment count")
