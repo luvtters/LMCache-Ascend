@@ -82,6 +82,12 @@ def require_unhealthy(status):
         raise AssertionError('Expected unavailable service with no pins/writes')
 
 
+def classify_readiness_failure(error, operation):
+    if isinstance(error, TimeoutError) and operation == 'absent-rank2-mapping':
+        return 'EXPECTED_ABSENT_MEMBER_MAPPING_TIMEOUT_ZERO_COPY'
+    return 'OBSERVED_STARTUP_FAILURE_CAUSE_NOT_VERIFIED'
+
+
 def missing_probe(a, report, event):
     # Raw primitive calls expose the native failing step before cleanup can fail.
     import torch
@@ -94,6 +100,7 @@ def missing_probe(a, report, event):
     report['copy_calls'] = 0
     report['cleanup_errors'] = []
     def checked(name, fn):
+        report['current_operation'] = name
         event(name + '_begin')
         result = fn()
         event(name + '_return', result=result)
@@ -110,6 +117,7 @@ def missing_probe(a, report, event):
         config.operation_timeout = 5
         checked('bm.initialize', lambda: bm.initialize(a.store_url, 3, 0, config))
         bm_initialized = True
+        report['current_operation'] = 'bm.create2'
         event('bm.create2_begin')
         handle = bm.create2(id=0, local_dram_size=1 << 30, max_dram_size=1 << 30,
                             data_op_type=bm.BmDataOpType.SDMA)
@@ -118,6 +126,7 @@ def missing_probe(a, report, event):
             raise RuntimeError('bm.create2 returned empty handle')
         checked('BM.join', handle.join)
         joined = True
+        report['current_operation'] = 'absent-rank2-mapping'
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             pointer = handle.peer_rank_ptr(2, bm.BmMemType.HOST)
@@ -132,8 +141,9 @@ def missing_probe(a, report, event):
         if not initialized:
             raise  # Environment/ACL initialization is not the missing-member negative.
         report['native_readiness_error'] = repr(error)
-        report['functional_status'] = 'EXPECTED_FIXED_WORLD_READINESS_FAILURE_ZERO_COPY'
-        event('expected_readiness_failure', error=repr(error), copy_calls=0)
+        report['functional_status'] = classify_readiness_failure(error, report['current_operation'])
+        event('observed_readiness_failure', error=repr(error), copy_calls=0,
+              classification=report['functional_status'], operation=report['current_operation'])
     finally:
         steps = []
         if handle is not None:
@@ -290,6 +300,8 @@ def main(argv=None):
     try:
         (missing_probe if a.case == 'missing' else leave_probe)(a, report, event)
         report['status'] = 'FUNCTIONAL_EXPECTATION_MET_EXTERNAL_WAIT_PENDING'
+        if report.get('functional_status') == 'OBSERVED_STARTUP_FAILURE_CAUSE_NOT_VERIFIED':
+            report['status'] = 'NATIVE_STARTUP_FAILURE_CAUSE_NOT_VERIFIED_EXTERNAL_WAIT_PENDING'
         if report['cleanup_errors']:
             report['status'] = 'FUNCTIONAL_EXPECTATION_MET_CLEANUP_ERRORS'
             failed = True

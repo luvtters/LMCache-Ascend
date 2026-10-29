@@ -33,6 +33,15 @@ class FaultProbeChecks(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.args(extra=['--run'])
 
+    def test_native_unknown_or_allocation_failure_never_proves_missing_member(self):
+        for error, operation in [(RuntimeError('bm.initialize failed: -1'), 'bm.initialize'),
+                (RuntimeError('allocation failed'), 'bm.create2'),
+                (TimeoutError('unknown native timeout'), 'BM.join')]:
+            self.assertEqual(p.classify_readiness_failure(error, operation),
+                             'OBSERVED_STARTUP_FAILURE_CAUSE_NOT_VERIFIED')
+        self.assertEqual(p.classify_readiness_failure(TimeoutError('absent'),
+            'absent-rank2-mapping'), 'EXPECTED_ABSENT_MEMBER_MAPPING_TIMEOUT_ZERO_COPY')
+
     def test_peer_left_must_be_explicit_not_miss_or_unrelated_failure(self):
         self.assertIn('left', p.require_peer_left(RuntimeError('BM peer rank2 left')))
         for value in ('cache miss', 'timeout', 'invalid model'):
