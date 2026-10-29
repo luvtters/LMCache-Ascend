@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental single-service LMCache L2 backed by a MemFabric DRAM rank.
+"""Experimental single-service LMCache L2 backed by a selected MemFabric pool.
 
 Keys are immutable and the index is volatile. Fixed-size slots keep allocation
 simple. One I/O thread owns BM; lookup locks protect slots from eviction until
@@ -35,12 +35,15 @@ class _Entry:
 class MemFabricL2Adapter(L2AdapterInterface):
     def __init__(self, params, l1_memory_desc=None):
         allowed = {"device_id", "world_size", "pool_gb", "storage_rank",
-                   "slot_size_mb", "store_url"}
+                   "slot_size_mb", "store_url", "pool_memory_type"}
         if set(params) - allowed:
             raise ValueError(f"Unknown MemFabric options: {set(params) - allowed}")
         device = params.get("device_id", 0)
         world = params.get("world_size", 1)
         pool_gb = params.get("pool_gb", 1)
+        self.pool_memory_type = params.get("pool_memory_type", "host")
+        if self.pool_memory_type not in ("host", "device"):
+            raise ValueError("pool_memory_type must be host or device")
         self.storage_rank = params.get("storage_rank", world - 1)
         slot_mb = params.get("slot_size_mb", 32)
         values = (device, world, pool_gb, self.storage_rank, slot_mb)
@@ -71,7 +74,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
         try:
             self._session = self._executor.submit(
                 BMSession, device_id=device, rank_id=0, world_size=world,
-                pool_gb=pool_gb, store_url=params.get("store_url", "tcp://127.0.0.1:28580")
+                pool_gb=pool_gb, store_url=params.get("store_url", "tcp://127.0.0.1:28580"),
+                pool_memory_type=self.pool_memory_type
             ).result()
             self._base = self._executor.submit(
                 self._session.peer_address, self.storage_rank
@@ -83,8 +87,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
             for event in self._events.values():
                 event.close()
             raise
-        logger.info("MEMFABRIC_READY protocol=SDMA storage_rank=%d capacity=%d slot=%d",
-                    self.storage_rank, capacity, self._slot_size)
+        logger.info("MEMFABRIC_READY protocol=SDMA storage_rank=%d capacity=%d slot=%d pool_memory_type=%s",
+                    self.storage_rank, capacity, self._slot_size, self.pool_memory_type)
 
     def get_store_event_fd(self):
         return self._events["store"].fileno()
@@ -292,7 +296,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
                         self._remove(key)
 
     def get_memory_tags(self):
-        return MemoryTags(MemorySegment.DRAM, MemoryResidency.LOCAL)
+        segment = MemorySegment.VRAM if self.pool_memory_type == "device" else MemorySegment.DRAM
+        return MemoryTags(segment, MemoryResidency.LOCAL)
 
     def _observe_peer_departure(self):
         if not self._poisoned and self._session.peer_departed.is_set():
@@ -307,6 +312,12 @@ class MemFabricL2Adapter(L2AdapterInterface):
             self._observe_peer_departure()
             return {"is_healthy": not self._closed and not self._poisoned,
                     "protocol": "SDMA", "storage_rank": self.storage_rank,
+                    "pool_memory_type": self.pool_memory_type,
+                    "pool_memory_medium": "HBM" if self.pool_memory_type == "device" else "DRAM",
+                    "pool_native_mem_type": "DEVICE" if self.pool_memory_type == "device" else "HOST",
+                    "local_selected_pool_bytes": self._session.local_pool_bytes,
+                    "storage_peer_gva": self._base,
+                    "actual_export_seg_type": "NOT_VERIFIED_READ_NATIVE_LOG",
                     "objects": len(self._entries), "free_slots": len(self._free),
                     "locked_objects": sum(e.pins > 0 for e in self._entries.values()),
                     "total_pins": sum(e.pins for e in self._entries.values()),

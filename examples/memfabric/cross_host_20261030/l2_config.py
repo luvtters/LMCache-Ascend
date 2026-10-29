@@ -22,6 +22,9 @@ def read_config(path):
     cfg.setdefault("python", "python3")
     cfg.setdefault("store_port", 28580)
     cfg.setdefault("pool_gb", 1)
+    cfg.setdefault("pool_memory_type", "host")
+    if cfg["pool_memory_type"] not in ("host", "device"):
+        raise ValueError("pool_memory_type must be host or device")
     cfg.setdefault("slot_size_mb", 32)
     cfg.setdefault("tp_size", 1)
     cfg.setdefault("driver_devices", [8])
@@ -48,7 +51,8 @@ def adapter_config(cfg, driver=False):
                 class_name="MemFabricL2Adapter", adapter_params=dict(
                     device_id=cfg["driver_bm_device"] if driver else cfg["service_bm_device"],
                     world_size=2, storage_rank=1, pool_gb=cfg["pool_gb"],
-                    slot_size_mb=cfg["slot_size_mb"], store_url=cfg["store_url"]))
+                    slot_size_mb=cfg["slot_size_mb"], store_url=cfg["store_url"],
+                    pool_memory_type=cfg.get("pool_memory_type", "host")))
 
 
 def model_expectations(tp_size):

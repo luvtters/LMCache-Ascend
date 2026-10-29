@@ -12,7 +12,10 @@ class BMSession:
     _guard = threading.Lock()
     _active = False
 
-    def __init__(self, *, device_id, rank_id, world_size, pool_gb, store_url):
+    def __init__(self, *, device_id, rank_id, world_size, pool_gb, store_url,
+                 pool_memory_type="host"):
+        if pool_memory_type not in ("host", "device"):
+            raise ValueError("pool_memory_type must be host or device")
         if not (0 <= rank_id < world_size and device_id >= 0 and pool_gb >= 1):
             raise ValueError("Invalid BM device, rank, world size, or pool capacity")
         if not isinstance(pool_gb, int):
@@ -25,6 +28,8 @@ class BMSession:
             BMSession._active = True
         self.thread_id = threading.get_ident()
         self.rank_id = rank_id
+        self.pool_memory_type = pool_memory_type
+        self.local_pool_bytes = 0
         self.departed_rank = None
         self.peer_departed = threading.Event()
         self.handle = None
@@ -52,18 +57,29 @@ class BMSession:
             self.check(bm.initialize(store_url, world_size, device_id, config),
                        "bm.initialize")
             self.initialized = True
-            self.handle = bm.create2(id=0, local_dram_size=pool_gb << 30,
-                                     max_dram_size=pool_gb << 30,
-                                     data_op_type=bm.BmDataOpType.SDMA)
+            options = dict(id=0, local_dram_size=pool_gb << 30,
+                           max_dram_size=pool_gb << 30,
+                           data_op_type=bm.BmDataOpType.SDMA)
+            # Match the isolated raw DEVICE-pool probe: keep the DRAM segment
+            # and add HBM, but address only the explicitly selected pool.
+            if pool_memory_type == "device":
+                options.update(local_hbm_size=pool_gb << 30,
+                               max_hbm_size=pool_gb << 30)
+            self.handle = bm.create2(**options)
             if self.handle is None:
                 raise RuntimeError("BM returned an empty handle")
+            self._pool_mem_type = (bm.BmMemType.DEVICE if pool_memory_type == "device"
+                                   else bm.BmMemType.HOST)
+            self.local_pool_bytes = self.handle.local_mem_size(self._pool_mem_type)
+            if self.local_pool_bytes != pool_gb << 30:
+                raise RuntimeError("Selected BM pool has unexpected local capacity")
             self.handle.set_group_event_handler(self._on_group_event)
             self.check(self.handle.join(), "BM join")
             self.joined = True
             # join() completes local membership; peer_rank_ptr() may already
             # return a nonzero GVA before the peer's mapping has arrived.
             # JOIN callbacks do not replay peers present before this rank joined.
-            # SDMA requires an actual device VA mapping for every peer segment.
+            # SDMA requires a device VA mapping for the selected peer pool.
             deadline = time.monotonic() + config.init_timeout
             while not self.peer_departed.is_set():
                 if all(self.handle.gva_to_va(
@@ -71,7 +87,7 @@ class BMSession:
                        for peer in range(world_size) if peer != rank_id):
                     break
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("BM peer DRAM mappings did not become ready")
+                    raise TimeoutError(f"BM peer {pool_memory_type} mappings did not become ready")
                 self.peer_departed.wait(0.1)
             if self.peer_departed.is_set():
                 raise RuntimeError("BM peer left while the fixed group was joining")
@@ -97,9 +113,9 @@ class BMSession:
 
     def peer_address(self, rank):
         self._check_thread()
-        address = self.handle.peer_rank_ptr(rank, self.bm.BmMemType.HOST)
+        address = self.handle.peer_rank_ptr(rank, self._pool_mem_type)
         if not address:
-            raise RuntimeError(f"No DRAM mapping for BM rank {rank}")
+            raise RuntimeError(f"No {self.pool_memory_type} mapping for BM rank {rank}")
         return address
 
     def copy(self, src, dst, size, *, store):
