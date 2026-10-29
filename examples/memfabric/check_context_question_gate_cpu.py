@@ -1,14 +1,48 @@
 #!/usr/bin/env python3
 """CPU preconditions/default routing; no model HTTP or device operations."""
 from copy import deepcopy
+from pathlib import Path
+import subprocess
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import direct_context_question_gate as gate
+import cross_host_role as roles
 from make_context_question_request import request_body
 
 
 class ContextQuestionChecks(unittest.TestCase):
+    def test_role_defaults_match_frozen_plan_and_custom_options_only_change_gate(self):
+        source = subprocess.check_output(['git', 'show',
+            '7231f81:examples/memfabric/cross_host_role.py'],
+            cwd=Path(__file__).resolve().parents[2], text=True, encoding='utf-8')
+        reference = ModuleType('frozen_role_before_context_options')
+        exec(compile(source, '<frozen-7231f81-role>', 'exec'), reference.__dict__)
+        for tp in (1, 4):
+            args = SimpleNamespace(root='/private', python='/python', topology='T3',
+                stage='inference', session_id='cpu-case', pool_gb=1 if tp==1 else 2,
+                tp_size=tp, model='/readonly/model', skip_blocks=0, pool_memory_type='device',
+                p_devices=[2] if tp==1 else [2,3,4,5], d_devices=[10] if tp==1 else [10,11,12,13],
+                pool_device=14)
+            for role in ('service', 'p', 'd', 'proxy', 'gate', 'trace137', 'trace12'):
+                args.role = role
+                frozen = reference.build_plan(args)
+                self.assertEqual(roles.build_plan(args), frozen)
+                custom = SimpleNamespace(**vars(args), context_question_request='/private/question.json',
+                                         expected_answer='VELM42', cold_reference=True)
+                plan = roles.build_plan(custom)
+                if role != 'gate':
+                    self.assertEqual(plan, frozen)
+                else:
+                    argv = plan['argv']
+                    self.assertTrue(argv[2].endswith('/direct_context_question_gate.py'))
+                    self.assertNotIn('--expected-prompt-tokens', argv)
+                    self.assertNotIn('--expected-copy-bytes', argv)
+                    self.assertEqual(argv[argv.index('--request-json') + 1], '/private/question.json')
+                    self.assertEqual(argv[argv.index('--expected-answer') + 1], 'VELM42')
+                    self.assertIn('--cold-reference', argv)
+
     def test_default_is_original_gate_with_original_frozen_options(self):
         with patch.object(gate.stock, "run") as original, patch.object(gate, "run_custom") as custom:
             gate.main(["--output", "unused", "--expected-prompt-tokens", "1373",

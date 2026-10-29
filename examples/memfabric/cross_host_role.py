@@ -134,7 +134,15 @@ def build_plan(args):
                 '--prefiller-port', '28401', '--decoder-host', HOSTS[d_host],
                 '--decoder-port', '28402', '--telemetry-port', '25808']
     elif args.role == 'gate':
-        argv = [python, '-u', str(examples / 'direct_pd_gate.py'),
+        context_request = getattr(args, 'context_question_request', None)
+        expected_answer = getattr(args, 'expected_answer', None)
+        cold_reference = getattr(args, 'cold_reference', False)
+        if (expected_answer or cold_reference) and not context_request:
+            raise ValueError('Context-question gate requires context_question_request')
+        if context_request and (args.stage != 'inference' or not expected_answer):
+            raise ValueError('Context-question request requires inference stage and expected_answer')
+        gate_script = 'direct_context_question_gate.py' if context_request else 'direct_pd_gate.py'
+        argv = [python, '-u', str(examples / gate_script),
                 '--service-http', f'http://{owner}:28195',
                 '--prefiller', f'http://{HOSTS[p_host]}:28401',
                 '--decoder', f'http://{HOSTS[d_host]}:28402', '--proxy', f'http://{ip}:28400',
@@ -148,6 +156,13 @@ def build_plan(args):
                 '--expected-prompt-tokens', '1373', '--expected-copy-bytes', str(180 << 20),
                 '--expected-pool-memory-type', pool_memory_type,
                 '--max-tokens', '8', '--timeout', '360', '--output', str(case / 'gate')]
+        if context_request:
+            for frozen_flag in ('--expected-prompt-tokens', '--expected-copy-bytes'):
+                position = argv.index(frozen_flag)
+                del argv[position:position + 2]
+            argv += ['--request-json', str(context_request), '--expected-answer', expected_answer]
+            if cold_reference:
+                argv += ['--cold-reference']
     else:
         argv = [python, '-u', str(examples / 'direct_coordination.py'), '--bind', ip,
                 '--port', '29595' if args.role == 'coordinator' else '29596',
@@ -199,6 +214,9 @@ def main():
     parser.add_argument('--d-devices', type=lambda value: [int(v) for v in value.split(',')])
     parser.add_argument('--pool-device', type=int, help='Defaults to T0=12, other topologies=8')
     parser.add_argument('--skip-blocks', type=int, choices=(0, 1), default=0)
+    parser.add_argument('--context-question-request', help='Optional custom context question; affects gate role only')
+    parser.add_argument('--expected-answer', help='Exact expected code for a custom context question')
+    parser.add_argument('--cold-reference', action='store_true', help='Direct D cold reference before custom P/pool/D gate')
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--allow-npu', action='store_true')
     args = parser.parse_args()
