@@ -32,6 +32,8 @@ def arguments(argv=None):
     parser.add_argument('--role', choices=('service', 'p', 'd'), required=True)
     parser.add_argument('--tp-size', type=int, choices=(2, 4), required=True)
     parser.add_argument('--shard', type=int, default=0)
+    parser.add_argument('--pool-physical-device', type=int, default=0,
+                        help='Plan/manifest only; caller applies this service device mask')
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--ascend-source', type=Path, required=True)
@@ -46,7 +48,7 @@ def arguments(argv=None):
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--allow-npu', action='store_true')
     args = parser.parse_args(argv)
-    if (not 0 <= args.shard < args.tp_size or args.timeout <= 0 or
+    if (not 0 <= args.shard < args.tp_size or args.pool_physical_device < 0 or args.timeout <= 0 or
             not 1 <= args.init_timeout <= 3600 or not args.run_id or
             not args.run_id.isascii() or len(args.run_id) > 80 or
             any(not (c.isalnum() or c in '-_') for c in args.run_id)):
@@ -89,7 +91,7 @@ def build_plan(args):
         ascend_source=str(args.ascend_source), core_source=str(args.core_source),
         visible_devices=os.environ.get('ASCEND_RT_VISIBLE_DEVICES'),
         model_weights_loaded=False, model_inference_verified=False,
-        rpc_payload=False, physical_plan=dict(service=[0], p=[2, 3, 4, 5][:tp],
+        rpc_payload=False, physical_plan=dict(service=[args.pool_physical_device], p=[2, 3, 4, 5][:tp],
                                             d=[8, 9, 10, 11][:tp]),
         external_real_process_wait_required=True)
 

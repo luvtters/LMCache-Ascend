@@ -57,6 +57,14 @@ class TPProbeChecks(unittest.TestCase):
             self.assertEqual(len(set(values)), 4)
             self.assertTrue(all(-63 <= value <= 63 for value in values))
 
+    def test_pool_physical_plan_can_avoid_competition_without_changing_logical_id(self):
+        args = probe.arguments(['--role', 'service', '--tp-size', '4', '--run-id', 'pool6',
+            '--output-dir', 'unused', '--ascend-source', '/a', '--core-source', '/c',
+            '--pool-physical-device', '6'])
+        plan = probe.build_plan(args)
+        self.assertEqual(plan['physical_plan']['service'], [6])
+        self.assertEqual(plan['service_config']['device_id'], 0)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
