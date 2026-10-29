@@ -501,6 +501,7 @@ class _Lookup:
         self.keys = chunk_keys(key, backend.tokens_per_chunk, layout)
         self.future = None
         self.result = None
+        self.rejection = None
         self.deadline = 0
         self.lock = threading.Lock()
 
@@ -516,12 +517,14 @@ class _Lookup:
 
     def on_scheduler_check(self):
         with self.lock:
+            if self.rejection is not None:
+                raise self.rejection
             if self.result is not None or self.future is None:
                 return []
             if self.blocking:
                 self.future.wait(timeout=max(0, self.deadline - time.monotonic()))
             if self.future.query():
-                payload = self.backend.control.decode(self.future.result(timeout=0))
+                payload = self._reply()
                 self.epoch = payload["epoch"]
                 self.result = self.key.start + len(payload["descriptors"]) * self.backend.tokens_per_chunk
                 return []
@@ -533,9 +536,19 @@ class _Lookup:
     def get_result(self):
         return self.result
 
+    def _reply(self):
+        try:
+            return self.backend.control.decode(self.future.result(timeout=0))
+        except _ControlRejectedError as error:
+            # An explicit rejection applied no lookup/pins. Preserve the original
+            # error for the scheduler; cleanup must not turn it into a miss.
+            self.rejection = error
+            self.result = None
+            raise
+
     def close(self):
         with self.lock:
-            if self.result is None:
+            if self.result is None and self.rejection is None:
                 self.result = 0
 
     def drain(self):
@@ -573,7 +586,9 @@ class MemFabricDirectSchedulerBackend:
             # pins after a request was cancelled or skipped by engine APC.
             if lookup.drain() is not None:
                 raise TimeoutError("Direct lookup did not drain before lock release")
-            response = self.control.decode(lookup.future.result(timeout=0))
+            if lookup.rejection is not None:
+                continue
+            response = lookup._reply()
             selected = []
             for index, object_key in enumerate(lookup.keys):
                 start = lookup.key.start + index * self.tokens_per_chunk
@@ -589,7 +604,9 @@ class MemFabricDirectSchedulerBackend:
         for lookup in self.lookups.get(request_id, ()):
             if lookup.drain() is not None:
                 raise TimeoutError("Direct lookup did not drain before session release")
-            response = self.control.decode(lookup.future.result(timeout=0))
+            if lookup.rejection is not None:
+                continue
+            response = lookup._reply()
             self.control.call("release", {"epoch": response["epoch"],
                 "request_id": lookup.request_id, "dma_complete": True})
         self.lookups.pop(request_id, None)

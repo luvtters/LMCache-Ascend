@@ -368,6 +368,59 @@ class DirectTests(unittest.TestCase):
         self.assertEqual(client.index.status()["total_pins"], 0)
         self.assertEqual(owner.lookups, {})
 
+    def test_observed_peer_rejection_closes_without_replaying_or_becoming_miss(self):
+        client = Client()
+        client.index.invalidate("peer rank 2 left")
+        owner = backend(client)
+        lookup_key = key(worker=None)
+        lookup = owner.create_lookup(lookup_key, tp_size=1,
+            tokens_per_chunk=128, timeout=1, blocking_lookup=True)
+        lookup.submit()
+        with self.assertRaisesRegex(DIRECT._ControlRejectedError, "peer rank 2 left") as caught:
+            lookup.on_scheduler_check()
+        self.assertIsNone(lookup.get_result())
+        owner.free_lookup_locks(lookup_key, 1)
+        owner.close()
+        owner.close()
+        self.assertEqual(owner.lookups, {})
+        self.assertIsNone(lookup.get_result())
+        with self.assertRaises(DIRECT._ControlRejectedError) as repeated:
+            lookup.on_scheduler_check()
+        self.assertIs(repeated.exception, caught.exception)
+        self.assertFalse(any(name == "release" for name, _ in client.calls))
+        self.assertEqual(client.index.status()["total_pins"], 0)
+
+    def test_close_reports_unobserved_rejection_once_then_is_idempotent(self):
+        client = Client()
+        client.index.invalidate("peer rank 2 left")
+        owner = backend(client)
+        lookup = owner.create_lookup(key(worker=None), tp_size=1,
+            tokens_per_chunk=128, timeout=1, blocking_lookup=True)
+        lookup.submit()
+        with self.assertRaisesRegex(DIRECT._ControlRejectedError, "peer rank 2 left") as caught:
+            owner.close()
+        owner.close()
+        self.assertIsNone(lookup.get_result())
+        with self.assertRaises(DIRECT._ControlRejectedError) as repeated:
+            lookup.on_scheduler_check()
+        self.assertIs(repeated.exception, caught.exception)
+
+    def test_transport_failure_retains_unresolved_lookup_during_close(self):
+        client = Client()
+        client.delay = "lookup"
+        owner = backend(client)
+        lookup_key = key(worker=None)
+        lookup = owner.create_lookup(lookup_key, tp_size=1,
+            tokens_per_chunk=128, timeout=1, blocking_lookup=True)
+        lookup.submit()
+        lookup.future.set_exception(RuntimeError("transport outcome unknown"))
+        with self.assertRaisesRegex(RuntimeError, "transport outcome unknown"):
+            lookup.on_scheduler_check()
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "transport outcome unknown"):
+                owner.close()
+        self.assertIn(lookup_key.request_id, owner.lookups)
+
     def test_timeout_retains_lookup_until_late_reply_can_be_released(self):
         client = Client()
         lookup_key = key(worker=None)
