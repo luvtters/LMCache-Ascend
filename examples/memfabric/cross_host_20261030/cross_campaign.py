@@ -200,7 +200,7 @@ def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_d
     parser=argparse.Namespace(root=str(role_root),python=PY,topology=topology,stage=stage,
           session_id=ident,model='/workspace/d00896497/models/Qwen3-8B',pool_gb=1 if tp==1 else 2,
           skip_blocks=skip_blocks,tp_size=tp,p_devices=p_devices,d_devices=d_devices,pool_device=pool_device,pool_memory_type=pool_memory_type,
-          context_question_request=gate_request,expected_answer=gate_answer,cold_reference=cold_reference)
+          context_question_request=gate_request,expected_answer=gate_answer if gate_request else None,cold_reference=cold_reference)
     mapping=module.TOPOLOGIES[topology]
     roles=['coordinator'] if stage!='inference' else ['trace'+h for h in sorted({v[0] for v in mapping.values()})]
     roles+=['service','p','d']
