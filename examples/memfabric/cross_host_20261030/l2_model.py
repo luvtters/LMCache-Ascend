@@ -62,8 +62,13 @@ def commands(cfg):
          "--decoder-host", "127.0.0.1", "--decoder-port", str(ports["d"]),
          "--telemetry-port", str(ports["telemetry"])]
     gate = [py, "-u", str(Path(__file__).with_name("l2_gate.py")), "--config", cfg["config_path"]]
-    return dict(service=service, p=engine + ["--port", str(ports["p"])],
-                d=engine + ["--port", str(ports["d"])], proxy=proxy, gate=gate), l2
+    roles = dict(service=service, p=engine + ["--port", str(ports["p"])],
+                 d=engine + ["--port", str(ports["d"])], proxy=proxy, gate=gate)
+    if cfg.get("followup_command"):
+        if not isinstance(cfg["followup_command"], list) or not all(isinstance(x, str) for x in cfg["followup_command"]):
+            raise ValueError("followup_command must be an explicit argv list")
+        roles["followup"] = cfg["followup_command"]
+    return roles, l2
 
 
 def service_main(cfg):
@@ -168,6 +173,7 @@ def supervise(cfg, plan_only=False):
 
     exit_code = 1
     gate_exit = None
+    followup_exit = None
     try:
         launch("service", devices["service"])
         ready(cfg["ports"]["http"], "/healthcheck", cfg.get("service_timeout", 200))
@@ -192,6 +198,18 @@ def supervise(cfg, plan_only=False):
         exit_code = gate_exit
         if exit_code:
             raise RuntimeError(("Gate failed", exit_code))
+        if "followup" in cmds:
+            launch("followup", [bm_device])
+            deadline = time.monotonic() + cfg.get("followup_timeout", 90)
+            while procs["followup"].poll() is None:
+                if stop or time.monotonic() > deadline:
+                    raise TimeoutError("Follow-up interrupted or timed out")
+                # Negative probes may intentionally make D fail closed. Retain
+                # its actual exit in the common lifecycle record below.
+                time.sleep(.2)
+            followup_exit = procs["followup"].wait()
+            if followup_exit:
+                raise RuntimeError(("Follow-up failed", followup_exit))
     except BaseException:
         write_json(out / "failure.json", dict(traceback=traceback.format_exc(), unix_ns=time.time_ns()))
         exit_code = 1
@@ -210,7 +228,7 @@ def supervise(cfg, plan_only=False):
                 pass
 
         # Keep service/BM alive until P/D and their native transfer contexts exit.
-        for name in ("gate", "proxy", "d", "p", "service"):
+        for name in ("followup", "gate", "proxy", "d", "p", "service"):
             if name not in procs:
                 continue
             proc = procs[name]
@@ -246,7 +264,7 @@ def supervise(cfg, plan_only=False):
         if lifecycle_errors:
             exit_code = 1
         write_json(out / "processes.json", records)
-        write_json(out / "supervisor_result.json", dict(gate_exit=gate_exit,
+        write_json(out / "supervisor_result.json", dict(gate_exit=gate_exit, followup_exit=followup_exit,
                      supervisor_exit=exit_code, roles=records, lifecycle_errors=lifecycle_errors,
                      shutdown_budget_seconds=shutdown_total,
                      shutdown_elapsed_seconds=time.monotonic() - shutdown_start,
