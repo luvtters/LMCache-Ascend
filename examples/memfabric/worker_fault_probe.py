@@ -88,6 +88,10 @@ def classify_readiness_failure(error, operation):
     return 'OBSERVED_STARTUP_FAILURE_CAUSE_NOT_VERIFIED'
 
 
+def coordination_payload(name, role, **extra):
+    return dict(name=name, role=role, **extra)
+
+
 def missing_probe(a, report, event):
     # Raw primitive calls expose the native failing step before cleanup can fail.
     import torch
@@ -190,7 +194,7 @@ def leave_probe(a, report, event):
             event('unexpected_copy_attempt', copy_calls=report['copy_calls'])
             return super()._copy(*args, **kwargs)
     def mark(name, **kw):
-        publish(a.coord_url, a.run_id, name, dict(role=a.role, **kw))
+        publish(a.coord_url, a.run_id, name, coordination_payload(name, a.role, **kw))
     def wait(name):
         return wait_event(a.coord_url, a.run_id, name, a.timeout)
     def key(suffix):
@@ -311,7 +315,9 @@ def main(argv=None):
         event('unexpected_failure', error=repr(error))
         if a.case == 'leave':
             try:
-                publish(a.coord_url, a.run_id, 'failed-' + a.role, dict(error=repr(error)))
+                name = 'failed-' + a.role
+                publish(a.coord_url, a.run_id, name,
+                        coordination_payload(name, a.role, error=repr(error)))
             except Exception:
                 report['publish_error'] = traceback.format_exc()
     finally:

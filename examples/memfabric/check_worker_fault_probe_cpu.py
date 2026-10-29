@@ -4,7 +4,10 @@ import io
 import json
 import sys
 import unittest
+import tempfile
+import threading
 import worker_fault_probe as p
+from direct_coordination import make_server, publish, wait_event
 
 
 class FaultProbeChecks(unittest.TestCase):
@@ -56,6 +59,19 @@ class FaultProbeChecks(unittest.TestCase):
                              ('pending_writes', 1), ('last_error', 'missing')]:
             with self.assertRaises(AssertionError):
                 p.require_unhealthy(dict(good, **{field: value}))
+
+    def test_payload_accepted_by_actual_coordinator_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = make_server('127.0.0.1', 0, directory, 'cpu-fault')
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = 'http://127.0.0.1:' + str(server.server_address[1])
+                value = p.coordination_payload('registered-p', 'p')
+                self.assertTrue(publish(url, 'cpu-fault', 'registered-p', value)['accepted'])
+                self.assertEqual(wait_event(url, 'cpu-fault', 'registered-p', 1), value)
+            finally:
+                server.shutdown(); server.server_close(); thread.join()
 
 
 if __name__ == '__main__':
