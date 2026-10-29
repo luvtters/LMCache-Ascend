@@ -128,7 +128,7 @@ def missing_probe(a, report, event):
         raise TimeoutError('Absent rank2 mapping readiness timed out (world remains3)')
     except AssertionError:
         raise
-    except Exception as error:
+    except (RuntimeError, TimeoutError) as error:
         if not initialized:
             raise  # Environment/ACL initialization is not the missing-member negative.
         report['native_readiness_error'] = repr(error)
