@@ -192,7 +192,8 @@ def l2_case(ident, kind, reverse, tp, evidence, member_host=None, member_device=
         cleanup(reversed(started),evidence,lambda i:120 if i==driver else 20)
 
 
-def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_devices=None, d_devices=None, pool_device=None, pool_memory_type='host', skip_blocks=0, followup_argv=None, gate_request=None, gate_answer='ORCHID', cold_reference=False):
+def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_devices=None, d_devices=None, pool_device=None, pool_memory_type='host', skip_blocks=0, followup_argv=None, gate_request=None, gate_answer='ORCHID', cold_reference=False, max_num_seqs=1):
+    if max_num_seqs not in (1,2):raise ValueError('Experiment max_num_seqs must be 1 or 2')
     role_root=Path(role_root) if role_root else ROOT if tp==1 else ROOT/'tp_candidate'
     runner=role_root/'src/ascend_direct/examples/memfabric/cross_host_role.py'
     spec=importlib.util.spec_from_file_location('role_'+ident,runner)
@@ -200,7 +201,7 @@ def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_d
     parser=argparse.Namespace(root=str(role_root),python=PY,topology=topology,stage=stage,
           session_id=ident,model='/workspace/d00896497/models/Qwen3-8B',pool_gb=1 if tp==1 else 2,
           skip_blocks=skip_blocks,tp_size=tp,p_devices=p_devices,d_devices=d_devices,pool_device=pool_device,pool_memory_type=pool_memory_type,
-          context_question_request=gate_request,expected_answer=gate_answer if gate_request else None,cold_reference=cold_reference)
+          context_question_request=gate_request,expected_answer=gate_answer if gate_request else None,cold_reference=cold_reference,max_num_seqs=max_num_seqs)
     mapping=module.TOPOLOGIES[topology]
     roles=['coordinator'] if stage!='inference' else ['trace'+h for h in sorted({v[0] for v in mapping.values()})]
     roles+=['service','p','d']
@@ -213,6 +214,7 @@ def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_d
             host=plan['host']; task=ident+'-'+role
             argv=[PY,'-u',runner,'--root',role_root,'--topology',topology,'--stage',stage,'--session-id',ident,'--role',role,'--run']
             if tp>1: argv += ['--tp-size',str(tp),'--pool-gb','2']
+            if max_num_seqs!=1: argv += ['--max-num-seqs',str(max_num_seqs)]
             if p_devices is not None: argv += ['--p-devices',','.join(map(str,p_devices))]
             if d_devices is not None: argv += ['--d-devices',','.join(map(str,d_devices))]
             if pool_device is not None: argv += ['--pool-device',str(pool_device)]
