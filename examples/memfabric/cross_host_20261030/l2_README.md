@@ -32,6 +32,8 @@
 
 模型计划：`python l2_model.py --config model-run.json --plan-only`。实际执行去掉 `--plan-only`，外部控制器同时启动同一组远端 member。supervisor 前台启动 service、P、D、原 proxy、严格 gate，最后逐角色停止并真实 wait；`processes.json` 原样记录返回码和发送信号，不把 SIGABRT/SIGKILL 改为正常退出。无自动重启。`l2_model.py --role service` 也是独立角色 CLI，但通常由 supervisor 调用。
 
+请求 gate 的退出码单独保留为 `gate_exit`。任一角色异常退出、清理强杀或未完成 wait 都写入 `lifecycle_errors`，使 supervisor 非零退出；本轮发送 SIGINT 后收到 130/-2 单列为受控退出，不称自然退出 0。默认每角色 `stop_timeout=18` 秒，全部角色共享 `shutdown_timeout=90` 秒上限（均不能配置超过 90）；外部 hostcontroller 给 supervisor 至少 120 秒 grace，不能 30 秒便强杀父进程。全部角色各自进程组的 wait 和发送信号原样归档；远端 member 的退出另行核验。
+
 严格 gate 收齐所有 TP P 完成事件，等 10×TP 对象、180 MiB STORE 与自动排空 L1 后才放行 D。检查 1373 prompt、1280 external、93 compute、0 prefix、ORCHID，以及 D 的每条真实 prefetch 原文零 L1、L2 总数等于 10×TP。冻结 MP 的一次 PrefetchTaskSpec 已包含所有 kv rank，因此期望单条聚合预取记录。TP1 的 18 MiB/对象及 TP2/4/8 的动态分片计算均须用本轮原件验证，不是已验证结论。TP>1 需配置足够且不重叠的 P/D 设备，并让 service 看见所有 P/D 和独立 BM 设备；资源不足应停止在此，不扩大授权。
 
 反向独立新 attempt：将 communication_ip 改为新 rank0 通信 IP，模型、设备、已许可目录及端口按新主机配置；外部 member 交换到原主机。不要复用旧 BM 组或就绪文件。

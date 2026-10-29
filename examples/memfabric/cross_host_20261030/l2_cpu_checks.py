@@ -9,10 +9,27 @@ import tempfile
 import unittest
 
 from l2_config import adapter_config, model_expectations, prefetch_audit, read_config
-from l2_model import commands, supervise
+from l2_model import classify_wait, commands, shutdown_budget, supervise
 
 
 class Checks(unittest.TestCase):
+    def test_wait_contract_preserves_crashes_and_controlled_signals(self):
+        self.assertEqual(classify_wait(0, []), "NATURAL_ZERO")
+        for code in (130, -2):
+            self.assertEqual(classify_wait(code, ["SIGINT"]), "CONTROLLED_SIGINT")
+            self.assertTrue(classify_wait(code, []).startswith("FAILED"))
+        for code in (-6, -7, -11, -9, 134, 135, 139, 137):
+            self.assertTrue(classify_wait(code, ["SIGINT"]).startswith("FAILED"))
+        self.assertEqual(classify_wait(0, ["SIGINT", "SIGKILL"]), "FAILED_FORCED_KILL")
+        self.assertTrue(classify_wait(None, []).startswith("FAILED"))
+
+    def test_shared_shutdown_budget(self):
+        self.assertEqual(shutdown_budget({}), (18, 90))
+        self.assertEqual(shutdown_budget(dict(stop_timeout=20, shutdown_timeout=75)), (20, 75))
+        for cfg in (dict(shutdown_timeout=91), dict(shutdown_timeout=0), dict(stop_timeout=91)):
+            with self.assertRaises(ValueError):
+                shutdown_budget(cfg)
+
     def config(self):
         raw = dict(run_root="/private/runs", run_id="new-attempt", core_path="/private/core",
                    ascend_path="/private/ascend", communication_ip="192.168.0.223",

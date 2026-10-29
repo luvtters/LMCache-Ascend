@@ -19,6 +19,28 @@ import urllib.request
 from l2_config import adapter_config, model_expectations, read_config, write_json
 
 
+def shutdown_budget(cfg):
+    """One shared monotonic budget, shorter than the outer 120-second grace."""
+    per_role = float(cfg.get("stop_timeout", 18))
+    total = float(cfg.get("shutdown_timeout", 90))
+    if not 0 < per_role <= 90 or not 0 < total <= 90:
+        raise ValueError("stop_timeout and shutdown_timeout must be in (0, 90] seconds")
+    return per_role, total
+
+
+def classify_wait(returncode, signals_sent):
+    """Preserve native wait codes; only our own SIGINT explains 130/-2."""
+    if "SIGKILL" in signals_sent:
+        return "FAILED_FORCED_KILL"
+    if returncode == 0:
+        return "NATURAL_ZERO" if not signals_sent else "CONTROLLED_ZERO"
+    if returncode in (130, -2) and "SIGINT" in signals_sent:
+        return "CONTROLLED_SIGINT"
+    if returncode is None:
+        return "FAILED_WAIT_NOT_COMPLETED"
+    return "FAILED_UNEXPECTED_EXIT"
+
+
 def commands(cfg):
     py, ports = cfg["python"], cfg["ports"]
     l2 = adapter_config(cfg)
@@ -69,6 +91,7 @@ def service_main(cfg):
 
 
 def supervise(cfg, plan_only=False):
+    per_role_stop, shutdown_total = shutdown_budget(cfg)
     cmds, l2 = commands(cfg)
     devices = cfg["local_devices"]
     tp = cfg["tp_size"]
@@ -141,6 +164,7 @@ def supervise(cfg, plan_only=False):
         raise TimeoutError((port, path))
 
     exit_code = 1
+    gate_exit = None
     try:
         launch("service", devices["service"])
         ready(cfg["ports"]["http"], "/healthcheck", cfg.get("service_timeout", 200))
@@ -161,13 +185,27 @@ def supervise(cfg, plan_only=False):
             if failed:
                 raise RuntimeError(("Role exited while gate running", failed))
             time.sleep(0.2)
-        exit_code = procs["gate"].wait()
+        gate_exit = procs["gate"].wait()
+        exit_code = gate_exit
         if exit_code:
             raise RuntimeError(("Gate failed", exit_code))
     except BaseException:
         write_json(out / "failure.json", dict(traceback=traceback.format_exc(), unix_ns=time.time_ns()))
         exit_code = 1
     finally:
+        shutdown_start = time.monotonic()
+        shutdown_deadline = shutdown_start + shutdown_total
+        # Reserve a final bounded interval to reap any forcibly stopped groups.
+        graceful_deadline = shutdown_deadline - min(5, shutdown_total / 4)
+        lifecycle_errors = []
+
+        def send(proc, signum, sent):
+            try:
+                os.killpg(proc.pid, signum)
+                sent.append(signal.Signals(signum).name)
+            except ProcessLookupError:
+                pass
+
         # Keep service/BM alive until P/D and their native transfer contexts exit.
         for name in ("gate", "proxy", "d", "p", "service"):
             if name not in procs:
@@ -175,19 +213,41 @@ def supervise(cfg, plan_only=False):
             proc = procs[name]
             sent = []
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGINT)
-                sent.append("SIGINT")
+                send(proc, signal.SIGINT, sent)
             try:
-                result = proc.wait(timeout=cfg.get("stop_timeout", 45))
+                result = proc.wait(timeout=min(per_role_stop, max(0, graceful_deadline - time.monotonic())))
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                sent.append("SIGKILL")
-                result = proc.wait()
+                send(proc, signal.SIGKILL, sent)
+                try:
+                    result = proc.wait(timeout=min(1, max(0, shutdown_deadline - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    result = None
             records[name].update(wait_returncode=result, signals_sent=sent,
-                                 waited_unix_ns=time.time_ns())
+                                 wait_completed=result is not None, waited_unix_ns=time.time_ns())
             write_json(out / "processes.json", records)
-        write_json(out / "supervisor_result.json", dict(gate_exit=exit_code, roles=records,
-                     lifecycle="REVIEW_ACTUAL_WAIT_CODES_AND_REMOTE_MEMBER_SEPARATELY"))
+        # All remaining groups have already received SIGKILL. Reap using the
+        # same deadline; an unreaped process remains an explicit failure.
+        for name, proc in procs.items():
+            if not records[name]["wait_completed"]:
+                try:
+                    result = proc.wait(timeout=max(0, shutdown_deadline - time.monotonic()))
+                    records[name].update(wait_returncode=result, wait_completed=True,
+                                         waited_unix_ns=time.time_ns())
+                except subprocess.TimeoutExpired:
+                    pass
+            classification = classify_wait(records[name]["wait_returncode"], records[name]["signals_sent"])
+            records[name]["exit_classification"] = classification
+            if classification.startswith("FAILED"):
+                lifecycle_errors.append(dict(role=name, classification=classification,
+                    wait_returncode=records[name]["wait_returncode"], signals_sent=records[name]["signals_sent"]))
+        if lifecycle_errors:
+            exit_code = 1
+        write_json(out / "processes.json", records)
+        write_json(out / "supervisor_result.json", dict(gate_exit=gate_exit,
+                     supervisor_exit=exit_code, roles=records, lifecycle_errors=lifecycle_errors,
+                     shutdown_budget_seconds=shutdown_total,
+                     shutdown_elapsed_seconds=time.monotonic() - shutdown_start,
+                     lifecycle="FAILED" if lifecycle_errors else "LOCAL_ROLES_ACCEPTED_REMOTE_MEMBER_REQUIRES_SEPARATE_WAIT"))
     return exit_code
 
 
