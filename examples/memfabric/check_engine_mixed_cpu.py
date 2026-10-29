@@ -74,7 +74,7 @@ class EngineMixedChecks(unittest.TestCase):
         before=dict(host_id='host',run_id='run',mono_ns=100)
         row=dict(kind='scheduler_step',phase='begin',role='D',host_id='host',
             session_id='run',mono_ns=110,pid=900,scheduler_step=7,
-            num_scheduled_tokens={'one':1,'two':2})
+            num_scheduled_tokens={'chatcmpl-one':1,'chatcmpl-two':2})
         after=dict(host_id='host',run_id='run',records=[row])
         responses=[dict(response_request_id='chatcmpl-'+key,client_request_id=key)
                    for key in ('one','two')]
@@ -83,11 +83,11 @@ class EngineMixedChecks(unittest.TestCase):
     def test_same_step_positive_tokens_and_http_identities_are_required(self):
         before,after,responses=self.fixture()
         self.assertTrue(probe.scheduler_evidence(before,after,responses)['proven'])
-        after['records'][0]['num_scheduled_tokens']['two']=0
+        after['records'][0]['num_scheduled_tokens']['chatcmpl-two']=0
         self.assertFalse(probe.scheduler_evidence(before,after,responses)['proven'])
         before,after,responses=self.fixture()
-        after['records'][0]['num_scheduled_tokens']={'one':1}
-        other=deepcopy(after['records'][0]);other['num_scheduled_tokens']={'two':1}
+        after['records'][0]['num_scheduled_tokens']={'chatcmpl-one':1}
+        other=deepcopy(after['records'][0]);other['num_scheduled_tokens']={'chatcmpl-two':1}
         other['scheduler_step']=8;after['records'].append(other)
         self.assertFalse(probe.scheduler_evidence(before,after,responses)['proven'])
 
@@ -97,6 +97,36 @@ class EngineMixedChecks(unittest.TestCase):
         self.assertFalse(probe.scheduler_evidence(before,after,responses)['proven'])
         before,after,responses=self.fixture();after['records'][0]['session_id']='wrong'
         with self.assertRaises(AssertionError):probe.scheduler_evidence(before,after,responses)
+
+    def test_installed_vllm_exact_api_id_plus_eight_lower_hex_contract(self):
+        api='chatcmpl-followup-abcdef0123456789'
+        self.assertTrue(probe.scheduler_id_matches_api_id(api,api))
+        self.assertTrue(probe.scheduler_id_matches_api_id(api+'-ab6613ba',api))
+        for wrong in [api+'-ab6613b',api+'-ab6613baa',api+'-ab6613bg',
+                      api+'-AB6613BA',api+'-ab6613ba-extra','prefix-'+api+'-ab6613ba',
+                      api.removeprefix('chatcmpl-')+'-ab6613ba',
+                      'chatcmpl-other-request-ab6613ba']:
+            self.assertFalse(probe.scheduler_id_matches_api_id(wrong,api),wrong)
+        before,after,responses=self.fixture()
+        after['records'][0]['num_scheduled_tokens']={
+            'chatcmpl-one-ab6613ba':1,'chatcmpl-two-0123abcd':93}
+        proof=probe.scheduler_evidence(before,after,responses)
+        self.assertTrue(proof['proven'])
+        self.assertEqual(proof['scheduler_request_ids'],
+            ['chatcmpl-one-ab6613ba','chatcmpl-two-0123abcd'])
+
+    def test_ambiguous_or_duplicate_internal_mapping_cannot_claim_two_requests(self):
+        before,after,responses=self.fixture()
+        responses[1]['response_request_id']='chatcmpl-one-ab6613ba'
+        after['records'][0]['num_scheduled_tokens']={
+            'chatcmpl-one-ab6613ba':1,'chatcmpl-one-ab6613ba-0123abcd':2}
+        proof=probe.scheduler_evidence(before,after,responses)
+        self.assertFalse(proof['proven'])
+        self.assertEqual(proof['ambiguous_scheduler_steps'],1)
+        before,after,responses=self.fixture()
+        after['records'][0]['num_scheduled_tokens']={
+            'chatcmpl-one-ab6613ba':1,'chatcmpl-one-0123abcd':2,'chatcmpl-two':3}
+        self.assertFalse(probe.scheduler_evidence(before,after,responses)['proven'])
 
     def test_default_plan_does_not_issue_http_or_create_output(self):
         with patch.object(probe.follow,'http',side_effect=AssertionError('HTTP')):

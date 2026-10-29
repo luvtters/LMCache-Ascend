@@ -3,12 +3,20 @@
 import argparse
 import json
 from pathlib import Path
+import re
 
 import direct_followups as follow
 
 
-def normalized(identity):
-    return identity.removeprefix("chatcmpl-")
+def scheduler_id_matches_api_id(scheduler_id, api_id):
+    """Installed vLLM assigns external ID + '-' + first eight lower hex chars.
+
+    Accept the complete API ID itself when randomization is disabled. Never
+    remove arbitrary suffixes or match client-ID substrings.
+    """
+    return scheduler_id == api_id or re.fullmatch(
+        re.escape(api_id) + r"-[0-9a-f]{8}", scheduler_id
+    ) is not None
 
 
 def scheduler_evidence(before, after, responses):
@@ -17,21 +25,29 @@ def scheduler_evidence(before, after, responses):
     assert len(responses) == 2
     assert len({row["response_request_id"] for row in responses}) == 2
     assert len({row["client_request_id"] for row in responses}) == 2
-    aliases = [{normalized(row[field]) for field in ("response_request_id", "client_request_id")}
-               for row in responses]
+    api_ids = [row["response_request_id"] for row in responses]
     steps = [row for row in after["records"]
              if row["kind"] == "scheduler_step" and row["role"] == "D"
              and row["mono_ns"] >= before["mono_ns"]]
+    ambiguous_steps = 0
     for row in steps:
         assert row["host_id"] == after["host_id"] and row["session_id"] == after["run_id"]
-        ids = {normalized(key) for key, value in row["num_scheduled_tokens"].items() if value > 0}
-        matches = [names & ids for names in aliases]
-        if all(matches) and any(left != right for left in matches[0] for right in matches[1]):
+        ids = [key for key, value in row["num_scheduled_tokens"].items() if value > 0]
+        owners = {key: [index for index, api_id in enumerate(api_ids)
+                        if scheduler_id_matches_api_id(key, api_id)] for key in ids}
+        matches = [{key for key, indices in owners.items() if index in indices}
+                   for index in range(2)]
+        if any(len(indices) > 1 for indices in owners.values()) or any(len(keys) > 1 for keys in matches):
+            ambiguous_steps += 1
+            continue
+        if all(len(keys) == 1 for keys in matches) and matches[0].isdisjoint(matches[1]):
             return dict(proven=True, scheduler_pid=row["pid"], scheduler_step=row["scheduler_step"],
                         mono_ns=row["mono_ns"], num_scheduled_tokens=row["num_scheduled_tokens"],
-                        response_ids=[r["response_request_id"] for r in responses],
+                        response_ids=api_ids, scheduler_request_ids=[next(iter(keys)) for keys in matches],
+                        id_contract="Exact API response ID, optionally followed by '-' and 8 lower hex characters",
                         boundary="Two successful HTTP requests scheduled in one D engine step")
     return dict(proven=False, observed_scheduler_steps=len(steps),
+                ambiguous_scheduler_steps=ambiguous_steps,
                 reason="No same-step positive-token pair linked to these HTTP identities")
 
 
