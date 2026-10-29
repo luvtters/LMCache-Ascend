@@ -115,6 +115,9 @@ def supervise(cfg, plan_only=False):
     write_json(out / "manifest.json", dict(config=cfg, **plan))
     for port in [cfg["store_port"], *cfg["ports"].values()]:
         with socket.socket() as sock:
+            # Closed HTTP clients may leave TIME_WAIT after the preceding group.
+            # Match the real servers' address reuse without accepting a listener.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("127.0.0.1", port))
     procs, records = {}, {}
     stop = False

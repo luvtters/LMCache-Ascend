@@ -155,9 +155,10 @@ def ready(host, url, timeout, roles):
     raise TimeoutError(url)
 
 
-def l2_case(ident, kind, reverse, tp, evidence):
+def l2_case(ident, kind, reverse, tp, evidence, member_host=None, member_device=8, core_path=None, config_overrides=None):
     local,remote=('12','137') if reverse else ('137','12')
-    cfg=dict(run_root=str(ROOT/'runs'),run_id=ident,core_path=str(ROOT/'src/core_compat'),
+    remote=member_host or remote
+    cfg=dict(run_root=str(ROOT/'runs'),run_id=ident,core_path=str(core_path or ROOT/'src/core_compat'),
              ascend_path=str(ROOT/'src/ascend_l2'),python=PY,env_file='/workspace/d00896497/env_crosshost.sh',
              communication_ip=HOSTS[local],store_port=28580,pool_gb=1 if tp<4 else 2,
              slot_size_mb=32,tp_size=tp,driver_devices=[8],driver_bm_device=0,
@@ -167,17 +168,20 @@ def l2_case(ident, kind, reverse, tp, evidence):
         cfg.update(local_devices=dict(p=[8,9],d=[10,11],service=[8,9,10,11,12]),service_bm_device=4)
     if tp==4:
         cfg.update(local_devices=dict(p=[2,3,4,5],d=[8,9,10,11],service=[2,3,4,5,8,9,10,11,12]),service_bm_device=8)
+    cfg.update(config_overrides or {})
     config=api(local,'/config',dict(path='configs/'+ident+'.json',data=cfg))['path']
     member=ident+'-member'; driver=ident+'-driver'
-    common={'PYTHONPATH':str(ROOT/'src/ascend_l2')+':'+str(ROOT/'src/core_compat')}
-    member_env=dict(common,ASCEND_RT_VISIBLE_DEVICES='8',TORCH_DEVICE_BACKEND_AUTOLOAD='0')
-    member_argv=[PY,'-u',ROOT/'src/ascend_l2/examples/memfabric/pool_member.py','--device','0','--rank','1','--world-size','2','--pool-gb',str(cfg['pool_gb']),'--store-url',f'tcp://{HOSTS[local]}:28580']
+    common={'PYTHONPATH':cfg['ascend_path']+':'+cfg['core_path']}
+    member_env=dict(common,ASCEND_RT_VISIBLE_DEVICES=str(member_device),TORCH_DEVICE_BACKEND_AUTOLOAD='0')
+    member_argv=[PY,'-u',Path(cfg['ascend_path'])/'examples/memfabric/pool_member.py','--device','0','--rank','1','--world-size','2','--pool-gb',str(cfg['pool_gb']),'--store-url',f"tcp://{HOSTS[local]}:{cfg['store_port']}"]
+    if cfg.get('pool_memory_type'):
+        member_argv += ['--pool-memory-type',cfg['pool_memory_type']]
     started=[]
     try:
         start(remote,member,member_argv,member_env,active=started,evidence=evidence)
-        argv=[PY,'-u',L2/('l2_driver.py' if kind=='smoke' else 'l2_model.py'),'--config',config]
+        argv=[PY,'-u',Path(cfg['ascend_path'])/'examples/memfabric/cross_host_20261030'/('l2_driver.py' if kind=='smoke' else 'l2_model.py'),'--config',config]
         env=dict(common)
-        if kind=='smoke': env.update(ASCEND_RT_VISIBLE_DEVICES='8',TORCH_DEVICE_BACKEND_AUTOLOAD='0')
+        if kind=='smoke': env.update(ASCEND_RT_VISIBLE_DEVICES=','.join(map(str,cfg['driver_devices'])),TORCH_DEVICE_BACKEND_AUTOLOAD='0')
         start(local,driver,argv,env,active=started,evidence=evidence)
         result=wait(local,driver,240 if kind=='smoke' else 900,evidence)
         if result['returncode']!=0: raise RuntimeError('L2 role failed '+str(result['returncode']))
@@ -188,15 +192,16 @@ def l2_case(ident, kind, reverse, tp, evidence):
         cleanup(reversed(started),evidence,lambda i:120 if i==driver else 20)
 
 
-def direct_case(ident, stage, evidence, tp=1):
-    role_root=ROOT if tp==1 else ROOT/'tp_candidate'
+def direct_case(ident, stage, evidence, tp=1, topology='T3', role_root=None, p_devices=None, d_devices=None, pool_device=None, pool_memory_type='host', skip_blocks=0):
+    role_root=Path(role_root) if role_root else ROOT if tp==1 else ROOT/'tp_candidate'
     runner=role_root/'src/ascend_direct/examples/memfabric/cross_host_role.py'
     spec=importlib.util.spec_from_file_location('role_'+ident,runner)
     module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-    parser=argparse.Namespace(root=str(role_root),python=PY,topology='T3',stage=stage,
+    parser=argparse.Namespace(root=str(role_root),python=PY,topology=topology,stage=stage,
           session_id=ident,model='/workspace/d00896497/models/Qwen3-8B',pool_gb=1 if tp==1 else 2,
-          skip_blocks=0,tp_size=tp,p_devices=None,d_devices=None,pool_device=8)
-    roles=['coordinator'] if stage!='inference' else ['trace137','trace12']
+          skip_blocks=skip_blocks,tp_size=tp,p_devices=p_devices,d_devices=d_devices,pool_device=pool_device,pool_memory_type=pool_memory_type)
+    mapping=module.TOPOLOGIES[topology]
+    roles=['coordinator'] if stage!='inference' else ['trace'+h for h in sorted({v[0] for v in mapping.values()})]
     roles+=['service','p','d']
     if stage=='inference': roles+=['proxy','gate']
     active=[]; plans={}
@@ -205,13 +210,20 @@ def direct_case(ident, stage, evidence, tp=1):
             parser.role=role
             plan=module.build_plan(parser); plans[role]=plan
             host=plan['host']; task=ident+'-'+role
-            argv=[PY,'-u',runner,'--root',role_root,'--topology','T3','--stage',stage,'--session-id',ident,'--role',role,'--run']
+            argv=[PY,'-u',runner,'--root',role_root,'--topology',topology,'--stage',stage,'--session-id',ident,'--role',role,'--run']
             if tp>1: argv += ['--tp-size',str(tp),'--pool-gb','2']
+            if p_devices is not None: argv += ['--p-devices',','.join(map(str,p_devices))]
+            if d_devices is not None: argv += ['--d-devices',','.join(map(str,d_devices))]
+            if pool_device is not None: argv += ['--pool-device',str(pool_device)]
+            if pool_memory_type!='host': argv += ['--pool-memory-type',pool_memory_type]
+            if skip_blocks: argv += ['--skip-blocks',str(skip_blocks)]
             if plan['physical_device'] is not None: argv+=['--allow-npu']
             if role=='proxy':
                 for engine in ('p','d'):
-                    ready('137',f'http://192.168.0.223:{28401 if engine=="p" else 28402}/health',600,active)
-                ready('12','http://192.168.0.50:28195/healthcheck',60,active)
+                    h=plans[engine]['host']
+                    ready(h,f'http://{HOSTS[h]}:{28401 if engine=="p" else 28402}/health',600,active)
+                h=plans['service']['host']
+                ready(h,f'http://{HOSTS[h]}:28195/healthcheck',60,active)
             persistent=(role=='coordinator' or (role=='service' and stage=='context') or
                         (role in ('service','p','d','proxy','trace137','trace12') and stage=='inference'))
             start(host,task,argv,persistent=persistent,active=active,evidence=evidence)
