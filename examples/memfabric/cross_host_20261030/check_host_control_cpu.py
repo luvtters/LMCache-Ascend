@@ -43,4 +43,15 @@ with tempfile.TemporaryDirectory() as d:
     else:
         raise AssertionError("post-window restart accepted")
     assert (Path(d) / "halted.json").exists()
+with tempfile.TemporaryDirectory() as d:
+    s = module.Supervisor(d, time.time() + 60)
+    s.start(dict(id="controlled", argv=[sys.executable, "-c", "import time; time.sleep(30)"], persistent=True))
+    result=s.stop("controlled", .1)
+    assert result['state']=='EXITED' and result['real_wait']
+    assert result['planned_stop'] and any(x['delivered'] for x in result['stop_signals'])
+    assert (Path(d)/'tasks/controlled/wait.raw.json').exists()
+    assert s.stop('controlled',0)==result
+    s.exclusive_until=time.time()-1
+    s.start(dict(id='persistent_zero',argv=[sys.executable,'-c','pass'],persistent=True))
+    assert wait(s,'persistent_zero')['returncode']==0 and s.halted
 print("CPU_ONLY: raw output, real wait, fresh attempts, pre-window failure, post-window halt verified")

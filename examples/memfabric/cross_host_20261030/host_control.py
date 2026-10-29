@@ -66,7 +66,8 @@ class Supervisor:
                           cwd=str(cwd), planned_stop=False, state="RUNNING",
                           persistent=bool(request.get("persistent", False)),
                           log=str(folder / "process.raw.log"))
-            item = dict(proc=proc, log=log, record=record, folder=folder)
+            item = dict(proc=proc, log=log, record=record, folder=folder,
+                        exited=threading.Event(), stop_lock=threading.Lock())
             self.tasks[ident] = item
             dump(folder / "started.json", record)
             threading.Thread(target=self._wait, args=(ident,), daemon=True).start()
@@ -74,15 +75,28 @@ class Supervisor:
 
     def _wait(self, ident):
         item = self.tasks[ident]
-        rc = item["proc"].wait()
+        while not item["exited"].is_set():
+            with self.lock:
+                self._poll(item)
+            item["exited"].wait(.02)
+
+    def _poll(self, item):
+        # Every reap and signal uses this lock. A dead child keeps its PID until
+        # reaped, so a signal cannot target a reused PID between poll and killpg.
+        if item["exited"].is_set():
+            return True
+        rc = item["proc"].poll()
+        if rc is None:
+            return False
         item["log"].close()
-        with self.lock:
-            record = item["record"]
-            record.update(state="EXITED", returncode=rc, signal=-rc if rc < 0 else None,
-                          ended=time.time())
-            dump(item["folder"] / "wait.raw.json", record)
-            if (rc != 0 or record["persistent"]) and not record["planned_stop"] and time.time() >= self.exclusive_until:
-                self.halt("unplanned_child_exit_after_exclusive_window", ident)
+        record = item["record"]
+        record.update(state="EXITED", returncode=rc, signal=-rc if rc < 0 else None,
+                      ended=time.time(), real_wait=True)
+        dump(item["folder"] / "wait.raw.json", record)
+        item["exited"].set()
+        if (rc != 0 or record["persistent"]) and not record["planned_stop"] and time.time() >= self.exclusive_until:
+            self.halt("unplanned_child_exit_after_exclusive_window", record["id"])
+        return True
 
     def halt(self, reason, ident=None):
         with self.lock:
@@ -98,30 +112,37 @@ class Supervisor:
     def stop(self, ident, grace=30, reason="controlled_case_shutdown"):
         with self.lock:
             item = self.tasks[ident]
+        with item["stop_lock"]:
             proc = item["proc"]
-            if proc.poll() is not None:
-                return dict(item["record"])
-            item["record"]["planned_stop"] = True
-            item["record"]["stop_reason"] = reason
-            dump(item["folder"] / "stop_requested.json", dict(time=time.time(), reason=reason, pid=proc.pid))
-        for sig, delay in ((signal.SIGINT, grace), (signal.SIGTERM, 8), (signal.SIGKILL, 5)):
-            if proc.poll() is not None:
-                break
-            with open(item["folder"] / "signals.raw.jsonl", "a", encoding="utf-8") as stream:
-                stream.write(json.dumps(dict(time=time.time(), pid=proc.pid, signal=int(sig), reason=reason)) + "\n")
-            try:
-                if os.name == "posix":
-                    os.killpg(proc.pid, sig)
-                else:
-                    proc.terminate()
-            except ProcessLookupError:
-                break
-            try:
-                proc.wait(timeout=delay)
-            except subprocess.TimeoutExpired:
-                continue
-        time.sleep(.05)
-        return self.status(ident)
+            with self.lock:
+                if self._poll(item):
+                    return dict(item["record"])
+                item["record"].update(planned_stop=True, stop_reason=reason, stop_signals=[])
+                dump(item["folder"] / "stop_requested.json", dict(time=time.time(), reason=reason, pid=proc.pid))
+            for sig, delay in ((signal.SIGINT, grace), (signal.SIGTERM, 8), (getattr(signal, 'SIGKILL', signal.SIGTERM), 5)):
+                with self.lock:
+                    if self._poll(item):
+                        break
+                    receipt = dict(time=time.time(), pid=proc.pid, signal=int(sig), reason=reason, delivered=False)
+                    try:
+                        if os.name == "posix":
+                            os.killpg(proc.pid, sig)
+                        else:
+                            proc.terminate()
+                        receipt["delivered"] = True
+                    except ProcessLookupError:
+                        pass
+                    item["record"]["stop_signals"].append(receipt)
+                    with open(item["folder"] / "signals.raw.jsonl", "a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(receipt) + "\n")
+                if item["exited"].wait(delay):
+                    break
+            with self.lock:
+                self._poll(item)
+                result = dict(item["record"])
+                if result["state"] != "EXITED":
+                    result["cleanup"] = "CLEANUP_UNKNOWN"
+                return result
 
 
 def handler(supervisor):
@@ -159,6 +180,20 @@ def handler(supervisor):
                 if self.path == "/halt":
                     supervisor.halt(request["reason"])
                     return self.send(200, supervisor.policy())
+                if self.path == "/config":
+                    path = (supervisor.root / request["path"]).resolve()
+                    if not path.is_relative_to(supervisor.root) or path.suffix != ".json" or path.exists():
+                        raise ValueError("Configuration must be a fresh JSON path inside run root")
+                    dump(path, request["data"])
+                    return self.send(200, {"path": str(path)})
+                if self.path == "/read":
+                    path = (supervisor.root / request["path"]).resolve()
+                    if not path.is_relative_to(supervisor.root) or not path.is_file():
+                        raise ValueError("Not a file inside run root")
+                    raw = path.read_bytes()
+                    limit = min(2000000, max(1, request.get("limit", 50000)))
+                    return self.send(200, {"path": str(path), "bytes": len(raw),
+                                           "tail": raw[-limit:].decode("utf-8", "replace")})
                 self.send(404, {"error": "unknown path"})
             except (ValueError, RuntimeError, KeyError) as exc:
                 self.send(409, {"error": str(exc)})
@@ -184,8 +219,13 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        errors = []
         for ident in list(supervisor.tasks):
-            supervisor.stop(ident, 15, "supervisor_shutdown")
+            try:
+                supervisor.stop(ident, 15, "supervisor_shutdown")
+            except Exception as exc:
+                errors.append(dict(id=ident, error=repr(exc)))
+        dump(supervisor.root / "shutdown_cleanup.json", dict(errors=errors))
         server.server_close()
 
 
