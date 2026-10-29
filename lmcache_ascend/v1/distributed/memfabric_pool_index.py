@@ -276,7 +276,7 @@ class PoolIndex:
                         transfer_ready=self._ready and not self._closed and not self._error,
                         closed=self._closed, last_error=self._error, protocol="SDMA",
                         storage_rank=self.storage_rank, world_size=self.world_size,
-                        tp_size=self.tp_size, layout=deepcopy(self._layout), chunk_size=self._chunk_size,
+                        tp_size=self.tp_size, layout=deepcopy(self._layout), direct_chunk_bytes=self._chunk_size,
                         pool_bytes=self.pool_bytes, slot_size=self.slot_size,
                         objects=len(self._entries), free_slots=len(self._free),
                         pending_writes=len(self._writes),

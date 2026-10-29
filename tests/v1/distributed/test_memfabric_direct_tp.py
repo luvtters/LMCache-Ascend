@@ -2,6 +2,9 @@
 """CPU TP transactions and worker routing; no NPU/BM execution evidence."""
 
 from concurrent.futures import ThreadPoolExecutor
+import ast
+import os
+from pathlib import Path
 import types
 import unittest
 
@@ -9,6 +12,34 @@ from test_memfabric_direct import DIRECT, Client, PoolIndex, Session, Transfer, 
 
 
 class TpPoolTests(unittest.TestCase):
+    def test_core_status_flatten_preserves_token_chunk_size(self):
+        # Execute the matching core's actual aggregator in isolation from its
+        # native imports; this is the HTTP /status field collision boundary.
+        core = Path(os.environ.get("LMCACHE_CORE_SOURCE", str(
+            Path(__file__).parents[4] / "lmcache-cross-host-direct")))
+        path = core / "lmcache/v1/multiprocess/server.py"
+        if not path.is_file():
+            self.skipTest("Set LMCACHE_CORE_SOURCE to the matching core checkout")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        server = next(node for node in tree.body
+                      if isinstance(node, ast.ClassDef) and node.name == "MPCacheServer")
+        report_status = next(node for node in server.body
+                             if isinstance(node, ast.FunctionDef) and node.name == "report_status")
+        namespace = {}
+        exec(compile(ast.Module(body=[report_status], type_ignores=[]), str(path), "exec"), namespace)
+        for tp in (1, 2):
+            with self.subTest(tp=tp):
+                pool = (PoolIndex(pool_bytes=128, slot_size=64, storage_rank=0,
+                                  world_size=3) if tp == 1 else self.pool())
+                context = types.SimpleNamespace(chunk_size=128, hash_algorithm_name="test",
+                    session_manager=types.SimpleNamespace(active_count=lambda: 0),
+                    storage_manager=types.SimpleNamespace(report_status=lambda: {"is_healthy": True}))
+                engine = types.SimpleNamespace(_context=context,
+                    _modules=[types.SimpleNamespace(report_status=pool.status)])
+                status = namespace["report_status"](engine)
+                self.assertEqual(status["chunk_size"], 128)
+                self.assertEqual(status["direct_chunk_bytes"], None if tp == 1 else 32)
+
     def pool(self, tp=2, slots=8):
         pool = PoolIndex(pool_bytes=slots * 64, slot_size=64,
                          storage_rank=0, world_size=1 + 2 * tp, tp_size=tp)
