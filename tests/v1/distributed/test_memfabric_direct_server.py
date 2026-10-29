@@ -112,6 +112,22 @@ class ServerTests(unittest.TestCase):
         server._quiesce_device_callbacks = quiesce
         server.close()
 
+    def test_create_binds_declared_builtin_quiesce_dependency(self):
+        base = load_server()
+        callback = lambda: None
+        required = []
+        class Candidate(base):
+            def __init__(self, context, config, **kwargs):
+                self.bound = kwargs['quiesce_device_callbacks']
+        def require(module):
+            required.append(module)
+            return types.SimpleNamespace(quiesce_device_callbacks=callback)
+        build = types.SimpleNamespace(engine_context=None, require=require,
+                                      config_for=lambda cls: self.config)
+        item = Candidate.create(build)
+        self.assertIs(item.bound, callback)
+        self.assertEqual(tuple(required), base.module_dependencies)
+
     def test_startup_error_and_peer_departure_are_reported_unavailable(self):
         def fail(**kwargs):
             raise RuntimeError("join failed")
