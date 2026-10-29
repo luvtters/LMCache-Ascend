@@ -1,0 +1,10 @@
+{
+  "status": "PASS",
+  "evidence_class": "CPU JSON gate only",
+  "checks": {
+    "three_complete_ABC_groups_pass": true,
+    "incomplete_never_passes": true,
+    "missing_backend_rejected": true,
+    "actual_incomplete_summary_returns_2": true
+  }
+}

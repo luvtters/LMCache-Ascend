@@ -1,0 +1,22 @@
+{
+  "status": "PASS",
+  "evidence_class": "real CPU-only subprocesses and launcher exit; no device or remote execution",
+  "checks": {
+    "launcher_exit_does_not_stop_runner": true,
+    "declared_exit3_handoff_runs_validated_successor": true,
+    "declared_handoff_runs_required_cleanup_and_blocks_failed_cleanup": true,
+    "missing_successor_rejected_before_predecessor": true,
+    "real_failure_cleanup_then_next_without_false_pass": true,
+    "unknown_or_failed_cleanup_blocks_resource_continuation": true,
+    "expired_window_starts_zero_steps": true,
+    "stop_new_prevents_later_step": true,
+    "post_filesystem_deadline_recheck_preserves_unstarted_pending_work": true,
+    "only_explicit_authorized_window_is_forwarded_to_children": true,
+    "commands_pass_but_report_not_ready_reruns_real_steps_then_gate_succeeds": true,
+    "safe_failed_step_requeues_after_other_work_with_fresh_attempt": true,
+    "retry_without_new_attempt_name_is_rejected": true,
+    "timed_out_child_reaped_cleanup_then_continue": true
+  },
+  "platform": "local WSL Linux POSIX subprocess branch",
+  "non_root": true
+}

@@ -25,8 +25,18 @@ RUNTIME = ROOT / "runtime"
 PY = os.environ.get("MF_EXPERIMENT_PYTHON", sys.executable)
 ENV = ROOT / "env.sh"
 MODEL = PurePosixPath(os.environ.get("MF_MODEL", "/path/to/read-only/Qwen3-8B"))
-BEGIN = datetime.fromisoformat("2026-10-29T01:20:00+08:00").timestamp()
-NEW_WORK_END = datetime.fromisoformat("2026-10-29T05:30:00+08:00").timestamp()
+def authorized_window():
+    values = [os.environ.get(key) for key in ("MF_AUTHORIZED_START_AT", "MF_AUTHORIZED_STOP_NEW_AT")]
+    if any(value is not None for value in values) and not all(values):
+        raise ValueError("Supply both explicit authorized-window values")
+    values = values if all(values) else ["2026-10-29T01:20:00+08:00", "2026-10-29T05:30:00+08:00"]
+    parsed = [datetime.fromisoformat(value) for value in values]
+    if any(value.tzinfo is None or value.utcoffset() is None for value in parsed) or parsed[0] >= parsed[1]:
+        raise ValueError("Authorized window must have a timezone and increasing boundaries")
+    return tuple(value.timestamp() for value in parsed)
+
+
+BEGIN, NEW_WORK_END = authorized_window()
 PORTS = dict(service=25595, http=28195, bm=28695, p=28401, d=28402,
              proxy=28400, proxy_telemetry=25808, gate_telemetry=25809,
              p_counter=29401, d_counter=29402)

@@ -1,0 +1,10 @@
+{
+  "status": "PASS",
+  "evidence_class": "CPU parsing only, no commands or future tasks launched",
+  "checks": {
+    "historical_default_unchanged": true,
+    "explicit_future_window_parses_only": true,
+    "naive_window_rejected": true,
+    "partial_window_rejected": true
+  }
+}

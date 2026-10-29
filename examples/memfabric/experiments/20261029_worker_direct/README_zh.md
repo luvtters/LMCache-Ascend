@@ -2,6 +2,8 @@
 
 日期：2026-10-29。结果状态：**PARTIAL_COMPLETION**；功能验收和一轮串行探索对照通过，指定重复性能矩阵及异常实验未完成。详见[阶段实测报告](RESULTS_zh.md)及[精选证据](selected_evidence.json)。CPU检查、真实搬运、性能和退出分别记录。
 
+后续已查明03:39主会话的模型容量错误及03:42接续链断点，并补充[独立接续执行器与CPU验证](continuation/README_zh.md)。此修复没有实机部署或安排新设备任务。
+
 前提为 LMCache core `8bc9edc`、LMCache-Ascend `7e5d40a`，Qwen3-8B / TP1、固定 BM 成员、DRAM 池及已准备的 Ascend 环境。没有增加 SDK 或依赖版本。新组必须使用新 case；未知 DMA 完成时不能靠超时回收地址，成员失效后不能原地重新加入旧组。
 
 | 组别 | D 的恢复路径 | 要回答的问题 |
