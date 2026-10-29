@@ -87,6 +87,16 @@ def validate_local_segments(planes, segments, expected):
             raise AssertionError('Segment extends beyond its retained original NPU plane')
 
 
+def owner_pool_addresses(session, pool_memory_type, local_device_type):
+    result = dict(owner_gva=int(session.peer_address(0)))
+    if pool_memory_type == 'device':
+        mapped = int(session.handle.gva_to_va(result['owner_gva'], local_device_type))
+        if not mapped:
+            raise RuntimeError('Selected owner pool has no actual LOCAL_DEVICE mapping')
+        result['owner_local_device_va'] = mapped
+    return result
+
+
 def batch_arrays(segments, *, retrieve=False):
     """The D planner maps its target pages to the same packed pool layout."""
     if not segments:
@@ -174,11 +184,9 @@ def execute(args, report, record):
         publish(args.coord_url, args.run_id, "joined-" + args.role,
                 dict(name="joined-" + args.role, rank=report["rank"], layers=args.layers))
         if args.role != "pool":
-            owner_gva = int(session.peer_address(0))
-            owner_va = int(session.handle.gva_to_va(owner_gva, bm.BmMemType.LOCAL_DEVICE))
-            if not owner_va:
-                raise RuntimeError('Selected owner pool has no actual LOCAL_DEVICE mapping')
-            report.update(owner_gva=owner_gva, owner_local_device_va=owner_va)
+            report.update(owner_pool_addresses(session, args.pool_memory_type,
+                                               bm.BmMemType.LOCAL_DEVICE))
+            owner_gva = report['owner_gva']
             segments = plan_segments(report["plane_metadata"],
                 SOURCE_BLOCKS if args.role == "p" else TARGET_BLOCKS,
                 block_size=64, token_start=0, token_count=128,
