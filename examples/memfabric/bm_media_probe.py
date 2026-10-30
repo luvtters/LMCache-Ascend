@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Two-rank raw BM medium probe. Defaults to a CPU-only plan.
 
-Rank 0 writes a patterned 1 MiB NPU buffer to rank 1's selected BM pool.
-Rank 1 restores it into a separate NPU buffer and compares every byte against
-an independently generated expectation. HTTP carries immutable metadata only.
+Push writes rank 0's patterned NPU buffer to rank 1's pool, then rank 1 verifies.
+Pull-only initializes rank 1's own pool locally, then rank 0 reads and verifies.
+Every byte is compared to an independent expectation; HTTP is metadata only.
 The caller owns device masks, a fresh store/group, both process waits and raw
 stdout/stderr (including actual native ExportInner segType records).
 """
@@ -14,11 +14,14 @@ from pathlib import Path
 import socket
 import time
 import traceback
+from urllib.parse import urlparse
 
 from direct_coordination import publish, wait_event
 
 PAYLOAD_BYTES = 1 << 20
 POOL_BYTES = 1 << 30
+# Exact SDK 1.2.1 smem_bm_def.h; allocation variant, not a copy flag.
+DRAM_MAP_HOST_VA_FLAG = 1 << 9
 
 
 def arguments(argv=None):
@@ -28,6 +31,14 @@ def arguments(argv=None):
                         help='Logical NPU id after the caller applies its device mask')
     parser.add_argument('--world-size', type=int, choices=(2,), default=2)
     parser.add_argument('--media', choices=('host', 'device'), required=True)
+    parser.add_argument('--direction', choices=('push', 'pull-only'), default='push')
+    parser.add_argument('--data-op-type', choices=('sdma', 'device_rdma'), default='sdma')
+    parser.add_argument('--device-nic', default='tcp://127.0.0.1:10005',
+                        help='SDK NIC URL; DEVICE_RDMA selects its own NPU IP using this port')
+    parser.add_argument('--enable-56bits-gva', action='store_true',
+                        help='Explicit SDK address mode; permits RDMA allocator HAL fallback')
+    parser.add_argument('--dram-map-host-va', action='store_true',
+                        help='Isolated HOST/SDMA allocation diagnostic; default remains flags=0')
     parser.add_argument('--store-url', required=True)
     parser.add_argument('--coord-url', required=True)
     parser.add_argument('--run-id', required=True)
@@ -36,6 +47,8 @@ def arguments(argv=None):
     parser.add_argument('--init-timeout', type=int, default=300)
     parser.add_argument('--allow-npu', action='store_true')
     args = parser.parse_args(argv)
+    if args.dram_map_host_va and (args.media != 'host' or args.data_op_type != 'sdma'):
+        parser.error('--dram-map-host-va is only a HOST/SDMA allocation variant')
     if args.device < 0 or args.timeout <= 0 or args.init_timeout <= 0:
         parser.error('device and timeouts must be valid')
     if (not args.run_id or not args.run_id.isascii() or
@@ -43,6 +56,9 @@ def arguments(argv=None):
         parser.error('run-id must contain ASCII letters, digits, dash or underscore')
     if not args.store_url.startswith('tcp://') or not args.coord_url.startswith(('http://', 'https://')):
         parser.error('store-url must be tcp:// and coord-url must be HTTP(S)')
+    nic = urlparse(args.device_nic)
+    if nic.scheme != 'tcp' or not nic.hostname or not nic.port or not 0 < nic.port < 65536:
+        parser.error('device-nic must be tcp://IPv4:port')
     return args
 
 
@@ -50,12 +66,19 @@ def build_plan(args):
     hbm = POOL_BYTES if args.media == 'device' else 0
     return dict(status='PLAN_ONLY', rank=args.rank, device=args.device,
         hostname=socket.gethostname(), pid=os.getpid(), world_size=2,
-        media=args.media, run_id=args.run_id, store_url=args.store_url,
+        media=args.media, direction=args.direction, writer_rank=1 if args.direction=='pull-only' else 0,
+        reader_rank=0 if args.direction=='pull-only' else 1,
+        data_op_type=args.data_op_type, device_nic=args.device_nic,
+        run_id=args.run_id, store_url=args.store_url,
         coord_url=args.coord_url, owner_rank=1, payload_bytes=PAYLOAD_BYTES,
         fresh_store_and_process_group_required=True,
         target_memory='DEVICE' if hbm else 'HOST',
         create2=dict(id=0, local_dram_size=POOL_BYTES, max_dram_size=POOL_BYTES,
-                     local_hbm_size=hbm, max_hbm_size=hbm, data_op_type='SDMA', flags=0),
+                     local_hbm_size=hbm, max_hbm_size=hbm,
+                     data_op_type='SDMA' if args.data_op_type == 'sdma' else 'DEVICE_RDMA',
+                     enable_56bits_gva=args.enable_56bits_gva,
+                     flags=DRAM_MAP_HOST_VA_FLAG if args.dram_map_host_va else 0),
+        actual_transport='NOT_VERIFIED_READ_NATIVE_TRANSPORT_LOG',
         actual_export_seg_type='NOT_VERIFIED_READ_NATIVE_PROCESS_RAW_LOG',
         payload_via_rpc=False, external_process_wait_required=True,
         comparison_scope='raw_BM_medium_diagnostic_not_LMCache_or_performance')
@@ -65,11 +88,39 @@ def pattern_bytes(size):
     return bytes((index * 17 + (index // 251) * 29 + 43) % 256 for index in range(size))
 
 
-def owner_address(handle, bm, media, timeout, emit):
+def sdk_data_op(bm, name):
+    # A missing SDK enum is an error, never a request to fall back to SDMA.
+    if name not in ('sdma', 'device_rdma'):
+        raise ValueError('Unsupported data operation')
+    return getattr(bm.BmDataOpType, 'SDMA' if name == 'sdma' else 'DEVICE_RDMA')
+
+
+def sdk_create_options(report, bm):
+    return dict(report['create2'], data_op_type=sdk_data_op(bm, report['data_op_type']))
+
+
+def peer_contract(report):
+    return {key: report[key] for key in ('media', 'direction', 'data_op_type', 'device_nic',
+        'world_size', 'store_url', 'payload_bytes', 'create2')}
+
+
+def check_peer_contract(local, peer):
+    if local != peer:
+        raise ValueError('Ranks disagree on pool geometry, medium or data operation')
+
+
+def owner_address(handle, bm, media, timeout, emit, data_op_type='sdma'):
     mem_type = bm.BmMemType.DEVICE if media == 'device' else bm.BmMemType.HOST
     deadline = time.monotonic() + timeout
     while True:
         pointer = handle.peer_rank_ptr(1, mem_type)
+        if pointer and data_op_type == 'device_rdma':
+            # RDMA addresses remote registered memory through transport keys.
+            # The SDK deliberately leaves remote LOCAL_DEVICE mappings absent.
+            emit('OWNER_GVA_READY', owner_rank=1, target_memory=media,
+                 peer_ptr=int(pointer), peer_ptr_hex=hex(pointer),
+                 readiness='BM_JOIN_AND_TRANSPORT_REGISTRATION; no SDMA mapping claim')
+            return pointer
         local_va = handle.gva_to_va(pointer, bm.BmMemType.LOCAL_DEVICE) if pointer else 0
         if pointer and local_va:
             emit('OWNER_MAPPING_READY', owner_rank=1, target_memory=media,
@@ -123,15 +174,20 @@ def run(args, report, emit):
     def marker(name, **metadata):
         publish(args.coord_url, args.run_id, name,
                 dict(name=name, rank=args.rank, hostname=socket.gethostname(),
-                     media=args.media, **metadata), min(5, args.timeout))
+                     media=args.media, data_op_type=args.data_op_type, **metadata), min(5, args.timeout))
 
     def wait(name):
         result = wait_event(args.coord_url, args.run_id, name, args.timeout)
-        if result.get('media') != args.media:
-            raise RuntimeError('Peer medium differs from this attempt')
+        if (result.get('media') != args.media or
+                result.get('data_op_type') != args.data_op_type):
+            raise RuntimeError('Peer medium or data operation differs from this attempt')
         return result
 
     try:
+        marker('config-ready-' + str(args.rank), contract=peer_contract(report))
+        peer = wait('config-ready-' + str(1 - args.rank))
+        check_peer_contract(peer_contract(report), peer['contract'])
+        emit('PEER_CONFIG_AGREED', contract=peer_contract(report))
         torch.npu.set_device(args.device)
         emit('DEVICE_SELECTED', logical_device=args.device)
         mf.set_log_level(0)  # Preserve native ExportInner/Import records in caller's raw log.
@@ -144,10 +200,17 @@ def run(args, report, emit):
         config.init_timeout = args.init_timeout
         config.create_timeout = args.init_timeout
         config.operation_timeout = args.init_timeout
+        if args.data_op_type == 'device_rdma':
+            config.set_nic(args.device_nic)
+            emit('DEVICE_RDMA_NIC_REQUESTED', device_nic=args.device_nic,
+                 actual_device_ip='READ_NATIVE_TRANSPORT_LOG')
         call_step('bm.initialize', lambda: bm.initialize(
             args.store_url, 2, args.device, config), emit)
         bm_ready = True
-        options = dict(report['create2'], data_op_type=bm.BmDataOpType.SDMA)
+        operation = sdk_data_op(bm, args.data_op_type)
+        emit('SDK_DATA_OPERATION_SELECTED', data_op_type=args.data_op_type,
+             sdk_enum=str(operation), sdk_enum_value=int(operation))
+        options = sdk_create_options(report, bm)
         emit('CREATE_BEGIN', requested=report['create2'],
              actual_export_seg_type='READ_NATIVE_ExportInner_NOT_REQUESTED_MEDIA')
         handle = bm.create2(**options)
@@ -156,7 +219,7 @@ def run(args, report, emit):
         emit('CREATE_RETURN', handle_type=str(type(handle)))
         call_step('join', handle.join, emit)
         joined = True
-        pointer = owner_address(handle, bm, args.media, args.timeout, emit)
+        pointer = owner_address(handle, bm, args.media, args.timeout, emit, args.data_op_type)
         report['owner_peer_ptr'] = int(pointer)
         report['owner_peer_ptr_hex'] = hex(pointer)
         marker('ready-' + str(args.rank), owner_ptr=int(pointer),
@@ -166,7 +229,7 @@ def run(args, report, emit):
             raise RuntimeError('Peer BM group id differs')
         if peer.get('owner_ptr') != pointer or peer.get('target_memory') != report['target_memory']:
             raise RuntimeError('Ranks disagree on selected owner pool address or memory type')
-        if args.rank == 0:
+        if args.rank == report['writer_rank']:
             host_source = bytearray(pattern_bytes(PAYLOAD_BYTES))
             source = torch.frombuffer(host_source, dtype=torch.uint8).to(f'npu:{args.device}')
             buffers.extend([host_source, source])
@@ -181,7 +244,7 @@ def run(args, report, emit):
             marker('stored', completed_bytes=PAYLOAD_BYTES)
             verified = wait('verified')
             if verified.get('equal') is not True or verified.get('verified_bytes') != PAYLOAD_BYTES:
-                raise AssertionError('Owner did not verify the complete payload')
+                raise AssertionError('Reader did not verify the complete payload')
             report['peer_full_content_equal'] = True
             marker('source-ack')
         else:
