@@ -16,6 +16,8 @@ def load(name):
 
 
 c=load('cross_campaign'); h=load('host_control')
+# This fixture exercises the before-deadline phase, regardless of today's date.
+c.EXCLUSIVE_UNTIL = time.time() + 60
 with tempfile.TemporaryDirectory() as temporary:
     root=Path(temporary); supervisors={}; servers={}; threads=[]
     for host in c.HOSTS:

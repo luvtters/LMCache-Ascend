@@ -24,7 +24,8 @@ class Checks(unittest.TestCase):
         self.assertTrue(classify_wait(None, []).startswith("FAILED"))
 
     def test_shared_shutdown_budget(self):
-        self.assertEqual(shutdown_budget({}), (18, 90))
+        self.assertEqual(shutdown_budget({}), (60, 90))
+        self.assertEqual(shutdown_budget(dict(stop_timeout=18)), (18, 90))
         self.assertEqual(shutdown_budget(dict(stop_timeout=20, shutdown_timeout=75)), (20, 75))
         for cfg in (dict(shutdown_timeout=91), dict(shutdown_timeout=0), dict(stop_timeout=91)):
             with self.assertRaises(ValueError):

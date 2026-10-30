@@ -163,7 +163,7 @@ def l2_case(ident, kind, reverse, tp, evidence, member_host=None, member_device=
              communication_ip=HOSTS[local],store_port=28580,pool_gb=1 if tp<4 else 2,
              slot_size_mb=32,tp_size=tp,driver_devices=[8],driver_bm_device=0,
              service_bm_device=2,local_devices=dict(p=[8],d=[10],service=[8,10,12]),
-             model_path='/workspace/d00896497/models/Qwen3-8B',stop_timeout=18,shutdown_timeout=90)
+             model_path='/workspace/d00896497/models/Qwen3-8B',stop_timeout=60,shutdown_timeout=90)
     if tp==2:
         cfg.update(local_devices=dict(p=[8,9],d=[10,11],service=[8,9,10,11,12]),service_bm_device=4)
     if tp==4:

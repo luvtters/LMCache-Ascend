@@ -21,7 +21,9 @@ from l2_config import adapter_config, model_expectations, read_config, write_jso
 
 def shutdown_budget(cfg):
     """One shared monotonic budget, shorter than the outer 120-second grace."""
-    per_role = float(cfg.get("stop_timeout", 18))
+    # Service periodic threads can take over 18 seconds to stop normally.
+    # Keep the shared deadline bounded while allowing the measured teardown.
+    per_role = float(cfg.get("stop_timeout", 60))
     total = float(cfg.get("shutdown_timeout", 90))
     if not 0 < per_role <= 90 or not 0 < total <= 90:
         raise ValueError("stop_timeout and shutdown_timeout must be in (0, 90] seconds")
