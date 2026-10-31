@@ -8,6 +8,24 @@ import unittest
 
 
 class Checks(unittest.TestCase):
+    def test_device_endpoint_plan_and_mapping(self):
+        import registered_host_rdma_probe as p
+        base = ['--rank', '0', '--device', '0', '--store-url', 'tcp://127.0.0.1:19001',
+            '--coord-url', 'http://127.0.0.1:19002', '--run-id', 'cpu', '--output', 'unused.json']
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            p.arguments(base + ['--local-endpoint', 'device'])
+        a = p.arguments(base + ['--local-endpoint', 'device', '--copy-interface', 'g2g'])
+        plan = p.build_plan(a)
+        self.assertEqual(plan['create2']['local_hbm_size'], 1 << 30)
+        self.assertEqual(plan['local_endpoint'], 'device')
+        p.validate_device_mapping(0x10000, 4096, 0x80000, 0x80200, 256)
+        for values in ((0, 4096, 0x80000, 0x80200, 256),
+                       (0x10000, 512, 0x80000, 0x80200, 256),
+                       (0x10000, 4096, 0, 512, 256),
+                       (0x10000, 4096, 0x80000, 0x80001, 256)):
+            with self.assertRaises(ValueError):
+                p.validate_device_mapping(*values)
+
     def test_registered_gva_copy_interface(self):
         import registered_host_rdma_probe as p
         # Both endpoints are managed HOST GVAs; no HVA is passed as a DEVICE pointer.

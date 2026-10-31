@@ -114,3 +114,37 @@ The selected interface is recorded and must match across ranks. Source basis:
 `hybm_va_manager.cpp:233-293`, `hybm_data_op_device_rdma.cpp:115-133,379-398`.
 The CPU request checks verify exact GVA source/destination selection; they do
 not prove that the device run passes direction checking or RDMA completion.
+
+## Optional real NPU endpoint, with explicit local D2D staging
+
+Add **`--local-endpoint device --copy-interface g2g` on both ranks** for a
+separate device validation group. Defaults remain unchanged. This mode requests
+1 GiB HOST plus 1 GiB HBM per rank. Rank 1 remains the remote HOST pool owner.
+Rank 0 selects its own registered DEVICE GVA at source offset 0 and restore
+offset `2*n`, checks `local_mem_size(DEVICE)`, nonzero/overflow-free mappings,
+and contiguous `LOCAL_DEVICE` translations. Device addresses are never CPU
+dereferenced. Failure to obtain the requested mapping aborts the attempt.
+
+Rank 0 creates real contiguous uint8 `torch` NPU source and restore tensors.
+The public SDK L2G interface copies source Tensor to its local HBM GVA, then
+G2G copies that registered HBM GVA to the remote HOST GVA. After independent
+owner verification, source Tensor and registered HBM source are overwritten.
+G2G reads remote HOST into the separate registered HBM restore region; G2L
+copies that region to the real restore NPU Tensor, which is then synchronized
+and copied to CPU solely for full-byte verification. Owner-generated B repeats
+the read with fresh sentinels. Tensor allocations stay alive through teardown.
+
+This is a registered NPU-to-remote-HOST primitive with **local D2D staging**,
+not zero-copy transmission directly from arbitrary torch scratch. No payload
+is staged through a local HOST buffer during the measured cross-host copy.
+Initial test-pattern upload and final CPU inspection are verification setup.
+The trace records each local staging operation separately from cross-host
+completion byte counters. It does not prove production integration or speedup.
+
+Fixed SDK source: `hybm_data_op_device_rdma.cpp` local CopyLD2GD/CopyGD2LD
+branches call CopyLD2LD (`ACL_MEMCPY_DEVICE_TO_DEVICE`); cross-rank
+CopyGD2GH/CopyGH2GD call CopyRDMA. Public G2G selects DEVICE-to-HOST and
+HOST-to-DEVICE from managed GVA regions, and TransformVa converts only local
+managed pointers. `torch.npu.synchronize` brackets local staging and precedes
+content inspection; synchronous SDK returns remain mandatory. CPU checks cover
+the new explicit parameter contract and mapping geometry, not NPU execution.
