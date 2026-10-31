@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Two-rank raw BM medium probe. Defaults to a CPU-only plan.
 
-Push writes rank 0's patterned NPU buffer to rank 1's pool, then rank 1 verifies.
+Push writes rank 0's patterned buffer to rank 1's pool, then rank 1 verifies.
 Pull-only initializes rank 1's own pool locally, then rank 0 reads and verifies.
 Every byte is compared to an independent expectation; HTTP is metadata only.
 The caller owns device masks, a fresh store/group, both process waits and raw
@@ -42,6 +42,8 @@ def arguments(argv=None):
                         help='Isolated HOST/SDMA allocation diagnostic; default remains flags=0')
     parser.add_argument('--payload-bytes', type=int, default=PAYLOAD_BYTES,
                         help='Full compared payload, a positive multiple of 32, at most 64 MiB')
+    parser.add_argument('--buffer-kind', choices=('npu', 'cpu'), default='npu',
+                        help='CPU uses SDK H2G/G2H with HOST/SDMA; still requires NPU context')
     parser.add_argument('--store-url', required=True)
     parser.add_argument('--coord-url', required=True)
     parser.add_argument('--run-id', required=True)
@@ -52,6 +54,8 @@ def arguments(argv=None):
     args = parser.parse_args(argv)
     if not 0 < args.payload_bytes <= MAX_PAYLOAD_BYTES or args.payload_bytes % 32:
         parser.error('payload-bytes must be a positive multiple of 32 and at most 64 MiB')
+    if args.buffer_kind == 'cpu' and (args.media != 'host' or args.data_op_type != 'sdma'):
+        parser.error('--buffer-kind cpu requires HOST/SDMA')
     if args.dram_map_host_va and (args.media != 'host' or args.data_op_type != 'sdma'):
         parser.error('--dram-map-host-va is only a HOST/SDMA allocation variant')
     if args.device < 0 or args.timeout <= 0 or args.init_timeout <= 0:
@@ -76,6 +80,9 @@ def build_plan(args):
         data_op_type=args.data_op_type, device_nic=args.device_nic,
         run_id=args.run_id, store_url=args.store_url,
         coord_url=args.coord_url, owner_rank=1, payload_bytes=args.payload_bytes,
+        buffer_kind=args.buffer_kind, npu_context_required=True,
+        copy_types=dict(write='H2G' if args.buffer_kind == 'cpu' else 'L2G',
+                        read='G2H' if args.buffer_kind == 'cpu' else 'G2L'),
         fresh_store_and_process_group_required=True,
         target_memory='DEVICE' if hbm else 'HOST',
         create2=dict(id=0, local_dram_size=POOL_BYTES, max_dram_size=POOL_BYTES,
@@ -106,7 +113,7 @@ def sdk_create_options(report, bm):
 
 def peer_contract(report):
     return {key: report[key] for key in ('media', 'direction', 'data_op_type', 'device_nic',
-        'world_size', 'store_url', 'payload_bytes', 'create2')}
+        'world_size', 'store_url', 'payload_bytes', 'buffer_kind', 'copy_types', 'create2')}
 
 
 def check_peer_contract(local, peer):
@@ -162,6 +169,7 @@ def cleanup_steps(steps, emit):
 
 def run(args, report, emit):
     payload_bytes = args.payload_bytes
+    write_copy, read_copy = report['copy_types']['write'], report['copy_types']['read']
     # Device and native SDK imports are intentionally behind --allow-npu.
     import torch
     import torch_npu  # noqa: F401
@@ -180,13 +188,15 @@ def run(args, report, emit):
     def marker(name, **metadata):
         publish(args.coord_url, args.run_id, name,
                 dict(name=name, rank=args.rank, hostname=socket.gethostname(),
-                     media=args.media, data_op_type=args.data_op_type, **metadata), min(5, args.timeout))
+                     media=args.media, data_op_type=args.data_op_type,
+                     buffer_kind=args.buffer_kind, **metadata), min(5, args.timeout))
 
     def wait(name):
         result = wait_event(args.coord_url, args.run_id, name, args.timeout)
         if (result.get('media') != args.media or
-                result.get('data_op_type') != args.data_op_type):
-            raise RuntimeError('Peer medium or data operation differs from this attempt')
+                result.get('data_op_type') != args.data_op_type or
+                result.get('buffer_kind') != args.buffer_kind):
+            raise RuntimeError('Peer medium, buffer kind or data operation differs from this attempt')
         return result
 
     try:
@@ -237,16 +247,19 @@ def run(args, report, emit):
             raise RuntimeError('Ranks disagree on selected owner pool address or memory type')
         if args.rank == report['writer_rank']:
             host_source = bytearray(pattern_bytes(payload_bytes))
-            source = torch.frombuffer(host_source, dtype=torch.uint8).to(f'npu:{args.device}')
+            source = torch.frombuffer(host_source, dtype=torch.uint8)
+            if args.buffer_kind == 'npu':
+                source = source.to(f'npu:{args.device}')
             buffers.extend([host_source, source])
             torch.npu.synchronize(args.device)
-            emit('BUFFER_READY', kind='source_npu', ptr=source.data_ptr(), bytes=payload_bytes)
-            call_step('copy_L2G', lambda: handle.copy_data(source.data_ptr(), pointer,
-                payload_bytes, bm.BmCopyType.L2G, 0), emit,
+            emit('BUFFER_READY', kind='source_' + args.buffer_kind,
+                 ptr=source.data_ptr(), bytes=payload_bytes)
+            call_step('copy_' + write_copy, lambda: handle.copy_data(source.data_ptr(), pointer,
+                payload_bytes, getattr(bm.BmCopyType, write_copy), 0), emit,
                 requested_bytes=payload_bytes, src=source.data_ptr(), dst=pointer, flags=0)
-            call_step('wait_after_L2G', handle.wait, emit)
+            call_step('wait_after_' + write_copy, handle.wait, emit)
             report['completed_write_bytes'] = payload_bytes
-            emit('COPY_COMPLETED', direction='L2G', completed_bytes=payload_bytes)
+            emit('COPY_COMPLETED', direction=write_copy, completed_bytes=payload_bytes)
             marker('stored', completed_bytes=payload_bytes)
             verified = wait('verified')
             if verified.get('equal') is not True or verified.get('verified_bytes') != payload_bytes:
@@ -255,16 +268,16 @@ def run(args, report, emit):
             marker('source-ack')
         else:
             restored = torch.full((payload_bytes,), 165, dtype=torch.uint8,
-                                  device=f'npu:{args.device}')
+                                  device='cpu' if args.buffer_kind == 'cpu' else f'npu:{args.device}')
             buffers.append(restored)
             torch.npu.synchronize(args.device)
             stored = wait('stored')
             if stored.get('completed_bytes') != payload_bytes:
                 raise AssertionError('Source did not complete the expected byte count')
-            call_step('copy_G2L', lambda: handle.copy_data(pointer, restored.data_ptr(),
-                payload_bytes, bm.BmCopyType.G2L, 0), emit,
+            call_step('copy_' + read_copy, lambda: handle.copy_data(pointer, restored.data_ptr(),
+                payload_bytes, getattr(bm.BmCopyType, read_copy), 0), emit,
                 requested_bytes=payload_bytes, src=pointer, dst=restored.data_ptr(), flags=0)
-            call_step('wait_after_G2L', handle.wait, emit)
+            call_step('wait_after_' + read_copy, handle.wait, emit)
             torch.npu.synchronize(args.device)
             report['completed_read_bytes'] = payload_bytes
             observed = restored.cpu().numpy().tobytes()
@@ -323,7 +336,8 @@ def main(argv=None):
         def emit(event, **metadata):
             record = dict(event=event, unix_ns=time.time_ns(), mono_ns=time.monotonic_ns(),
                 hostname=socket.gethostname(), pid=os.getpid(), rank=args.rank,
-                device=args.device, media=args.media, run_id=args.run_id, **metadata)
+                device=args.device, media=args.media, buffer_kind=args.buffer_kind,
+                run_id=args.run_id, **metadata)
             line = json.dumps(record, sort_keys=True)
             events.write(line + '\n')
             events.flush()

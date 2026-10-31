@@ -38,14 +38,37 @@ class ProbeChecks(unittest.TestCase):
             probe.check_peer_contract(probe.peer_contract(plans[0]), wrong)
 
     def test_small_payload_drives_both_runtime_allocations_copies_and_counts(self):
+        self.check_small_buffer_runtime('npu')
+
+    def test_cpu_buffer_kind_is_explicit_restricted_and_in_contract(self):
+        original = probe.build_plan(probe.arguments(self.payload_args()))
+        self.assertEqual(original['buffer_kind'], 'npu')
+        alternate = probe.build_plan(probe.arguments(self.payload_args('--buffer-kind', 'cpu')))
+        self.assertEqual(alternate['buffer_kind'], 'cpu')
+        self.assertEqual(alternate['copy_types'], dict(write='H2G', read='G2H'))
+        self.assertTrue(alternate['npu_context_required'])
+        with self.assertRaises(ValueError):
+            probe.check_peer_contract(probe.peer_contract(original), probe.peer_contract(alternate))
+        for extra in (['--media', 'device'], ['--data-op-type', 'device_rdma']):
+            with self.assertRaises(SystemExit):
+                probe.arguments(self.payload_args('--buffer-kind', 'cpu', *extra))
+
+    def test_cpu_buffers_copy_types_wait_order_and_full_content(self):
+        self.check_small_buffer_runtime('cpu')
+
+    def check_small_buffer_runtime(self, kind):
         # Fake only unavailable device/SDK boundaries; execute the real run path.
         size = 64
-        allocations, copies, publications = [], [], []
+        allocations, copies, publications, steps, devices = [], [], [], [], []
         class Buffer:
             def __init__(self, data):
                 self.data = bytes(data)
                 allocations.append(len(self.data))
-            def to(self, device): return self
+            def to(self, device):
+                if kind == 'cpu':
+                    raise AssertionError('CPU source must not be transferred to NPU')
+                devices[-1] = device
+                return self
             def data_ptr(self): return 4096
             def cpu(self): return self
             def numpy(self): return self
@@ -55,34 +78,51 @@ class ProbeChecks(unittest.TestCase):
             def gva_to_va(self, *args): return 16384
             def copy_data(self, src, dst, count, direction, flags):
                 copies.append((count, direction, flags))
+                steps.append('copy')
                 return 0
             def join(self): return 0
-            def wait(self): return 0
+            def wait(self):
+                steps.append('wait')
+                return 0
             def leave(self): return 0
             def destroy(self): return None
         bm = SimpleNamespace(BmConfig=SimpleNamespace,
             BmMemType=SimpleNamespace(HOST=3, LOCAL_DEVICE=0),
-            BmDataOpType=SimpleNamespace(SDMA=1), BmCopyType=SimpleNamespace(L2G=1, G2L=2),
+            BmDataOpType=SimpleNamespace(SDMA=1),
+            BmCopyType=SimpleNamespace(L2G=1, G2L=2, H2G=3, G2H=4),
             initialize=lambda *a: 0, uninitialize=lambda: None,
             create2=lambda **kw: Handle(), __file__='cpu-fake')
         mf = SimpleNamespace(bm=bm, initialize=lambda: 0, uninitialize=lambda: None,
                              set_log_level=lambda level: None, __file__='cpu-fake')
-        torch = SimpleNamespace(uint8='uint8',
-            frombuffer=lambda data, **kw: Buffer(data),
-            full=lambda shape, fill, **kw: Buffer(bytes([fill]) * shape[0]),
+        def frombuffer(data, **kw):
+            devices.append('cpu')
+            return Buffer(data)
+        def full(shape, fill, **kw):
+            devices.append(kw['device'])
+            return Buffer(bytes([fill]) * shape[0])
+        torch = SimpleNamespace(uint8='uint8', frombuffer=frombuffer, full=full,
             npu=SimpleNamespace(set_device=lambda device: None, synchronize=lambda device: None))
         for rank in (0, 1):
-            args = probe.arguments(self.payload_args('--rank', str(rank), '--payload-bytes', str(size)))
+            extra = ['--buffer-kind', 'cpu'] if kind == 'cpu' else []
+            args = probe.arguments(self.payload_args('--rank', str(rank), '--payload-bytes', str(size), *extra))
             report = probe.build_plan(args)
+            events = []
             def wait_event(url, run_id, name, timeout):
-                return dict(media='host', data_op_type='sdma', contract=probe.peer_contract(report),
+                return dict(media='host', data_op_type='sdma', buffer_kind=kind,
+                            contract=probe.peer_contract(report),
                             group_id=0, owner_ptr=8192, target_memory='HOST',
                             completed_bytes=size, equal=True, verified_bytes=size)
             with patch.dict(sys.modules, {'torch': torch, 'torch_npu': SimpleNamespace(),
                                          'memfabric_hybrid': mf}), \
                     patch.object(probe, 'wait_event', wait_event), \
                     patch.object(probe, 'publish', lambda *a: publications.append(a[3])):
-                probe.run(args, report, lambda *a, **kw: None)
+                probe.run(args, report, lambda event, **kw: events.append((event, kw)))
+            copy_name = ('H2G' if rank == 0 else 'G2H') if kind == 'cpu' else (
+                'L2G' if rank == 0 else 'G2L')
+            sdk_steps = [metadata['step'] for event, metadata in events if event == 'SDK_BEGIN']
+            self.assertIn('copy_' + copy_name, sdk_steps)
+            self.assertEqual(sdk_steps[sdk_steps.index('copy_' + copy_name) + 1],
+                             'wait_after_' + copy_name)
             self.assertTrue(report['payload_passed'])
             self.assertTrue(report['local_cleanup_passed'])
             self.assertEqual(report['completed_write_bytes' if rank == 0 else 'completed_read_bytes'], size)
@@ -90,7 +130,10 @@ class ProbeChecks(unittest.TestCase):
                 self.assertEqual(report['verified_bytes'], size)
                 self.assertTrue(report['full_content_equal'])
         self.assertEqual(allocations, [size, size])
-        self.assertEqual(copies, [(size, 1, 0), (size, 2, 0)])
+        self.assertEqual(copies, [(size, 3, 0), (size, 4, 0)] if kind == 'cpu'
+                         else [(size, 1, 0), (size, 2, 0)])
+        self.assertEqual(devices, ['cpu', 'cpu'] if kind == 'cpu' else ['npu:0', 'npu:0'])
+        self.assertEqual(steps, ['copy', 'wait', 'wait', 'copy', 'wait', 'wait'])
         self.assertEqual([p['completed_bytes'] for p in publications if 'completed_bytes' in p], [size])
         self.assertEqual([p['verified_bytes'] for p in publications if 'verified_bytes' in p], [size])
         publications.clear()
