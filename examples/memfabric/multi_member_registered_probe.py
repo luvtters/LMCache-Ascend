@@ -16,7 +16,9 @@ from registered_host_rdma_probe import (POOL_BYTES, checked_end, pattern,
 
 PROTOCOL = 'world3-registered-host-rdma-v1'
 ROLES = {0: 'owner', 1: 'writer', 2: 'reader'}
-PAYLOADS = (64, 1 << 20, 18 << 20)
+# Explicit campaign boundaries only; every allocation/registration/copy/check
+# keeps the exact requested byte count, including odd lengths (no rounding).
+PAYLOADS = (64, 65, 4095, 4096, 4097, 1 << 20, 18 << 20, 64 << 20, 128 << 20)
 
 
 def arguments(argv=None):

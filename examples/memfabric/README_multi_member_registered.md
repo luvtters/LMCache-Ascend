@@ -66,9 +66,26 @@ python examples/memfabric/multi_member_registered_probe.py \
 Without `--allow-npu`, the probe writes `PLAN_ONLY` and never imports torch,
 torch_npu or MemFabric. Output files use exclusive creation; each retry requires
 a fresh run ID, coordination directory, ports and result directory.
-Permitted payloads are exactly 64, 1048576 and 18874368 bytes.
+Permitted payloads are exactly 64, 65, 4095, 4096, 4097, 1048576, 18874368,
+67108864 and 134217728 bytes. This is an explicit finite allowlist, not an
+unbounded capacity option. Odd lengths retain the exact requested bytes;
+neither registration nor copy or full-content expectations are rounded.
 
-The seven CPU checks exercise CLI limits, identical world3 creation contracts,
+Owner offset remains zero, with the requested range checked inside actual
+`local_mem_size(HOST)` and complete CPU-rw mappings before access. Every rank
+still contributes HOST1GiB/HBM0. Writer/reader tensors are exactly `n` uint8
+elements, contiguous, with a positive pointer checked for address overflow;
+the registration and copy lengths are both exactly `n`. Maximum allowed
+128MiB is below the 1GiB pool/allocation boundary and below uint32 range,
+while fixed SDK public copy parameters use uint64 lengths. No offset addition,
+integer narrowing, block-size calculation or tensor element-width conversion
+is introduced by these new sizes. Real hardware acceptance of odd MR/copy
+lengths and the new capacity sizes remains NOT_VERIFIED until a fresh group
+produces complete byte/content, native-return and three-process wait evidence.
+Previous CLI rejections are entrance failures, not capacity or RDMA failures.
+
+The eight CPU checks exercise the finite size/CLI limits and all-rank boundary
+plans, identical world3 creation contracts,
 exclusive PLAN_ONLY output with no native imports, full-content and peer
 identity rejection, all three causal role flows with local bytearrays and real
 localhost HTTP metadata, missing-peer timeout, and explicit peer failure.

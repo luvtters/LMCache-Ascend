@@ -48,7 +48,7 @@ class Checks(unittest.TestCase):
     def test_payload_and_cli_limits(self):
         for n in p.PAYLOADS:
             self.assertEqual(p.arguments(cli() + ['--payload-bytes', str(n)]).payload_bytes, n)
-        for options in (['--payload-bytes', '32'], ['--payload-bytes', str(64 << 20)],
+        for options in (['--payload-bytes', '32'], ['--payload-bytes', str((128 << 20)+1)],
                 ['--world-size', '4'], ['--rank', '3'], ['--device', '8'],
                 ['--timeout', '0'], ['--timeout', 'nan'], ['--timeout', 'inf'],
                 ['--init-timeout', '0'], ['--run-id', 'a/b'],
@@ -56,6 +56,23 @@ class Checks(unittest.TestCase):
                 ['--device-nic', 'tcp://localhost:99999']):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 p.arguments(cli() + options)
+
+    def test_explicit_odd_page_and_capacity_boundary_plans(self):
+        allowed = (64, 65, 4095, 4096, 4097, 1 << 20, 18 << 20, 64 << 20, 128 << 20)
+        self.assertEqual(set(p.PAYLOADS), set(allowed))
+        for n in allowed:
+            for rank in p.ROLES:
+                args = p.arguments(cli(rank) + ['--payload-bytes', str(n)])
+                plan = p.build_plan(args)
+                self.assertEqual(plan['payload_bytes'], n)
+                self.assertEqual(plan['owner_offset'], 0)
+                self.assertLessEqual(plan['owner_offset']+n, plan['create2']['local_dram_size'])
+                self.assertLess(n, 1 << 32)
+                self.assertEqual(plan['copy_types'], dict(write='L2G', read='G2L'))
+                self.assertFalse(plan['local_device_staging'])
+        for n in (0, -1, 66, 4094, 4098, (128 << 20)+1, 1 << 30, 1 << 32, 1 << 64):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                p.arguments(cli() + ['--payload-bytes', str(n)])
 
     def test_event_identity_and_full_content_rejections(self):
         value = dict(protocol=p.PROTOCOL, name='event-A', rank=2)
