@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from direct_coordination import publish, wait_event
 
 PAYLOAD_BYTES = 1 << 20
+MAX_PAYLOAD_BYTES = 64 << 20
 POOL_BYTES = 1 << 30
 # Exact SDK 1.2.1 smem_bm_def.h; allocation variant, not a copy flag.
 DRAM_MAP_HOST_VA_FLAG = 1 << 9
@@ -39,6 +40,8 @@ def arguments(argv=None):
                         help='Explicit SDK address mode; permits RDMA allocator HAL fallback')
     parser.add_argument('--dram-map-host-va', action='store_true',
                         help='Isolated HOST/SDMA allocation diagnostic; default remains flags=0')
+    parser.add_argument('--payload-bytes', type=int, default=PAYLOAD_BYTES,
+                        help='Full compared payload, a positive multiple of 32, at most 64 MiB')
     parser.add_argument('--store-url', required=True)
     parser.add_argument('--coord-url', required=True)
     parser.add_argument('--run-id', required=True)
@@ -47,6 +50,8 @@ def arguments(argv=None):
     parser.add_argument('--init-timeout', type=int, default=300)
     parser.add_argument('--allow-npu', action='store_true')
     args = parser.parse_args(argv)
+    if not 0 < args.payload_bytes <= MAX_PAYLOAD_BYTES or args.payload_bytes % 32:
+        parser.error('payload-bytes must be a positive multiple of 32 and at most 64 MiB')
     if args.dram_map_host_va and (args.media != 'host' or args.data_op_type != 'sdma'):
         parser.error('--dram-map-host-va is only a HOST/SDMA allocation variant')
     if args.device < 0 or args.timeout <= 0 or args.init_timeout <= 0:
@@ -70,7 +75,7 @@ def build_plan(args):
         reader_rank=0 if args.direction=='pull-only' else 1,
         data_op_type=args.data_op_type, device_nic=args.device_nic,
         run_id=args.run_id, store_url=args.store_url,
-        coord_url=args.coord_url, owner_rank=1, payload_bytes=PAYLOAD_BYTES,
+        coord_url=args.coord_url, owner_rank=1, payload_bytes=args.payload_bytes,
         fresh_store_and_process_group_required=True,
         target_memory='DEVICE' if hbm else 'HOST',
         create2=dict(id=0, local_dram_size=POOL_BYTES, max_dram_size=POOL_BYTES,
@@ -156,6 +161,7 @@ def cleanup_steps(steps, emit):
 
 
 def run(args, report, emit):
+    payload_bytes = args.payload_bytes
     # Device and native SDK imports are intentionally behind --allow-npu.
     import torch
     import torch_npu  # noqa: F401
@@ -230,46 +236,46 @@ def run(args, report, emit):
         if peer.get('owner_ptr') != pointer or peer.get('target_memory') != report['target_memory']:
             raise RuntimeError('Ranks disagree on selected owner pool address or memory type')
         if args.rank == report['writer_rank']:
-            host_source = bytearray(pattern_bytes(PAYLOAD_BYTES))
+            host_source = bytearray(pattern_bytes(payload_bytes))
             source = torch.frombuffer(host_source, dtype=torch.uint8).to(f'npu:{args.device}')
             buffers.extend([host_source, source])
             torch.npu.synchronize(args.device)
-            emit('BUFFER_READY', kind='source_npu', ptr=source.data_ptr(), bytes=PAYLOAD_BYTES)
+            emit('BUFFER_READY', kind='source_npu', ptr=source.data_ptr(), bytes=payload_bytes)
             call_step('copy_L2G', lambda: handle.copy_data(source.data_ptr(), pointer,
-                PAYLOAD_BYTES, bm.BmCopyType.L2G, 0), emit,
-                requested_bytes=PAYLOAD_BYTES, src=source.data_ptr(), dst=pointer, flags=0)
+                payload_bytes, bm.BmCopyType.L2G, 0), emit,
+                requested_bytes=payload_bytes, src=source.data_ptr(), dst=pointer, flags=0)
             call_step('wait_after_L2G', handle.wait, emit)
-            report['completed_write_bytes'] = PAYLOAD_BYTES
-            emit('COPY_COMPLETED', direction='L2G', completed_bytes=PAYLOAD_BYTES)
-            marker('stored', completed_bytes=PAYLOAD_BYTES)
+            report['completed_write_bytes'] = payload_bytes
+            emit('COPY_COMPLETED', direction='L2G', completed_bytes=payload_bytes)
+            marker('stored', completed_bytes=payload_bytes)
             verified = wait('verified')
-            if verified.get('equal') is not True or verified.get('verified_bytes') != PAYLOAD_BYTES:
+            if verified.get('equal') is not True or verified.get('verified_bytes') != payload_bytes:
                 raise AssertionError('Reader did not verify the complete payload')
             report['peer_full_content_equal'] = True
             marker('source-ack')
         else:
-            restored = torch.full((PAYLOAD_BYTES,), 165, dtype=torch.uint8,
+            restored = torch.full((payload_bytes,), 165, dtype=torch.uint8,
                                   device=f'npu:{args.device}')
             buffers.append(restored)
             torch.npu.synchronize(args.device)
             stored = wait('stored')
-            if stored.get('completed_bytes') != PAYLOAD_BYTES:
+            if stored.get('completed_bytes') != payload_bytes:
                 raise AssertionError('Source did not complete the expected byte count')
             call_step('copy_G2L', lambda: handle.copy_data(pointer, restored.data_ptr(),
-                PAYLOAD_BYTES, bm.BmCopyType.G2L, 0), emit,
-                requested_bytes=PAYLOAD_BYTES, src=pointer, dst=restored.data_ptr(), flags=0)
+                payload_bytes, bm.BmCopyType.G2L, 0), emit,
+                requested_bytes=payload_bytes, src=pointer, dst=restored.data_ptr(), flags=0)
             call_step('wait_after_G2L', handle.wait, emit)
             torch.npu.synchronize(args.device)
-            report['completed_read_bytes'] = PAYLOAD_BYTES
+            report['completed_read_bytes'] = payload_bytes
             observed = restored.cpu().numpy().tobytes()
-            expected = pattern_bytes(PAYLOAD_BYTES)  # Generated here; never received from rank 0.
+            expected = pattern_bytes(payload_bytes)  # Generated here; never received from rank 0.
             equal = observed == expected
             mismatch = 0 if equal else sum(a != b for a, b in zip(observed, expected))
             report.update(full_content_equal=equal, verified_bytes=len(observed), mismatch_bytes=mismatch)
             emit('CONTENT_CHECK', equal=equal, verified_bytes=len(observed), mismatch_bytes=mismatch)
-            if not equal or len(observed) != PAYLOAD_BYTES:
+            if not equal or len(observed) != payload_bytes:
                 raise AssertionError('Restored owner buffer differs from independent expected bytes')
-            marker('verified', equal=True, verified_bytes=PAYLOAD_BYTES)
+            marker('verified', equal=True, verified_bytes=payload_bytes)
             wait('source-ack')
         report['payload_passed'] = True
         marker('cleanup-ready-' + str(args.rank))
@@ -325,7 +331,7 @@ def main(argv=None):
         report.update(status='RUNNING', payload_passed=False,
                       completed_write_bytes=0, completed_read_bytes=0)
         args.output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding='utf-8')
-        emit('PROBE_BEGIN', requested=report['create2'], payload_bytes=PAYLOAD_BYTES)
+        emit('PROBE_BEGIN', requested=report['create2'], payload_bytes=args.payload_bytes)
         try:
             run(args, report, emit)
             report['status'] = 'PAYLOAD_AND_LOCAL_CLEANUP_PASSED_EXTERNAL_WAIT_REQUIRED'

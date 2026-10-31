@@ -7,11 +7,105 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import bm_media_probe as probe
 
 
 class ProbeChecks(unittest.TestCase):
+    def payload_args(self, *extra):
+        return ['--rank', '0', '--device', '0', '--media', 'host',
+                '--store-url', 'tcp://127.0.0.1:28801',
+                '--coord-url', 'http://127.0.0.1:29601',
+                '--run-id', 'cpu-payload', '--output', 'unused.json', *extra]
+
+    def test_payload_size_validation_and_default(self):
+        self.assertEqual(probe.arguments(self.payload_args()).payload_bytes, 1 << 20)
+        for size in (32, 64, 4096, 1 << 20, 18 << 20, 64 << 20):
+            with self.subTest(size=size):
+                args = probe.arguments(self.payload_args('--payload-bytes', str(size)))
+                self.assertEqual(probe.build_plan(args)['payload_bytes'], size)
+        for size in ('0', '-32', '1', '63', str((64 << 20) + 32), '1.5'):
+            with self.subTest(size=size), self.assertRaises(SystemExit):
+                probe.arguments(self.payload_args('--payload-bytes', size))
+
+    def test_small_payload_contract_rejects_different_size(self):
+        plans = [probe.build_plan(probe.arguments(self.payload_args(
+            '--rank', str(rank), '--payload-bytes', '64'))) for rank in (0, 1)]
+        probe.check_peer_contract(probe.peer_contract(plans[0]), probe.peer_contract(plans[1]))
+        wrong = dict(probe.peer_contract(plans[1]), payload_bytes=4096)
+        with self.assertRaises(ValueError):
+            probe.check_peer_contract(probe.peer_contract(plans[0]), wrong)
+
+    def test_small_payload_drives_both_runtime_allocations_copies_and_counts(self):
+        # Fake only unavailable device/SDK boundaries; execute the real run path.
+        size = 64
+        allocations, copies, publications = [], [], []
+        class Buffer:
+            def __init__(self, data):
+                self.data = bytes(data)
+                allocations.append(len(self.data))
+            def to(self, device): return self
+            def data_ptr(self): return 4096
+            def cpu(self): return self
+            def numpy(self): return self
+            def tobytes(self): return probe.pattern_bytes(len(self.data))
+        class Handle:
+            def peer_rank_ptr(self, *args): return 8192
+            def gva_to_va(self, *args): return 16384
+            def copy_data(self, src, dst, count, direction, flags):
+                copies.append((count, direction, flags))
+                return 0
+            def join(self): return 0
+            def wait(self): return 0
+            def leave(self): return 0
+            def destroy(self): return None
+        bm = SimpleNamespace(BmConfig=SimpleNamespace,
+            BmMemType=SimpleNamespace(HOST=3, LOCAL_DEVICE=0),
+            BmDataOpType=SimpleNamespace(SDMA=1), BmCopyType=SimpleNamespace(L2G=1, G2L=2),
+            initialize=lambda *a: 0, uninitialize=lambda: None,
+            create2=lambda **kw: Handle(), __file__='cpu-fake')
+        mf = SimpleNamespace(bm=bm, initialize=lambda: 0, uninitialize=lambda: None,
+                             set_log_level=lambda level: None, __file__='cpu-fake')
+        torch = SimpleNamespace(uint8='uint8',
+            frombuffer=lambda data, **kw: Buffer(data),
+            full=lambda shape, fill, **kw: Buffer(bytes([fill]) * shape[0]),
+            npu=SimpleNamespace(set_device=lambda device: None, synchronize=lambda device: None))
+        for rank in (0, 1):
+            args = probe.arguments(self.payload_args('--rank', str(rank), '--payload-bytes', str(size)))
+            report = probe.build_plan(args)
+            def wait_event(url, run_id, name, timeout):
+                return dict(media='host', data_op_type='sdma', contract=probe.peer_contract(report),
+                            group_id=0, owner_ptr=8192, target_memory='HOST',
+                            completed_bytes=size, equal=True, verified_bytes=size)
+            with patch.dict(sys.modules, {'torch': torch, 'torch_npu': SimpleNamespace(),
+                                         'memfabric_hybrid': mf}), \
+                    patch.object(probe, 'wait_event', wait_event), \
+                    patch.object(probe, 'publish', lambda *a: publications.append(a[3])):
+                probe.run(args, report, lambda *a, **kw: None)
+            self.assertTrue(report['payload_passed'])
+            self.assertTrue(report['local_cleanup_passed'])
+            self.assertEqual(report['completed_write_bytes' if rank == 0 else 'completed_read_bytes'], size)
+            if rank == 1:
+                self.assertEqual(report['verified_bytes'], size)
+                self.assertTrue(report['full_content_equal'])
+        self.assertEqual(allocations, [size, size])
+        self.assertEqual(copies, [(size, 1, 0), (size, 2, 0)])
+        self.assertEqual([p['completed_bytes'] for p in publications if 'completed_bytes' in p], [size])
+        self.assertEqual([p['verified_bytes'] for p in publications if 'verified_bytes' in p], [size])
+        publications.clear()
+        with patch.dict(sys.modules, {'torch': torch, 'torch_npu': SimpleNamespace(),
+                                     'memfabric_hybrid': mf}), \
+                patch.object(probe, 'wait_event', wait_event), \
+                patch.object(probe, 'publish', lambda *a: publications.append(a[3])), \
+                patch.object(Buffer, 'tobytes', lambda self: probe.pattern_bytes(size - 1) + b'\x00'):
+            corrupted = probe.build_plan(args)
+            with self.assertRaisesRegex(AssertionError, 'Restored owner buffer'):
+                probe.run(args, corrupted, lambda *a, **kw: None)
+        self.assertFalse(corrupted['full_content_equal'])
+        self.assertEqual(corrupted['mismatch_bytes'], 1)
+        self.assertFalse(any('verified_bytes' in p for p in publications))
+
     def test_dram_mapping_variant_is_explicit_and_in_peer_contract(self):
         common=['--rank','0','--device','0','--media','host',
             '--store-url','tcp://127.0.0.1:28801','--coord-url','http://127.0.0.1:29601',
