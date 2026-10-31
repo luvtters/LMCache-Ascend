@@ -329,8 +329,13 @@ class BMSession:
     def wait(self):
         self._check_thread()
         if getattr(self, "_completion_unknown", False):
-            # DEVICE_RDMA handle.wait() is a no-op, not recovery evidence.
+            # No SDK wait is recovery evidence for an uncertain RDMA copy.
             raise RuntimeError("BM RDMA completion unknown; resources retained until process exit")
+        if getattr(self, "data_op_type", "SDMA") == "DEVICE_RDMA":
+            # Every public copy here is flags=0 and checked synchronously.
+            # SDK HostComposeDataOp::Wait only supports SDMA async work and
+            # fails for pure DEVICE_RDMA. Do not call it or claim it drained DMA.
+            return
         if self.handle is not None:
             self.check(self.handle.wait(), "BM wait")
 

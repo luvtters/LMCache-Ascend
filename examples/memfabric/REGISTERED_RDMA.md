@@ -60,8 +60,10 @@ NPU copy outside retained registered ranges. Scratch is private to the worker;
 callers must not resize or replace its storage while registered.
 
 Copies remain synchronous `copy_data(..., flags=0)`. Successful return is the
-API completion basis; `handle.wait()` is a no-op for DEVICE_RDMA and is never
-independent completion evidence. Native copy or registration failure retains
+API completion basis. The bottom-level RDMA Wait is a no-op, but the SDK's
+public compose Wait supports SDMA only and can fail for pure DEVICE_RDMA.
+This follow-up skips that unsupported wait only after synchronous success;
+it never counts as independent completion evidence. Native copy or registration failure retains
 the session and tensors until process exit, and close raises without unregister,
 leave or destroy. It does not recycle possibly active storage or release the
 associated direct write/read protection as if completion were known.

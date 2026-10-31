@@ -151,7 +151,7 @@ gate, native registration on service arenas, NPU/RDMA transport, inference and
 performance remain NOT_VERIFIED by this local development task.
 
 Local results: 9 new L2 contracts, 5 two-rank HTTP startup contracts,
-10 existing RDMA contracts and 4 default BM contracts pass (28 total);
+11 RDMA contracts and 4 default BM contracts pass (29 total);
 changed Python files also compile and `git diff
 --check` passes. No SSH, device initialization, installation or pushing was
 performed by this development task.
@@ -160,3 +160,13 @@ The same BMSession constructor fields can be explicitly configured in a worker
 `lmcache.mp.direct` and its direct-service module config in this follow-up branch.
 That reuse does not modify the frozen `a9d30974` worker candidate or establish
 that candidate's prior startup safety or new device results.
+
+Public native `handle.wait()` also differs from the bottom-level RDMA operator:
+`MemEntityDefault::Wait:889` dispatches through `HostComposeDataOp::Wait:229`,
+which supports SDMA asynchronous work and returns BM_ERROR when its SDMA
+operator is absent. `DataOpDeviceRDMA::Wait:522` itself is a no-op, but that is
+not the public compose path. This follow-up therefore skips the unsupported
+native wait only for pure DEVICE_RDMA after all wrapper copies succeeded
+synchronously with flags=0. Unknown registration/copy/teardown state still
+raises before that branch and retains allocations. SDMA retains native wait.
+No skipped wait is labeled as independent completion or recovery evidence.

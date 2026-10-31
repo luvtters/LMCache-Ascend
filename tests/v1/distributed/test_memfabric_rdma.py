@@ -123,7 +123,7 @@ class RdmaContracts(unittest.TestCase):
         self.assertIs(session_ref()._registered_tensors[1024][0], scratch_ref())
 
     def test_each_native_teardown_exception_retains_registered_allocations(self):
-        for stage in ("wait", "unregister", "leave", "destroy", "bm_uninitialize", "mf_uninitialize"):
+        for stage in ("unregister", "leave", "destroy", "bm_uninitialize", "mf_uninitialize"):
             with self.subTest(stage=stage):
                 module, session, handle, bm = self.make_session()
                 scratch = tensor()
@@ -138,6 +138,18 @@ class RdmaContracts(unittest.TestCase):
                 self.assertIs(session._registered_tensors[1024][0], scratch)
                 self.assertFalse(session.closed)
                 self.assertTrue(module.BMSession._active)
+
+    def test_successful_sync_rdma_close_does_not_call_sdma_only_native_wait(self):
+        module, session, handle, bm = self.make_session()
+        scratch = tensor()
+        session.register_npu_tensor(scratch)
+        session.copy_npu_to_global(1024, 4096, 32)
+        handle.wait.side_effect = RuntimeError("SDMA data operator not exist")
+        session.wait()
+        session.close()
+        handle.wait.assert_not_called()
+        handle.unregister.assert_called_once_with(1024)
+        self.assertTrue(session.closed)
 
     def test_unvalidated_cpu_and_invalid_tensor_registration_fail_explicitly(self):
         module, session, handle, bm = self.make_session()
