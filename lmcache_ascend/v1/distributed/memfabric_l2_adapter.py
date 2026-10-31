@@ -35,10 +35,12 @@ class _Entry:
 class MemFabricL2Adapter(L2AdapterInterface):
     def __init__(self, params, l1_memory_desc=None):
         allowed = {"device_id", "world_size", "pool_gb", "storage_rank",
-                   "slot_size_mb", "store_url"}
+                   "slot_size_mb", "store_url", "data_op_type", "device_nic", "enable_56bits_gva"}
         if set(params) - allowed:
             raise ValueError(f"Unknown MemFabric options: {set(params) - allowed}")
         device = params.get("device_id", 0)
+        self._data_op_type = params.get("data_op_type", "SDMA")
+        self._enable_56bits_gva = params.get("enable_56bits_gva", False)
         world = params.get("world_size", 1)
         pool_gb = params.get("pool_gb", 1)
         self.storage_rank = params.get("storage_rank", world - 1)
@@ -69,9 +71,11 @@ class MemFabricL2Adapter(L2AdapterInterface):
         self._events = {kind: create_event_notifier() for kind in self._tasks}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mf-bm")
         try:
+            optional = {name: params[name] for name in (
+                "data_op_type", "device_nic", "enable_56bits_gva") if name in params}
             self._session = self._executor.submit(
                 BMSession, device_id=device, rank_id=0, world_size=world,
-                pool_gb=pool_gb, store_url=params.get("store_url", "tcp://127.0.0.1:28580")
+                pool_gb=pool_gb, store_url=params.get("store_url", "tcp://127.0.0.1:28580"), **optional
             ).result()
             self._base = self._executor.submit(
                 self._session.peer_address, self.storage_rank
@@ -83,8 +87,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
             for event in self._events.values():
                 event.close()
             raise
-        logger.info("MEMFABRIC_READY protocol=SDMA storage_rank=%d capacity=%d slot=%d",
-                    self.storage_rank, capacity, self._slot_size)
+        logger.info("MEMFABRIC_READY protocol=%s storage_rank=%d capacity=%d slot=%d",
+                    self._data_op_type, self.storage_rank, capacity, self._slot_size)
 
     def get_store_event_fd(self):
         return self._events["store"].fileno()
@@ -182,6 +186,16 @@ class MemFabricL2Adapter(L2AdapterInterface):
         return self._free.pop()
 
     def _copy(self, obj, address, size, *, store):
+        if self._data_op_type == "DEVICE_RDMA":
+            try:
+                logger.info("MEMFABRIC_CPU_REGISTER pointer=%#x modulo4096=%d bytes=%d direction=%s",
+                            obj.data_ptr, obj.data_ptr % 4096, size, "H2G" if store else "G2H")
+                self._session.copy_cpu_object(obj, address, size, store=store)
+            except BaseException as exc:
+                self._poisoned = True
+                self._last_error = str(exc)
+                raise
+            return
         # Keep an additional allocator reference on error: a timeout alone does
         # not establish that device access has stopped. close() drains BM first.
         obj.ref_count_up()
@@ -221,6 +235,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
             except Exception as exc:
                 self._last_error = str(exc)
                 logger.exception("MemFabric store failed")
+                if self._data_op_type == "DEVICE_RDMA":
+                    raise
                 return L2StoreResult(False, total)
 
     def _lookup(self, keys, layouts):
@@ -228,6 +244,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
         with self._state_lock:
             self._observe_peer_departure()
             if self._poisoned:
+                if self._data_op_type == "DEVICE_RDMA":
+                    raise RuntimeError(self._last_error or "BM RDMA is unavailable")
                 return found
             for i, key in enumerate(keys):
                 entry = self._entries.get(key)
@@ -249,6 +267,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
         total = 0
         with self._state_lock:
             self._observe_peer_departure()
+            if self._poisoned and self._data_op_type == "DEVICE_RDMA":
+                raise RuntimeError(self._last_error or "BM RDMA is unavailable")
             for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
                 if self._poisoned:
                     break
@@ -268,6 +288,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
                 except Exception as exc:
                     self._last_error = str(exc)
                     logger.exception("MemFabric load failed")
+                    if self._data_op_type == "DEVICE_RDMA":
+                        raise
             logger.info("MEMFABRIC_LOAD keys=%d bytes=%d rank=%d",
                         len(keys), total, self.storage_rank)
         return found
@@ -306,7 +328,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
         with self._state_lock:
             self._observe_peer_departure()
             return {"is_healthy": not self._closed and not self._poisoned,
-                    "protocol": "SDMA", "storage_rank": self.storage_rank,
+                    "protocol": self._data_op_type, "enable_56bits_gva": self._enable_56bits_gva,
+                    "pool_memory_type": "host", "storage_rank": self.storage_rank,
                     "objects": len(self._entries), "free_slots": len(self._free),
                     "locked_objects": sum(e.pins > 0 for e in self._entries.values()),
                     "total_pins": sum(e.pins for e in self._entries.values()),
@@ -328,7 +351,14 @@ class MemFabricL2Adapter(L2AdapterInterface):
             self._closed = True
             drained = self._executor.submit(self._close_bm)
         # No timeout/cancel: all queued transfers must finish before unmapping.
-        drained.result()
+        try:
+            drained.result()
+        except BaseException as exc:
+            if self._data_op_type == "DEVICE_RDMA":
+                self._closed = False
+                self._poisoned = True
+                self._last_error = str(exc)
+            raise
         self._executor.shutdown(wait=True)
         for event in self._events.values():
             event.close()

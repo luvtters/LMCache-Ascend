@@ -53,6 +53,7 @@ class BMSession:
         self.device_id = device_id
         self.data_op_type = data_op_type
         self._registered_tensors = {}
+        self._registered_cpu_objects = {}
         self._unregistered_pointers = set()
         self._completion_unknown = False
         self.pool_memory_type = pool_memory_type
@@ -152,6 +153,40 @@ class BMSession:
             raise RuntimeError("External CPU MemoryObj RDMA path is not validated")
         self._copy(src, dst, size, self.bm.BmCopyType.H2G if store
                    else self.bm.BmCopyType.G2H)
+
+    def copy_cpu_object(self, obj, address, size, *, store):
+        """Register exactly one CPU MemoryObj while holding its allocator lease."""
+        self._check_thread()
+        if self.data_op_type != "DEVICE_RDMA":
+            raise ValueError("Registered CPU MemoryObj copies require DEVICE_RDMA")
+        if self.closed or self._completion_unknown:
+            raise RuntimeError("BM session is closed or completion is unknown")
+        raw = obj.raw_tensor
+        pointer = obj.data_ptr
+        if (raw is None or raw.device.type != "cpu" or not raw.is_contiguous()
+                or pointer != raw.data_ptr() or size != obj.get_size() or size <= 0
+                or size > raw.numel() * raw.element_size()):
+            raise ValueError("RDMA requires the exact contiguous CPU MemoryObj range")
+        if pointer <= 0 or pointer % 4096:
+            raise ValueError(f"RDMA CPU MemoryObj requires 4096-byte address alignment: "
+                             f"pointer={pointer:#x} modulo4096={pointer % 4096} bytes={size}")
+        if pointer in self._registered_cpu_objects:
+            raise RuntimeError("CPU MemoryObj is already registered")
+        obj.ref_count_up()
+        # A Tensor reference alone does not stop LMCache recycling this slice.
+        self._registered_cpu_objects[pointer] = (obj, raw, size)
+        try:
+            self.check(self.handle.register(pointer, size),
+                       f"BM register CPU MemoryObj bytes={size} modulo4096={pointer % 4096}")
+            src, dst = (pointer, address) if store else (address, pointer)
+            self._copy(src, dst, size, self.bm.BmCopyType.H2G if store else self.bm.BmCopyType.G2H)
+            self.check(self.handle.unregister(pointer), "BM unregister CPU MemoryObj")
+        except BaseException:
+            self._retain_unknown_completion()
+            raise
+        # Only successful synchronous copy AND unregister permit allocator reuse.
+        obj.ref_count_down()
+        del self._registered_cpu_objects[pointer]
 
     def copy_npu_to_global(self, src, dst, size):
         """Synchronously copy an actual local NPU pointer into a BM GVA."""
@@ -253,6 +288,7 @@ class BMSession:
                 self._retain_unknown_completion()
             raise
         self._registered_tensors.clear()
+        self._registered_cpu_objects.clear()
         self.closed = True
         with self._guard:
             BMSession._active = False
