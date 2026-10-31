@@ -9,16 +9,39 @@ import unittest
 
 
 class Checks(unittest.TestCase):
+    def test_sync_sampling_counts_and_failure_truncation(self):
+        import registered_host_rdma_probe as p
+        calls = []
+        def copy():
+            calls.append(1)
+            return 0
+        result = p.sample_sync_copy(copy, 3, 30, 64)
+        self.assertEqual(len(calls), 33)
+        self.assertEqual(len(result['warmup_samples']), 3)
+        self.assertEqual(len(result['samples']), 30)
+        self.assertEqual(result['completed_bytes'], 33*64)
+        self.assertTrue(result['passed'])
+        returns = iter([0, 0, -2, 0])
+        result = p.sample_sync_copy(lambda: next(returns), 1, 30, 64)
+        self.assertFalse(result['passed'])
+        self.assertEqual(len(result['samples']), 2)
+        self.assertEqual(result['completed_bytes'], 128)
+        self.assertEqual(result['samples'][-1]['raw_return'], -2)
+        self.assertTrue(all(item['elapsed_ns'] >= 0 for item in result['samples']))
+
     def test_registered_torch_request_and_plan(self):
         import registered_host_rdma_probe as p
         base = ['--rank', '0', '--device', '0', '--store-url', 'tcp://127.0.0.1:19001',
             '--coord-url', 'http://127.0.0.1:19002', '--run-id', 'cpu', '--output', 'unused.json']
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             p.arguments(base + ['--local-endpoint', 'torch-registered'])
-        a = p.arguments(base + ['--local-endpoint', 'torch-registered', '--copy-interface', 'l2g-g2l'])
+        a = p.arguments(base + ['--local-endpoint', 'torch-registered', '--copy-interface', 'l2g-g2l',
+                                '--benchmark-iterations', '30', '--benchmark-warmup', '3'])
         plan = p.build_plan(a)
         self.assertEqual(plan['create2']['local_hbm_size'], 0)
         self.assertFalse(plan['local_device_staging'])
+        self.assertEqual(plan['benchmark_iterations'], 30)
+        self.assertEqual(plan['benchmark_warmup'], 3)
         self.assertEqual(p.copy_request('l2g-g2l', 'write', 100, 200, 300, 400, 64), (300, 200, 'L2G'))
         self.assertEqual(p.copy_request('l2g-g2l', 'read', 100, 200, 300, 400, 64), (200, 400, 'G2L'))
 

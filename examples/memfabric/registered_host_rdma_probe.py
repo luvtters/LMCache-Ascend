@@ -37,11 +37,18 @@ def arguments(argv=None):
     p.add_argument('--timeout', type=float, default=120)
     p.add_argument('--init-timeout', type=int, default=120)
     p.add_argument('--allow-npu', action='store_true')
+    p.add_argument('--benchmark-iterations', type=int, default=0,
+                   help='Explicit torch-registered synchronous copy sampling; 0 preserves functional-only behavior')
+    p.add_argument('--benchmark-warmup', type=int, default=3)
     a = p.parse_args(argv)
     if a.local_endpoint == 'device' and a.copy_interface != 'g2g':
         p.error('device local endpoint requires explicit --copy-interface g2g')
     if (a.local_endpoint == 'torch-registered') != (a.copy_interface == 'l2g-g2l'):
         p.error('torch-registered local endpoint requires --copy-interface l2g-g2l and vice versa')
+    if not 0 <= a.benchmark_iterations <= 10000 or not 0 <= a.benchmark_warmup <= 1000:
+        p.error('benchmark iterations must be 0..10000 and warmup 0..1000')
+    if a.benchmark_iterations and a.local_endpoint != 'torch-registered':
+        p.error('benchmark requires --local-endpoint torch-registered')
     if not 0 < a.payload_bytes <= MAX_PAYLOAD or a.payload_bytes % 32:
         p.error('payload-bytes must be a positive multiple of 32, at most 64 MiB')
     if a.device < 0 or a.timeout <= 0 or a.init_timeout <= 0:
@@ -64,6 +71,7 @@ def build_plan(a):
         run_id=a.run_id, store_url=a.store_url, coord_url=a.coord_url,
         payload_bytes=a.payload_bytes, source_offset=0, restore_offset=2*a.payload_bytes,
         copy_interface=a.copy_interface, local_endpoint=a.local_endpoint,
+        benchmark_iterations=a.benchmark_iterations, benchmark_warmup=a.benchmark_warmup,
         local_device_staging=a.local_endpoint == 'device',
         data_op_type='DEVICE_RDMA', device_nic=a.device_nic,
         swap_space_size='0', fallback_allowed=False, payload_via_rpc=False,
@@ -91,6 +99,26 @@ def copy_request(interface, direction, own_gva, remote, hva, restore_hva, size):
                 (remote, restore_hva, 'G2L'))
     return ((hva, remote, 'H2G') if direction == 'write' else
             (remote, restore_hva, 'G2H'))
+
+
+def sample_sync_copy(operation, warmup, iterations, size):
+    result = dict(warmup_samples=[], samples=[], completed_bytes=0,
+                  passed=True, timing='perf_counter_ns around synchronous copy_data API only')
+    for index in range(warmup + iterations):
+        started = time.perf_counter_ns()
+        try:
+            raw_return = operation()
+            elapsed = time.perf_counter_ns() - started
+            item = dict(index=index, raw_return=raw_return, elapsed_ns=elapsed)
+        except BaseException:
+            elapsed = time.perf_counter_ns() - started
+            item = dict(index=index, raw_return=None, elapsed_ns=elapsed, error=traceback.format_exc())
+        result['warmup_samples' if index < warmup else 'samples'].append(item)
+        if item['raw_return'] != 0:
+            result['passed'] = False
+            break
+        result['completed_bytes'] += size
+    return result
 
 
 def pattern(size, label):
@@ -179,7 +207,8 @@ def run(a, report, emit):
     retained_tensors = []  # Keep real NPU allocations alive until all SDK teardown is done.
     registered_tensors = []
     contract = {k: report[k] for k in ('world_size', 'store_url', 'payload_bytes',
-        'device_nic', 'create2', 'source_offset', 'restore_offset', 'swap_space_size', 'copy_interface', 'local_endpoint')}
+        'device_nic', 'create2', 'source_offset', 'restore_offset', 'swap_space_size', 'copy_interface', 'local_endpoint',
+        'benchmark_iterations', 'benchmark_warmup')}
 
     def mark(name, **data):
         publish(a.coord_url, a.run_id, name, dict(name=name, rank=a.rank,
@@ -199,6 +228,31 @@ def run(a, report, emit):
 
     def verify(address, label, step):
         record_content(verify_local(address, n, label), step)
+
+    def remote_copy(src, dst, copy_type, step, direction, sample=False):
+        native_copy, native_type = handle.copy_data, getattr(bm.BmCopyType, copy_type)
+        operation = lambda: native_copy(src, dst, n, native_type, 0)
+        counter = 'completed_' + direction + '_bytes'
+        if sample and a.benchmark_iterations:
+            emit('COPY_SAMPLING_BEGIN', step=step, requested_bytes=n,
+                 iterations=a.benchmark_iterations, warmup=a.benchmark_warmup)
+            # Public SDK log levels: 0 debug, 1 info, 2 warn, 3 error.
+            # Suppress routine per-copy native printing while retaining warnings/errors.
+            call_step('sampling.log_level_warn', lambda: mf.set_log_level(2), emit, checked=False)
+            try:
+                result = sample_sync_copy(operation, a.benchmark_warmup, a.benchmark_iterations, n)
+            finally:
+                call_step('sampling.restore_log_level_debug', lambda: mf.set_log_level(0), emit, checked=False)
+            result['native_log_level_during_samples'] = '2-warn; debug restored outside timing loop'
+            report.setdefault('copy_samples', {})[direction] = result
+            report[counter] += result['completed_bytes']
+            emit('COPY_SAMPLING_END', step=step, passed=result['passed'], completed_bytes=result['completed_bytes'])
+            if not result['passed']:
+                raise RuntimeError('synchronous copy sampling failed: ' + step)
+        else:
+            call_step(step, operation, emit, requested_bytes=n, src=src, dst=dst,
+                      flags=0, copy_interface=a.copy_interface)
+            report[counter] += n
 
     try:
         mark('config-ready-' + str(a.rank), contract=contract)
@@ -268,8 +322,12 @@ def run(a, report, emit):
                     raise ValueError('real NPU source/restore allocations overlap')
                 for tensor in (source_tensor, restored_tensor):
                     pointer = tensor.data_ptr()
+                    registered_started = time.perf_counter_ns()
                     call_step('REGISTER_TORCH_NPU', lambda pointer=pointer: handle.register(pointer, n),
                               emit, pointer=pointer, requested_bytes=n)
+                    report.setdefault('registration_timings', []).append(dict(pointer=pointer,
+                        elapsed_ns=time.perf_counter_ns()-registered_started,
+                        timing='registration wrapper including event logging; separate from copy samples'))
                     registered_tensors.append(pointer)
                 report['registered_torch_pointers'] = list(registered_tensors)
 
@@ -293,9 +351,7 @@ def run(a, report, emit):
             source_pointer = source_tensor.data_ptr() if a.local_endpoint == 'torch-registered' else hva
             restore_pointer = restored_tensor.data_ptr() if a.local_endpoint == 'torch-registered' else restore
             src, dst, copy_type = copy_request(a.copy_interface, 'write', copy_gva, remote, source_pointer, restore_pointer, n)
-            call_step(copy_type + '_WRITE_A', lambda: handle.copy_data(src, dst, n, getattr(bm.BmCopyType, copy_type), 0),
-                      emit, requested_bytes=n, src=src, dst=dst, flags=0, copy_interface=a.copy_interface)
-            report['completed_write_bytes'] = n
+            remote_copy(src, dst, copy_type, copy_type + '_WRITE_A', 'write', sample=True)
             mark('push-complete', completed_bytes=n)
             owner = wait('owner-verified-A')
             if owner.get('verified_bytes') != n or owner.get('equal') is not True:
@@ -320,9 +376,7 @@ def run(a, report, emit):
                         if a.local_endpoint == 'device':
                             stage_to_pool(restored_tensor, copy_gva+2*n, 'LOCAL_D2D_RESET_RESTORE')
                 src, dst, copy_type = copy_request(a.copy_interface, 'read', copy_gva, remote, source_pointer, restore_pointer, n)
-                call_step(copy_type + '_READ_' + label, lambda: handle.copy_data(src, dst, n, getattr(bm.BmCopyType, copy_type), 0),
-                          emit, requested_bytes=n, src=src, dst=dst, flags=0, copy_interface=a.copy_interface)
-                report['completed_read_bytes'] += n
+                remote_copy(src, dst, copy_type, copy_type + '_READ_' + label, 'read', sample=label == 'A')
                 if restored_tensor is None:
                     verify(restore, label, 'reader_' + label)
                 else:

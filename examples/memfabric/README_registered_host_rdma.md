@@ -185,3 +185,29 @@ ACL call outside the SDK has no demonstrated corrective basis. The crash does
 not prove a general prohibition on HAL-mapped HBM pointers or remote RDMA
 failure. The torch-registered route removes that unverified local staging
 requirement and still needs separate real-device completion/cleanup evidence.
+
+## Optional synchronous API sampling
+
+On both ranks add `--benchmark-iterations 30 --benchmark-warmup 3` with
+`--local-endpoint torch-registered --copy-interface l2g-g2l`. Default iterations
+zero preserves functional-only execution. Register once; rank 0 first performs
+3 warmup plus 30 measured writes of A, then owner fully checks the final A.
+After source overwrite, 3 warmup plus 30 measured reads of stable owner A run,
+followed by full NPU restore content verification and the original independent
+owner-B write/read/full-content challenge. All original failure/cleanup gates
+and external process waits remain required.
+
+`copy_samples.write/read` retain every warmup/sample raw return and elapsed
+`perf_counter_ns`, successful completed bytes and failure truncation. The loop
+contains no coordination, content comparison or Python event printing. Public
+SDK log level is temporarily warn during samples, then restored to debug
+outside the loop; native warnings/errors remain visible. Routine debug log
+printing would otherwise dominate API timings. Registration wrapper elapsed
+times are separate and include event logging; they are not copy latency.
+
+Cross-host counters include successful warmup and measured copies plus the
+extra B read; at 3/30 expect write `33*n`, read `34*n`. Coordination marker
+bytes still describe the final single payload verified by owner. Preserve raw
+per-call samples; compare only paired same-host/cross-host groups at equal
+size and conditions. These are synchronous primitive API timings, not model
+TTFT, throughput, or production-adapter results.
