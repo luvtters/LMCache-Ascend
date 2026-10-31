@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU control contracts only; fake native SDK does not establish RDMA reachability."""
 from types import SimpleNamespace
+import gc
 import unittest
 from unittest.mock import MagicMock, patch
+import weakref
 
 from test_memfabric_direct_hbm import load_bm
 from test_memfabric_direct import DIRECT, Client, Session, Transfer
 from test_memfabric_direct_server import FakeSession, load_server
 
 
+class FakeTensor(SimpleNamespace):
+    pass
+
+
 def tensor(pointer=1024, size=32):
-    return SimpleNamespace(device=SimpleNamespace(type="npu", index=0),
+    return FakeTensor(device=SimpleNamespace(type="npu", index=0),
         data_ptr=lambda: pointer, numel=lambda: size, element_size=lambda: 1,
         is_contiguous=lambda: True)
 
@@ -93,6 +99,44 @@ class RdmaContracts(unittest.TestCase):
             with self.subTest(supplied=supplied), self.assertRaises(ValueError):
                 module.BMSession(device_id=0, rank_id=0, world_size=2,
                     pool_gb=1, store_url="cpu-only", **supplied)
+
+    def test_unregister_failure_retains_session_and_tensor_after_caller_drops_them(self):
+        module, session, handle, bm = self.make_session()
+        scratch = tensor()
+        session.register_npu_tensor(scratch)
+        session_ref, scratch_ref = weakref.ref(session), weakref.ref(scratch)
+        handle.unregister.return_value = 8
+        with self.assertRaisesRegex(RuntimeError, "unregister NPU tensor failed: 8"):
+            session.close()
+        self.assertFalse(session.closed)
+        self.assertTrue(module.BMSession._active)
+        handle.leave.assert_not_called()
+        handle.destroy.assert_not_called()
+        # Remove mock-held callback references as well as caller references.
+        handle.reset_mock()
+        del session, scratch
+        gc.collect()
+        self.assertIsNotNone(session_ref())
+        self.assertIsNotNone(scratch_ref())
+        self.assertIs(module.BMSession._uncertain_sessions[0], session_ref())
+        self.assertIs(session_ref()._registered_tensors[1024][0], scratch_ref())
+
+    def test_each_native_teardown_exception_retains_registered_allocations(self):
+        for stage in ("wait", "unregister", "leave", "destroy", "bm_uninitialize", "mf_uninitialize"):
+            with self.subTest(stage=stage):
+                module, session, handle, bm = self.make_session()
+                scratch = tensor()
+                session.register_npu_tensor(scratch)
+                operation = (bm.uninitialize if stage == "bm_uninitialize" else
+                             session.mf.uninitialize if stage == "mf_uninitialize" else
+                             getattr(handle, stage))
+                operation.side_effect = KeyboardInterrupt("injected teardown failure")
+                with self.assertRaisesRegex(KeyboardInterrupt, "injected teardown failure"):
+                    session.close()
+                self.assertIn(session, module.BMSession._uncertain_sessions)
+                self.assertIs(session._registered_tensors[1024][0], scratch)
+                self.assertFalse(session.closed)
+                self.assertTrue(module.BMSession._active)
 
     def test_unvalidated_cpu_and_invalid_tensor_registration_fail_explicitly(self):
         module, session, handle, bm = self.make_session()

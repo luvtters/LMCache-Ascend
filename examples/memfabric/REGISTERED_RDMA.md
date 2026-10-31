@@ -62,6 +62,11 @@ the independent primitive returned public unregister=0 while emitting
 HalHostUnregisterEx ret8 for DEVICE slices. Preserve full native logs and actual
 process exit codes in device acceptance.
 
+Any exception from wait, unregister, leave, destroy, or SDK uninitialization
+also retains the complete RDMA session and its Tensor references globally until
+process exit, even if the caller drops its context. Such a failure does not mark
+the session closed or permit a replacement BM session in the same process.
+
 ## L2 CPU MemoryObj boundary
 
 The compatibility L2 adapter currently uses external CPU `MemoryObj` addresses
@@ -89,8 +94,8 @@ python -m unittest discover -s tests/v1/distributed -p test_memfabric_direct_hbm
 python -m unittest discover -s tests/v1/distributed -p test_memfabric_direct.py -v
 ```
 
-Result: 6 new RDMA contracts, 4 BM controls, 7 medium contracts and 22 direct
-lifecycle contracts pass (39 total). These fakes establish configuration,
+Result: 8 new RDMA contracts, 4 BM controls, 7 medium contracts and 22 direct
+lifecycle contracts pass (41 total). These fakes establish configuration,
 registration ownership, direction/flags and error cleanup control only. Real
 worker-direct model gate, full KV byte equality, remote HOST provenance,
 multirank RDMA coexistence and performance remain NOT_VERIFIED for this commit.

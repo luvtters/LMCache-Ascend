@@ -232,21 +232,26 @@ class BMSession:
         self._check_thread()
         if self.closed:
             return
-        if self.handle is not None:
-            self.wait()
-            for pointer in list(self._registered_tensors):
-                if pointer not in self._unregistered_pointers:
-                    self.check(self.handle.unregister(pointer), "BM unregister NPU tensor")
-                    self._unregistered_pointers.add(pointer)
-                # Retain the tensor itself through leave/destroy/uninitialize.
-            if self.joined:
-                self.check(self.handle.leave(), "BM leave")
-            self.handle.destroy()
-            self.handle = None
-        if self.initialized:
-            self.bm.uninitialize()
-        if self.mf_initialized:
-            self.mf.uninitialize()
+        try:
+            if self.handle is not None:
+                self.wait()
+                for pointer in list(self._registered_tensors):
+                    if pointer not in self._unregistered_pointers:
+                        self.check(self.handle.unregister(pointer), "BM unregister NPU tensor")
+                        self._unregistered_pointers.add(pointer)
+                    # Retain the tensor itself through leave/destroy/uninitialize.
+                if self.joined:
+                    self.check(self.handle.leave(), "BM leave")
+                self.handle.destroy()
+                self.handle = None
+            if self.initialized:
+                self.bm.uninitialize()
+            if self.mf_initialized:
+                self.mf.uninitialize()
+        except BaseException:
+            if self.data_op_type == "DEVICE_RDMA":
+                self._retain_unknown_completion()
+            raise
         self._registered_tensors.clear()
         self.closed = True
         with self._guard:
