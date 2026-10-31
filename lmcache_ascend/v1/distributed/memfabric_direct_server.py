@@ -53,7 +53,9 @@ class MemFabricDirectServerModule(DiscoverableModule):
                                 storage_rank=config["rank_id"],
                                 world_size=config["world_size"], ready=False,
                                 tp_size=config.get("tp_size", 1),
-                                pool_memory_type=config.get("pool_memory_type", "host"))
+                                pool_memory_type=config.get("pool_memory_type", "host"),
+                                data_op_type=config.get("data_op_type", "SDMA"),
+                                enable_56bits_gva=config.get("enable_56bits_gva", False))
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._owner_thread = threading.Thread(target=self._run_pool,

@@ -204,6 +204,11 @@ class MemFabricDirectTransferContext(TransferContext):
                 "rank": self.config["rank_id"], "member_id": self.member_id,
                 "shard": self.shard, "tp_size": self.tp_size,
                 "pool_memory_type": self.pool_memory_type}
+            if (self.config.get("data_op_type", "SDMA") != "SDMA"
+                    or self.config.get("enable_56bits_gva", False)):
+                registration.update(data_op_type=self.config.get("data_op_type", "SDMA"),
+                    enable_56bits_gva=self.config.get("enable_56bits_gva", False),
+                    transport_contract_version=1)
             if self.tp_size > 1:
                 registration.update(layout=self.transfer.layout, size=self.transfer.size)
             self.registration = self.control.call("register", registration)
@@ -221,6 +226,11 @@ class MemFabricDirectTransferContext(TransferContext):
                     "status", {}).result(timeout=remaining))
             if self.transfer.size > self.registration["slot_size"]:
                 raise ValueError("NPU KV chunk does not fit one MemFabric slot")
+            if (self.registration.get("data_op_type", "SDMA") != self.config.get("data_op_type", "SDMA")
+                    or self.registration.get("enable_56bits_gva", False) != self.config.get("enable_56bits_gva", False)
+                    or (self.config.get("data_op_type", "SDMA") == "DEVICE_RDMA"
+                        and self.registration.get("transport_contract_version") != 1)):
+                raise ValueError("Worker and service BM transport contracts differ")
             self.base = self.session.peer_address(self.registration["storage_rank"])
         except Exception:
             self.session.close()

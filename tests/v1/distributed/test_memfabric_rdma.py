@@ -2,12 +2,13 @@
 """CPU control contracts only; fake native SDK does not establish RDMA reachability."""
 from types import SimpleNamespace
 import gc
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 import weakref
 
 from test_memfabric_direct_hbm import load_bm
-from test_memfabric_direct import DIRECT, Client, Session, Transfer
+from test_memfabric_direct import DIRECT, Client, PoolIndex, Session, Transfer
 from test_memfabric_direct_server import FakeSession, load_server
 
 
@@ -157,6 +158,9 @@ class RdmaContracts(unittest.TestCase):
 
     def test_worker_synchronizes_and_registers_owned_scratch(self):
         sessions = []
+        client = Client()
+        client.index = PoolIndex(pool_bytes=1 << 30, slot_size=32 << 20, storage_rank=0,
+            world_size=2, data_op_type="DEVICE_RDMA", enable_56bits_gva=True)
         class RdmaSession(Session):
             def register_npu_tensor(self, value):
                 self.record("register_tensor")
@@ -164,7 +168,7 @@ class RdmaContracts(unittest.TestCase):
         def factory(**kwargs):
             sessions.append(RdmaSession(**kwargs))
             return sessions[-1]
-        worker = DIRECT.MemFabricDirectTransferContext(instance_id=1, req_client=Client(),
+        worker = DIRECT.MemFabricDirectTransferContext(instance_id=1, req_client=client,
             tokens_per_chunk=128, mq_timeout=2, session_factory=factory, transfer_factory=Transfer,
             extra_config={"lmcache.mp.direct": dict(device_id=0, rank_id=1, world_size=2,
                 pool_gb=1, store_url="cpu-only", data_op_type="DEVICE_RDMA",
@@ -174,6 +178,10 @@ class RdmaContracts(unittest.TestCase):
             self.assertIs(sessions[0].retained, worker.transfer.buffer)
             self.assertEqual(worker.transfer.operations[0], "synchronize")
             self.assertEqual(sessions[0].operations[0], "register_tensor")
+            self.assertEqual(worker.registration["protocol"], "DEVICE_RDMA")
+            self.assertTrue(worker.registration["enable_56bits_gva"])
+            sent = next(payload for method, payload in client.calls if method == "register")
+            self.assertEqual(sent["transport_contract_version"], 1)
         finally:
             worker.close()
 
@@ -190,8 +198,64 @@ class RdmaContracts(unittest.TestCase):
             server._owner_thread.join(0.05)
             self.assertEqual(received[0]["data_op_type"], "DEVICE_RDMA")
             self.assertTrue(received[0]["enable_56bits_gva"])
+            self.assertEqual(server.report_status()["protocol"], "DEVICE_RDMA")
+            self.assertTrue(server.report_status()["enable_56bits_gva"])
+            wrong = json.loads(server.register(json.dumps(dict(rank=1, member_id="P")).encode()))
+            self.assertFalse(wrong["ok"])
+            self.assertIn("transport contracts differ", wrong["error"])
+            matched = json.loads(server.register(json.dumps(dict(rank=1, member_id="P",
+                data_op_type="DEVICE_RDMA", enable_56bits_gva=True,
+                transport_contract_version=1)).encode()))
+            self.assertTrue(matched["ok"])
         finally:
             server.close()
+
+    def test_pool_rejects_transport_mismatch_before_membership_changes(self):
+        for operation, bits in (("SDMA", False), ("DEVICE_RDMA", True)):
+            with self.subTest(operation=operation):
+                pool = PoolIndex(pool_bytes=128, slot_size=64, storage_rank=0,
+                    world_size=2, data_op_type=operation, enable_56bits_gva=bits)
+                for wrong in (
+                        {"data_op_type": "DEVICE_RDMA" if operation == "SDMA" else "SDMA",
+                         "enable_56bits_gva": bits},
+                        {"data_op_type": operation, "enable_56bits_gva": not bits},
+                        {"data_op_type": operation, "enable_56bits_gva": bits,
+                         "transport_contract_version": 2}):
+                    with self.assertRaisesRegex(ValueError, "transport contracts differ"):
+                        pool.register(rank=1, member_id="P", **wrong)
+                    self.assertFalse(pool.status()["registration_ready"])
+                pool.register(rank=1, member_id="P", data_op_type=operation,
+                    enable_56bits_gva=bits)
+                self.assertTrue(pool.status()["registration_ready"])
+                self.assertEqual(pool.status()["protocol"], operation)
+
+    def test_worker_surfaces_control_mismatch_and_closes_native_session(self):
+        for owner_op, owner_bits, worker_op, worker_bits in (
+                ("SDMA", False, "DEVICE_RDMA", False),
+                ("DEVICE_RDMA", True, "SDMA", False),
+                ("DEVICE_RDMA", False, "DEVICE_RDMA", True)):
+            with self.subTest(owner=owner_op, worker=worker_op, bits=worker_bits):
+                client, sessions = Client(), []
+                client.index = PoolIndex(pool_bytes=1 << 30, slot_size=32 << 20,
+                    storage_rank=0, world_size=2, data_op_type=owner_op,
+                    enable_56bits_gva=owner_bits)
+                def factory(**kwargs):
+                    session = Session(**kwargs)
+                    session.register_npu_tensor = lambda value: session.record("register_tensor")
+                    sessions.append(session)
+                    return session
+                worker = DIRECT.MemFabricDirectTransferContext(instance_id=1, req_client=client,
+                    tokens_per_chunk=128, mq_timeout=2, session_factory=factory, transfer_factory=Transfer,
+                    extra_config={"lmcache.mp.direct": dict(device_id=0, rank_id=1, world_size=2,
+                        pool_gb=1, store_url="cpu-only", data_op_type=worker_op,
+                        device_nic="tcp://127.0.0.1:10005", enable_56bits_gva=worker_bits)})
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "transport contracts differ"):
+                        worker.register({}, "qwen3", 1, 1, 2)
+                    self.assertTrue(sessions[0].closed)
+                    self.assertFalse(client.index.status()["registration_ready"])
+                finally:
+                    worker.close()
 
 
 if __name__ == "__main__":

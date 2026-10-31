@@ -3,6 +3,9 @@
 Base: worker lifecycle commit `c790352`. CPU control contracts pass locally;
 this production integration has not yet been exercised on NPU or with a model.
 It does not change LMCache core, the compatibility baseline, or SDK 1.2.1.
+Matching core lifecycle revision: `5b565d211416cd48bebf20bae12a4abc15a72ba9`.
+Use this Ascend candidate on service and every worker; do not mix it with the
+older SDMA-only server module for RDMA operation.
 
 ## Configuration for the actual worker/direct service
 
@@ -35,6 +38,14 @@ usable after injecting these fields into their JSON. `cross_host_role.py` and
 `validate_direct_kv.py` have no new RDMA CLI switches in this commit: their
 generated default configs continue to use SDMA. Do not assume those defaults
 activate this candidate.
+
+The service status reports configured `protocol` / `data_op_type` and
+`enable_56bits_gva`. Registration uses fixed `transport_contract_version=1` and
+rejects a worker whose data operation or 56-bit setting differs before adding
+that member. The default SDMA/false registration remains backward compatible
+with missing optional fields. The worker verifies its ready-status contract as
+well. NIC endpoint strings are rank-local and therefore are not equality-checked
+across hosts. Configured status is not native route proof; preserve SDK logs.
 
 The service still owns the remote HOST pool and payloads use NPU scratch to/from
 that pool via L2G/G2L; RPC remains metadata only. The service contributes no HBM
@@ -92,10 +103,18 @@ python -m unittest discover -s tests/v1/distributed -p test_memfabric_rdma.py -v
 python -m unittest discover -s tests/v1/distributed -p test_memfabric_bm.py -v
 python -m unittest discover -s tests/v1/distributed -p test_memfabric_direct_hbm.py -v
 python -m unittest discover -s tests/v1/distributed -p test_memfabric_direct.py -v
+python -m unittest discover -s tests/v1/distributed -p test_memfabric_direct_server.py -v
+python -m unittest discover -s tests/v1/distributed -p test_memfabric_direct_tp.py -v
 ```
 
-Result: 8 new RDMA contracts, 4 BM controls, 7 medium contracts and 22 direct
-lifecycle contracts pass (41 total). These fakes establish configuration,
+For the core status-aggregation check in the TP module, set
+`LMCACHE_CORE_SOURCE` to the matching core lifecycle checkout above.
+
+Result: 10 new RDMA contracts, 4 BM controls, 7 medium contracts, 22 direct
+lifecycle, 8 server and 8 TP contracts pass (59 total). These fakes establish configuration,
 registration ownership, direction/flags and error cleanup control only. Real
 worker-direct model gate, full KV byte equality, remote HOST provenance,
 multirank RDMA coexistence and performance remain NOT_VERIFIED for this commit.
+The separate real-router `test_memfabric_direct_protocol.py` could not import
+on this local Windows Python due to missing `msgspec`; it is not counted as a
+passing check, and no dependencies were installed for this candidate.

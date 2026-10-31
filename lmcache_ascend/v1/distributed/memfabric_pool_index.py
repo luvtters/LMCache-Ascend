@@ -21,7 +21,14 @@ class _Entry:
 
 class PoolIndex:
     def __init__(self, *, pool_bytes, slot_size, storage_rank, world_size,
-                 ready=True, tp_size=1, pool_memory_type="host"):
+                 ready=True, tp_size=1, pool_memory_type="host", data_op_type="SDMA",
+                 enable_56bits_gva=False):
+        if data_op_type not in ("SDMA", "DEVICE_RDMA"):
+            raise ValueError("data_op_type must be SDMA or DEVICE_RDMA")
+        if type(enable_56bits_gva) is not bool:
+            raise ValueError("enable_56bits_gva must be a bool")
+        self.data_op_type = data_op_type
+        self.enable_56bits_gva = enable_56bits_gva
         if pool_memory_type not in ("host", "device"):
             raise ValueError("pool_memory_type must be host or device")
         self.pool_memory_type = pool_memory_type
@@ -93,10 +100,16 @@ class PoolIndex:
             return self.status()
 
     def register(self, *, rank, member_id, shard=0, tp_size=1, layout=None, size=None,
-                 pool_memory_type="host"):
+                 pool_memory_type="host", data_op_type="SDMA", enable_56bits_gva=False,
+                 transport_contract_version=1):
         self._shard(shard, tp_size)
         if pool_memory_type != self.pool_memory_type:
             raise ValueError("Worker and service pool memory types differ")
+        if (type(transport_contract_version) is not int or transport_contract_version != 1
+                or data_op_type != self.data_op_type
+                or type(enable_56bits_gva) is not bool
+                or enable_56bits_gva != self.enable_56bits_gva):
+            raise ValueError("Worker and service BM transport contracts differ")
         with self._lock:
             if self._closed or self._error:
                 self._available()
@@ -281,7 +294,9 @@ class PoolIndex:
             return dict(epoch=self.epoch, ready=self._ready and not self._closed and not self._error,
                         registration_ready=len(self._members) == self.world_size - 1,
                         transfer_ready=self._ready and not self._closed and not self._error,
-                        closed=self._closed, last_error=self._error, protocol="SDMA",
+                        closed=self._closed, last_error=self._error, protocol=self.data_op_type,
+                        data_op_type=self.data_op_type, enable_56bits_gva=self.enable_56bits_gva,
+                        transport_contract_version=1,
                         storage_rank=self.storage_rank, world_size=self.world_size,
                         pool_memory_type=self.pool_memory_type,
                         pool_selected_sdk_memory_type="HOST" if self.pool_memory_type == "host" else "DEVICE",
