@@ -9,6 +9,19 @@ import unittest
 
 
 class Checks(unittest.TestCase):
+    def test_registered_torch_request_and_plan(self):
+        import registered_host_rdma_probe as p
+        base = ['--rank', '0', '--device', '0', '--store-url', 'tcp://127.0.0.1:19001',
+            '--coord-url', 'http://127.0.0.1:19002', '--run-id', 'cpu', '--output', 'unused.json']
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            p.arguments(base + ['--local-endpoint', 'torch-registered'])
+        a = p.arguments(base + ['--local-endpoint', 'torch-registered', '--copy-interface', 'l2g-g2l'])
+        plan = p.build_plan(a)
+        self.assertEqual(plan['create2']['local_hbm_size'], 0)
+        self.assertFalse(plan['local_device_staging'])
+        self.assertEqual(p.copy_request('l2g-g2l', 'write', 100, 200, 300, 400, 64), (300, 200, 'L2G'))
+        self.assertEqual(p.copy_request('l2g-g2l', 'read', 100, 200, 300, 400, 64), (200, 400, 'G2L'))
+
     def test_actual_event_emitter_tensor_metadata(self):
         import registered_host_rdma_probe as p
         args = p.arguments(['--rank', '0', '--device', '0', '--store-url',

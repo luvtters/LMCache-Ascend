@@ -148,3 +148,40 @@ HOST-to-DEVICE from managed GVA regions, and TransformVa converts only local
 managed pointers. `torch.npu.synchronize` brackets local staging and precedes
 content inspection; synchronous SDK returns remain mandatory. CPU checks cover
 the new explicit parameter contract and mapping geometry, not NPU execution.
+
+## Optional registration of real torch NPU allocations
+
+For a fresh independent attempt, both ranks explicitly select
+**`--local-endpoint torch-registered --copy-interface l2g-g2l`**.
+This requests HOST 1 GiB and HBM pool size zero. Rank 0 allocates separate real
+contiguous uint8 NPU source and restore tensors, synchronizes them, rejects
+null/overflow/overlapping ranges, and calls public `BigMemory.register(ptr,n)`
+for each allocation. Every registration requires native return zero and is
+logged separately. Any missing API or registration failure aborts; no fallback
+or custom pointer wrapper is used.
+
+The remote write is `L2G(source_tensor_ptr, rank1_HOST_GVA,n,0)` and both remote
+reads are `G2L(rank1_HOST_GVA,restore_tensor_ptr,n,0)`. There is no local HAL HBM
+pool, local L2G/G2L staging or intermediate HOST payload buffer. The existing
+DEVICE_RDMA SafePut/SafeGet registration checks must hit the newly registered
+real tensor range, then call CopyRDMA. Owner-local HVA full-byte A verification,
+source overwrite, owner-written B, restore sentinel reset, independent reader
+full-byte checks and both-done barrier remain required. Completion counters
+advance only after a zero synchronous remote copy return.
+
+The registered tensors remain alive through explicit `unregister` calls and
+all SDK cleanup. Register and unregister raw returns are retained; native logs
+must also be checked because lower SDK cleanup paths can emit warnings while
+returning success. Public API basis: `docs/pythonAPI.md:332-333`,
+`smem_bm.cpp:565-594`, `smem_bm_entry.cpp:674-720`,
+`hybm_entity_default.cpp:240-286`, `hybm_mem_segment.cpp:128-170`.
+The registered device slice produces REG_MR_FLAG_HBM on the same transport.
+
+H2's previous staged-HBM route crashed with native SIGSEGV after entering its
+first local CopyLD2LD call, before the remote write. Fixed SDK CopyLD2LD calls
+DlAclApi::AclrtMemcpy directly with DEVICE_TO_DEVICE; the wrapper calls the
+loaded public `aclrtMemcpy` function, not `memcpy_s`. Repeating the identical
+ACL call outside the SDK has no demonstrated corrective basis. The crash does
+not prove a general prohibition on HAL-mapped HBM pointers or remote RDMA
+failure. The torch-registered route removes that unverified local staging
+requirement and still needs separate real-device completion/cleanup evidence.
