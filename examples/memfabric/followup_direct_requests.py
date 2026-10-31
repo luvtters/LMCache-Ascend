@@ -12,15 +12,59 @@ from pathlib import Path
 import time
 import traceback
 
-from direct_pd_gate import l1_empty, metric, trace_records
+from direct_pd_gate import (active_trace, l1_empty, metric, rank_copy_summary,
+                            trace_records, verify_rank_counts)
 
 
-def verify_d_trace(records, since_ns, expected_copies):
+def validate_snapshot(snapshot, role, session_id, baseline=None):
+    assert snapshot['run_id'] == session_id, 'Remote followup trace session mismatch'
+    assert isinstance(snapshot['host_id'], str) and snapshot['host_id'], 'Missing remote host identity'
+    assert type(snapshot['mono_ns']) is int and snapshot['mono_ns'] > 0
+    if baseline is not None:
+        assert snapshot['host_id'] == baseline['host_id'], 'Remote followup trace host changed'
+        assert snapshot['run_id'] == baseline['run_id']
+        assert snapshot['mono_ns'] >= baseline['mono_ns'], 'Remote trace clock moved backwards'
+    records = [r for r in snapshot['records'] if r['role'] == role]
+    assert all(r.get('host_id') == snapshot['host_id'] and r.get('session_id') == session_id
+               for r in records), 'Remote record host/session mismatch'
+    return records
+
+
+def collect_remote_snapshots(fetch, urls, session_id, baselines=None):
+    records, snapshots = [], {}
+    cutoffs = {} if baselines is None else dict(baselines)
+    for role in ('P', 'D'):
+        snapshot = fetch(urls[role])
+        records.extend(validate_snapshot(snapshot, role, session_id,
+                       None if baselines is None else baselines[role]))
+        snapshots[role] = snapshot
+        if baselines is None:
+            cutoffs[role] = {key: snapshot[key] for key in ('host_id', 'run_id', 'mono_ns')}
+    return records, cutoffs, snapshots
+
+
+def assert_no_new_p_traffic(records, since_ns):
+    active = active_trace(records, since_ns)
+    assert not any(r['role'] == 'P' and r['kind'] in ('bm_copy', 'kv_stage', 'native_transfer')
+                   for r in active), 'Unexpected P traffic after followup P-host baseline'
+    return 0
+
+
+def expected_followup_trace(prompt_tokens, chunk, requests, tp_size, bytes_per_request):
+    assert tp_size in (1, 2, 4, 8) and requests > 0 and chunk > 0
+    chunks = prompt_tokens // chunk
+    assert chunks > 0 and bytes_per_request > 0 and bytes_per_request % (chunks * tp_size) == 0
+    return dict(copies=chunks * requests * tp_size, bytes=bytes_per_request * requests,
+                per_rank_copies=chunks * requests,
+                per_rank_bytes=bytes_per_request * requests // tp_size)
+
+
+def verify_d_trace(records, since_ns, expected_copies, tp_size=1, expected_bytes=None):
     """Match completed D G2L-to-scatter chains on the same owner and NPU pointer."""
     scratch = {(r["pid"], r["local_ptr"]): r for r in records
                if r["role"] == "D" and r["kind"] == "npu_scratch"
                and r["phase"] == "complete"}
-    active = [r for r in records if r["mono_ns"] >= since_ns]
+    active = active_trace(records, since_ns)
     assert not any(r["kind"] == "cpu_bm_copy" for r in active), "CPU BM copy observed"
     assert not any(r["phase"] == "error" for r in active), "Worker trace contains an error"
     assert not any(r["role"] == "P" and r["kind"] in ("bm_copy", "kv_stage")
@@ -92,20 +136,41 @@ def verify_d_trace(records, since_ns, expected_copies):
     assert all(all(value is None for value in state.values())
                for state in streams.values()), "Incomplete D copy/scatter chain"
     assert completed == expected_copies > 0, (completed, expected_copies)
+    per_rank = None
+    if expected_bytes is not None:
+        assert read_bytes == expected_bytes, (read_bytes, expected_bytes)
+        assert expected_copies % tp_size == 0
+        per_rank = rank_copy_summary(records, since_ns, tp_size, 'D', 'G2L')
+        verify_rank_counts(per_rank, expected_copies // tp_size, expected_bytes, tp_size)
     return dict(g2l_copies=completed, scatter_completions=completed,
                 g2l_bytes=read_bytes, cpu_bm_copy_calls=0,
-                local_memory_type="npu", new_p_copies=0)
+                local_memory_type="npu", new_p_copies=0, tp_size=tp_size, per_rank=per_rank)
 
 
-def main():
+def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gate-dir", type=Path, required=True)
     parser.add_argument("--decoder", default="http://127.0.0.1:28202")
     parser.add_argument("--service-http", default="http://127.0.0.1:28175")
-    parser.add_argument("--trace-dir", type=Path, required=True)
+    parser.add_argument("--trace-dir", type=Path)
+    parser.add_argument("--p-trace-url", help="P host CPU /snapshot endpoint")
+    parser.add_argument("--d-trace-url", help="D host CPU /snapshot endpoint")
+    parser.add_argument("--session-id", help="Exact existing strict-gate session for remote snapshots")
     parser.add_argument("--model", default="mf-direct")
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    remote = bool(args.p_trace_url or args.d_trace_url)
+    if remote and not (args.p_trace_url and args.d_trace_url and args.session_id):
+        parser.error('remote trace requires paired --p-trace-url/--d-trace-url and --session-id')
+    if not remote and args.trace_dir is None:
+        parser.error('local trace requires --trace-dir')
+    if remote and args.trace_dir is not None:
+        parser.error('choose local trace-dir or paired remote snapshots')
+    return args
+
+
+def main(argv=None):
+    args = arguments(argv)
     gate = json.loads((args.gate_dir / "summary.json").read_text(encoding="utf-8"))
     assert gate["status"] == "DIRECT_POOL_PATH_PASS", "Strict gate has not passed"
     initial = json.loads((args.gate_dir / "initial.json").read_text(encoding="utf-8"))
@@ -115,6 +180,9 @@ def main():
     body.pop("stream_options", None)
     expected = dict(prompt=gate["prompt_tokens"], external=gate["d_external_tokens"],
                     computed=gate["d_computed_tokens"], prefix=0)
+    tp_size = gate.get('tp_size', 1)
+    bytes_per_request = gate['direct_trace']['d_g2l_bytes']
+    assert bytes_per_request == gate['direct_trace']['p_l2g_bytes'] > 0
     assert expected["external"] > 0 and gate["d_local_prefix_tokens"] == 0
     assert expected["computed"] + expected["external"] == expected["prompt"]
     args.output.mkdir(parents=True, exist_ok=False)
@@ -161,7 +229,9 @@ def main():
                     response=result)
 
     receipt = dict(status="RUNNING", gate_dir=str(args.gate_dir), expected=expected,
-                   decoder=args.decoder, service_http=args.service_http, phases=[])
+                   decoder=args.decoder, service_http=args.service_http, phases=[], tp_size=tp_size,
+                   trace_time_domain='per_host_baselines' if args.p_trace_url else 'local_client_monotonic',
+                   session_id=args.session_id, bytes_per_request=bytes_per_request)
     save("request", body)
     save("receipt", receipt)
     try:
@@ -174,7 +244,13 @@ def main():
                 save(phase + "_before_service", status)
                 (args.output / f"{phase}_metrics_before.txt").write_text(
                     before_metrics, encoding="utf-8")
-                since_ns = time.monotonic_ns()
+                if args.p_trace_url:
+                    _, since_ns, snapshots = collect_remote_snapshots(
+                        lambda url: get(client, url).json(), {'P':args.p_trace_url,'D':args.d_trace_url}, args.session_id)
+                    for role, snapshot in snapshots.items():
+                        save(phase + '_trace_snapshot_' + role + '_baseline', snapshot)
+                else:
+                    since_ns = time.monotonic_ns()
                 if count == 1:
                     results = [request(0)]
                 else:
@@ -200,22 +276,33 @@ def main():
                         save(phase + "_timeout", dict(service=status, observed=observed))
                         raise TimeoutError("D source metrics or pool protections did not settle")
                     time.sleep(0.2)
-                records = trace_records(args.trace_dir)
-                trace = verify_d_trace(records, since_ns, expected["prompt"] // chunk * count)
-                save(phase + "_trace", [r for r in records if r["mono_ns"] >= since_ns])
+                if args.p_trace_url:
+                    records, _, snapshots = collect_remote_snapshots(
+                        lambda url: get(client, url).json(), {'P':args.p_trace_url,'D':args.d_trace_url},
+                        args.session_id, since_ns)
+                    for role, snapshot in snapshots.items():
+                        save(phase + '_trace_snapshot_' + role + '_latest', snapshot)
+                else:
+                    records = trace_records(args.trace_dir)
+                assert_no_new_p_traffic(records, since_ns)
+                counts = expected_followup_trace(expected['prompt'], chunk, count, tp_size, bytes_per_request)
+                trace = verify_d_trace(records, since_ns, counts['copies'], tp_size, counts['bytes'])
+                save(phase + '_trace_full_with_scratch', records)
+                save(phase + "_trace", active_trace(records, since_ns))
                 save(phase + "_after_service", status)
                 (args.output / f"{phase}_metrics_after.txt").write_text(
                     after_metrics, encoding="utf-8")
                 summary = dict(name=phase, requests=count, answers=[r["answer"] for r in results],
                                source_delta=observed, direct_trace=trace,
                                final_pins=status["total_pins"], pending_writes=status["pending_writes"],
-                               note="Concurrent source counters are aggregate, not per-request logs")
+                               expected_trace=counts,
+                               note="Client concurrency; source counters aggregate. Scheduler batching/copy overlap not established.")
                 receipt["phases"].append(summary)
                 save("receipt", receipt)
                 print("MEMFABRIC_DIRECT_FOLLOWUP_PHASE_PASS", json.dumps(summary), flush=True)
         receipt.update(status="PASS", exit_code=0, completed_ns=time.monotonic_ns(),
                        total_requests=4,
-                       note="Functional replay/concurrency validation; not a performance sample")
+                       note="Functional replay/client concurrency only; not scheduler batching, copy overlap or a performance sample")
         save("receipt", receipt)
         print("MEMFABRIC_DIRECT_FOLLOWUP_PASS", json.dumps(receipt), flush=True)
     except Exception as exc:
