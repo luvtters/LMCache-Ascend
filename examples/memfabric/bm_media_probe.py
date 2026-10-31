@@ -23,6 +23,8 @@ MAX_PAYLOAD_BYTES = 64 << 20
 POOL_BYTES = 1 << 30
 # Exact SDK 1.2.1 smem_bm_def.h; allocation variant, not a copy flag.
 DRAM_MAP_HOST_VA_FLAG = 1 << 9
+# SDK hybm_def.h: node occupies bits 0..6; bit 7 enables NUMA policy.
+DRAM_NUMA_POLICY_FLAG = 1 << 7
 
 
 def arguments(argv=None):
@@ -40,6 +42,8 @@ def arguments(argv=None):
                         help='Explicit SDK address mode; permits RDMA allocator HAL fallback')
     parser.add_argument('--dram-map-host-va', action='store_true',
                         help='Isolated HOST/SDMA allocation diagnostic; default remains flags=0')
+    parser.add_argument('--dram-numa-node', type=int, choices=range(8), default=None,
+                        help='HOST/SDMA HAL NUMA allocation request (0..7); actual pages unverified')
     parser.add_argument('--payload-bytes', type=int, default=PAYLOAD_BYTES,
                         help='Full compared payload, a positive multiple of 32, at most 64 MiB')
     parser.add_argument('--buffer-kind', choices=('npu', 'cpu'), default='npu',
@@ -56,6 +60,8 @@ def arguments(argv=None):
         parser.error('payload-bytes must be a positive multiple of 32 and at most 64 MiB')
     if args.buffer_kind == 'cpu' and (args.media != 'host' or args.data_op_type != 'sdma'):
         parser.error('--buffer-kind cpu requires HOST/SDMA')
+    if args.dram_numa_node is not None and (args.media != 'host' or args.data_op_type != 'sdma'):
+        parser.error('--dram-numa-node requires HOST/SDMA')
     if args.dram_map_host_va and (args.media != 'host' or args.data_op_type != 'sdma'):
         parser.error('--dram-map-host-va is only a HOST/SDMA allocation variant')
     if args.device < 0 or args.timeout <= 0 or args.init_timeout <= 0:
@@ -73,6 +79,9 @@ def arguments(argv=None):
 
 def build_plan(args):
     hbm = POOL_BYTES if args.media == 'device' else 0
+    allocation_flags = DRAM_MAP_HOST_VA_FLAG if args.dram_map_host_va else 0
+    if args.dram_numa_node is not None:
+        allocation_flags |= DRAM_NUMA_POLICY_FLAG | args.dram_numa_node
     return dict(status='PLAN_ONLY', rank=args.rank, device=args.device,
         hostname=socket.gethostname(), pid=os.getpid(), world_size=2,
         media=args.media, direction=args.direction, writer_rank=1 if args.direction=='pull-only' else 0,
@@ -81,6 +90,8 @@ def build_plan(args):
         run_id=args.run_id, store_url=args.store_url,
         coord_url=args.coord_url, owner_rank=1, payload_bytes=args.payload_bytes,
         buffer_kind=args.buffer_kind, npu_context_required=True,
+        requested_dram_numa_node=args.dram_numa_node,
+        actual_dram_numa_node='NOT_VERIFIED',
         copy_types=dict(write='H2G' if args.buffer_kind == 'cpu' else 'L2G',
                         read='G2H' if args.buffer_kind == 'cpu' else 'G2L'),
         fresh_store_and_process_group_required=True,
@@ -89,7 +100,7 @@ def build_plan(args):
                      local_hbm_size=hbm, max_hbm_size=hbm,
                      data_op_type='SDMA' if args.data_op_type == 'sdma' else 'DEVICE_RDMA',
                      enable_56bits_gva=args.enable_56bits_gva,
-                     flags=DRAM_MAP_HOST_VA_FLAG if args.dram_map_host_va else 0),
+                     flags=allocation_flags),
         actual_transport='NOT_VERIFIED_READ_NATIVE_TRANSPORT_LOG',
         actual_export_seg_type='NOT_VERIFIED_READ_NATIVE_PROCESS_RAW_LOG',
         payload_via_rpc=False, external_process_wait_required=True,

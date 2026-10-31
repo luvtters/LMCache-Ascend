@@ -56,6 +56,31 @@ class ProbeChecks(unittest.TestCase):
     def test_cpu_buffers_copy_types_wait_order_and_full_content(self):
         self.check_small_buffer_runtime('cpu')
 
+    def test_explicit_dram_numa_requests_combine_without_changing_defaults(self):
+        original = probe.build_plan(probe.arguments(self.payload_args()))
+        self.assertIsNone(original['requested_dram_numa_node'])
+        self.assertEqual(original['create2']['flags'], 0)
+        mapped = probe.build_plan(probe.arguments(self.payload_args('--dram-map-host-va')))
+        self.assertEqual(mapped['create2']['flags'], 512)
+        for node, expected in ((0, 128), (4, 132)):
+            for extra, map_flag in (([], 0), (['--dram-map-host-va'], 512)):
+                with self.subTest(node=node, mapped=bool(extra)):
+                    plan = probe.build_plan(probe.arguments(self.payload_args(
+                        '--dram-numa-node', str(node), *extra)))
+                    self.assertEqual(plan['requested_dram_numa_node'], node)
+                    self.assertEqual(plan['actual_dram_numa_node'], 'NOT_VERIFIED')
+                    self.assertEqual(plan['create2']['flags'], expected | map_flag)
+                    with self.assertRaises(ValueError):
+                        probe.check_peer_contract(probe.peer_contract(original), probe.peer_contract(plan))
+
+    def test_dram_numa_rejects_wrong_route_and_invalid_node(self):
+        for extra in (['--media', 'device'], ['--data-op-type', 'device_rdma']):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                probe.arguments(self.payload_args('--dram-numa-node', '0', *extra))
+        for node in ('-1', '8', '1.5', 'invalid'):
+            with self.subTest(node=node), self.assertRaises(SystemExit):
+                probe.arguments(self.payload_args('--dram-numa-node', node))
+
     def check_small_buffer_runtime(self, kind):
         # Fake only unavailable device/SDK boundaries; execute the real run path.
         size = 64

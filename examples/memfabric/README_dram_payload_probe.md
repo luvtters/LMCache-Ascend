@@ -16,7 +16,7 @@ counts above UINT32_MAX. These inspected task builders expose no stricter
 length-alignment check. No SDK, medium or copy flags were changed.
 
 Run the CPU checks with `python examples/memfabric/check_bm_media_probe_cpu.py`.
-The 13 checks cover CLI bounds, mismatched rank payloads and a 64-byte real probe
+The 15 checks cover CLI bounds, mismatched rank payloads and a 64-byte real probe
 control path with fake device/SDK boundaries, including last-byte corruption.
 This proves Python sizing and control behavior only; native SDMA and cross-host
 HOST correctness remain NOT_VERIFIED by these CPU checks.
@@ -42,3 +42,16 @@ this is a CPU-buffer diagnostic, not an NPU-free communication test.
 The CPU boundary tests execute both ranks, reject CPU+DEVICE/RDMA, check CPU
 allocation/copy/wait ordering and reject last-byte corruption. They do not
 establish native SDK or cross-host correctness.
+
+## Explicit HAL DRAM NUMA request
+
+`--dram-numa-node N` is restricted to HOST/SDMA and, for this A3 diagnostic,
+nodes 0..7. The default is unset and keeps flags 0 (or 512 with
+`--dram-map-host-va`). Fixed SDK `hybm_def.h:28-34` assigns node bits 0..6 and
+NUMA-policy enable bit 7; the request is `(1 << 7) | N`. Node 0 and node 4
+therefore request flags 128 and 132, or 640 and 644 with HOST-VA mapping.
+Both ranks compare the complete create2 flags in their existing contract.
+
+`requested_dram_numa_node` reports only the requested HAL allocation node;
+`actual_dram_numa_node` remains NOT_VERIFIED. This parameter does not establish
+actual page placement. A failed transfer with it cannot exclude NUMA as a cause.
