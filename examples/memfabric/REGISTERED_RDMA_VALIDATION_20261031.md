@@ -1,5 +1,9 @@
 # Registered RDMA validation checkpoint (2026-10-31)
 
+This historical checkpoint is preserved. Later real MixedSHM L2/model evidence
+is in [the 2026-11-01 L2 checkpoint](REGISTERED_L2_RDMA_VALIDATION_20261101.md);
+it does not erase the HAL ret8 failure or teardown failures recorded below.
+
 This is a sanitized result record, not a collection of internal runtime logs.
 Runtime sources were Ascend `a9d30974` for the first TP1 campaign and
 `25ceb46e` for the JOIN/close fixes, with core `5b565d2`. Documentation commits

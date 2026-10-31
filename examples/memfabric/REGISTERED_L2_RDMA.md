@@ -1,5 +1,10 @@
 # Registered CPU MemoryObj L2 candidate (2026-10-31)
 
+Later real-service evidence is recorded separately in
+[the 2026-11-01 checkpoint](REGISTERED_L2_RDMA_VALIDATION_20261101.md).
+The standalone paged-allocator gate below and the service's MixedSHM allocator
+are distinct validation paths; success in one does not establish the other.
+
 This independent branch starts from worker candidate `a9d30974`; it does not
 replace that candidate or change LMCache core (`5b565d2` lifecycle baseline),
 the compatibility archive, or SDK 1.2.1. Service rank 0 and pool-member ranks
@@ -116,6 +121,13 @@ processes; a JSON success field is not proof of both natural process exits.
 ## Existing LMCache service configuration
 
 The normal L2 plugin structure is unchanged. Its `adapter_params` may now include:
+
+The `device_id: 0` below is a historical configuration example, not the device
+mapping used by the later service validation. That validation pinned the original
+L1 arena on logical device 0 and executed BM on logical device 2, with the
+corresponding runtime contexts separated. It requires both logical devices to
+be visible (at least two visible logical devices, with logical 2 actually mapped
+in the validated layout); do not copy the single-device example as that setup.
 
 ```json
 {
