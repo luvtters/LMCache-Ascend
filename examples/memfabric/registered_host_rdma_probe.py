@@ -11,7 +11,7 @@ import traceback
 from urllib.parse import urlparse
 
 from bm_media_probe import call_step, cleanup_steps
-from direct_coordination import publish, wait_event
+from direct_coordination import host_identity, publish, wait_event
 
 POOL_BYTES = 1 << 30
 MAX_PAYLOAD = 64 << 20
@@ -40,7 +40,28 @@ def arguments(argv=None):
     p.add_argument('--benchmark-iterations', type=int, default=0,
                    help='Explicit torch-registered synchronous copy sampling; 0 preserves functional-only behavior')
     p.add_argument('--benchmark-warmup', type=int, default=3)
+    p.add_argument('--sample-barrier-url', help='Independent CPU HTTP coordination URL for source-session sampling barrier')
+    p.add_argument('--sample-barrier-run-id', help='Fresh global barrier attempt id, distinct from this BM run-id')
+    p.add_argument('--sample-barrier-participant', help='This independent source participant, e.g. A')
+    p.add_argument('--sample-barrier-participants', help='Expected source participants, e.g. A,B')
     a = p.parse_args(argv)
+    barrier_fields = (a.sample_barrier_url, a.sample_barrier_run_id,
+                      a.sample_barrier_participant, a.sample_barrier_participants)
+    if any(barrier_fields) and not all(barrier_fields):
+        p.error('all four sample-barrier parameters must be provided together')
+    if a.sample_barrier_url:
+        participants = a.sample_barrier_participants.split(',')
+        valid_name = lambda name: bool(name) and name.isascii() and all(c.isalnum() or c in '-_' for c in name)
+        if (not a.benchmark_iterations or not 2 <= len(participants) <= 8
+                or len(set(participants)) != len(participants)
+                or not all(valid_name(name) for name in participants)
+                or a.sample_barrier_participant not in participants
+                or not valid_name(a.sample_barrier_run_id)
+                or a.sample_barrier_run_id == a.run_id):
+            p.error('barrier needs sampling, 2..8 distinct participants and a fresh distinct global run-id')
+        a.sample_barrier_participants = sorted(participants)
+    else:
+        a.sample_barrier_participants = []
     if a.local_endpoint == 'device' and a.copy_interface != 'g2g':
         p.error('device local endpoint requires explicit --copy-interface g2g')
     if (a.local_endpoint == 'torch-registered') != (a.copy_interface == 'l2g-g2l'):
@@ -56,7 +77,10 @@ def arguments(argv=None):
         p.error('device and timeouts must be valid')
     if not a.run_id or not a.run_id.isascii() or any(not (c.isalnum() or c in '-_') for c in a.run_id):
         p.error('run-id requires ASCII letters, digits, dash or underscore')
-    for value, scheme in ((a.store_url, 'tcp'), (a.device_nic, 'tcp'), (a.coord_url, 'http')):
+    urls = [(a.store_url, 'tcp'), (a.device_nic, 'tcp'), (a.coord_url, 'http')]
+    if a.sample_barrier_url:
+        urls.append((a.sample_barrier_url, 'http'))
+    for value, scheme in urls:
         parsed = urlparse(value)
         try:
             valid = parsed.hostname and parsed.port and 0 < parsed.port < 65536
@@ -73,6 +97,8 @@ def build_plan(a):
         payload_bytes=a.payload_bytes, source_offset=0, restore_offset=2*a.payload_bytes,
         copy_interface=a.copy_interface, local_endpoint=a.local_endpoint,
         benchmark_iterations=a.benchmark_iterations, benchmark_warmup=a.benchmark_warmup,
+        sample_barrier=dict(url=a.sample_barrier_url, run_id=a.sample_barrier_run_id,
+            participant=a.sample_barrier_participant, expected_participants=a.sample_barrier_participants),
         local_device_staging=a.local_endpoint == 'device',
         data_op_type='DEVICE_RDMA', device_nic=a.device_nic,
         swap_space_size='0', fallback_allowed=False, payload_via_rpc=False,
@@ -102,23 +128,70 @@ def copy_request(interface, direction, own_gva, remote, hva, restore_hva, size):
             (remote, restore_hva, 'G2H'))
 
 
+def clock_anchor():
+    before = time.monotonic_ns()
+    unix = time.time_ns()
+    after = time.monotonic_ns()
+    return dict(monotonic_before_ns=before, unix_ns=unix, monotonic_after_ns=after)
+
+
+def sample_barrier(a, phase, publish_callback=publish, wait_callback=wait_event):
+    if phase not in ('write', 'read') or not a.sample_barrier_url:
+        raise ValueError('sampling barrier requires configured write/read phase')
+    name = 'sample-ready-' + phase + '-' + a.sample_barrier_participant
+    contract = dict(payload_bytes=a.payload_bytes, iterations=a.benchmark_iterations,
+        warmup=a.benchmark_warmup, local_endpoint=a.local_endpoint, copy_interface=a.copy_interface)
+    payload = dict(name=name, protocol='independent-copy-sample-barrier-v1', phase=phase,
+        participant=a.sample_barrier_participant, expected_participants=a.sample_barrier_participants,
+        bm_run_id=a.run_id, pid=os.getpid(), host_id=host_identity(), contract=contract)
+    deadline = time.monotonic() + a.timeout
+    publish_callback(a.sample_barrier_url, a.sample_barrier_run_id, name, payload, min(5, a.timeout))
+    peers = []
+    for participant in a.sample_barrier_participants:
+        remaining = deadline-time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('sampling barrier deadline exceeded')
+        expected_name = 'sample-ready-' + phase + '-' + participant
+        peer = wait_callback(a.sample_barrier_url, a.sample_barrier_run_id, expected_name, remaining)
+        if (peer.get('name') != expected_name or peer.get('protocol') != payload['protocol']
+                or peer.get('phase') != phase or peer.get('participant') != participant
+                or peer.get('expected_participants') != a.sample_barrier_participants
+                or peer.get('contract') != contract or not peer.get('bm_run_id')
+                or not peer.get('host_id') or type(peer.get('pid')) is not int):
+            raise ValueError('sampling barrier peer contract mismatch')
+        peers.append(peer)
+    if (len({peer['bm_run_id'] for peer in peers}) != len(peers)
+            or len({(peer['host_id'], peer['pid']) for peer in peers}) != len(peers)):
+        raise ValueError('sampling barrier needs distinct BM attempts and source processes')
+    return dict(phase=phase, global_run_id=a.sample_barrier_run_id, participants=peers,
+                released_clock_anchor=clock_anchor())
+
+
 def sample_sync_copy(operation, warmup, iterations, size):
     result = dict(warmup_samples=[], samples=[], completed_bytes=0,
-                  passed=True, timing='perf_counter_ns around synchronous copy_data API only')
+                  passed=True, timing='perf_counter_ns around synchronous copy_data API only',
+                  clock_host_id=host_identity(), start_clock_anchor=clock_anchor(),
+                  monotonic_intervals='outer bounds of the timed synchronous API call; compare only identical host_id')
     for index in range(warmup + iterations):
+        start_mono = time.monotonic_ns()
         started = time.perf_counter_ns()
         try:
             raw_return = operation()
             elapsed = time.perf_counter_ns() - started
-            item = dict(index=index, raw_return=raw_return, elapsed_ns=elapsed)
+            end_mono = time.monotonic_ns()
+            item = dict(index=index, raw_return=raw_return, elapsed_ns=elapsed,
+                        start_monotonic_ns=start_mono, end_monotonic_ns=end_mono)
         except BaseException:
             elapsed = time.perf_counter_ns() - started
-            item = dict(index=index, raw_return=None, elapsed_ns=elapsed, error=traceback.format_exc())
+            end_mono = time.monotonic_ns()
+            item = dict(index=index, raw_return=None, elapsed_ns=elapsed, error=traceback.format_exc(),
+                        start_monotonic_ns=start_mono, end_monotonic_ns=end_mono)
         result['warmup_samples' if index < warmup else 'samples'].append(item)
         if item['raw_return'] != 0:
             result['passed'] = False
             break
         result['completed_bytes'] += size
+    result['end_clock_anchor'] = clock_anchor()
     return result
 
 
@@ -235,6 +308,12 @@ def run(a, report, emit):
         operation = lambda: native_copy(src, dst, n, native_type, 0)
         counter = 'completed_' + direction + '_bytes'
         if sample and a.benchmark_iterations:
+            if a.sample_barrier_url:
+                emit('COPY_BARRIER_BEGIN', direction=direction, participant=a.sample_barrier_participant)
+                barrier = sample_barrier(a, direction)
+                report.setdefault('sample_barrier_results', {})[direction] = barrier
+                emit('COPY_BARRIER_RELEASED', direction=direction,
+                     global_run_id=a.sample_barrier_run_id, participant=a.sample_barrier_participant)
             emit('COPY_SAMPLING_BEGIN', step=step, requested_bytes=n,
                  iterations=a.benchmark_iterations, warmup=a.benchmark_warmup)
             # Public SDK log levels: 0 debug, 1 info, 2 warn, 3 error.
@@ -417,6 +496,15 @@ def run(a, report, emit):
         except BaseException:
             report['failure_publish_error'] = traceback.format_exc()
             emit('FAILURE_PUBLISH_ERROR', traceback=report['failure_publish_error'])
+        if a.rank == 0 and a.sample_barrier_url:
+            try:
+                failure_name = 'failed-' + a.sample_barrier_participant
+                publish(a.sample_barrier_url, a.sample_barrier_run_id, failure_name,
+                    dict(name=failure_name, participant=a.sample_barrier_participant,
+                         bm_run_id=a.run_id, error=str(exc)), min(5, a.timeout))
+            except BaseException:
+                report['barrier_failure_publish_error'] = traceback.format_exc()
+                emit('BARRIER_FAILURE_PUBLISH_ERROR', traceback=report['barrier_failure_publish_error'])
     finally:
         steps = []
         # DEVICE_RDMA wait is a no-op; never label this independent completion.

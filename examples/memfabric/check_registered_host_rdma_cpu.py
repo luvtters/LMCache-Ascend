@@ -9,6 +9,55 @@ import unittest
 
 
 class Checks(unittest.TestCase):
+    def test_sampling_barrier_contract_and_callbacks(self):
+        import registered_host_rdma_probe as p
+        base = ['--rank', '0', '--device', '0', '--store-url', 'tcp://127.0.0.1:19001',
+            '--coord-url', 'http://127.0.0.1:19002', '--run-id', 'cpu-session-A',
+            '--output', 'unused.json', '--benchmark-iterations', '30', '--copy-interface', 'g2g']
+        flags = ['--sample-barrier-url', 'http://127.0.0.1:19003', '--sample-barrier-run-id', 'cpu-global',
+                 '--sample-barrier-participant', 'A', '--sample-barrier-participants', 'A,B']
+        args = p.arguments(base + flags)
+        self.assertEqual(args.sample_barrier_participants, ['A', 'B'])
+        for extra in (flags[:-2], flags + ['--sample-barrier-participants', 'A,A'],
+                      flags + ['--sample-barrier-run-id', 'cpu-session-A']):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                p.arguments(base + extra)
+        calls, posted = [], {}
+        def publish(url, run_id, name, payload, timeout):
+            calls.append(('publish', name))
+            posted.update(payload)
+        def wait(url, run_id, name, timeout):
+            calls.append(('wait', name))
+            value = dict(posted)
+            if name.endswith('-B'):
+                value.update(name=name, participant='B', bm_run_id='cpu-session-B', pid=posted['pid']+1)
+            return value
+        result = p.sample_barrier(args, 'write', publish, wait)
+        self.assertEqual(calls, [('publish', 'sample-ready-write-A'),
+                                 ('wait', 'sample-ready-write-A'), ('wait', 'sample-ready-write-B')])
+        self.assertEqual(result['phase'], 'write')
+        self.assertEqual(len(result['participants']), 2)
+        def wrong_peer(url, run_id, name, timeout):
+            value = wait(url, run_id, name, timeout)
+            value['contract'] = {}
+            return value
+        with self.assertRaises(ValueError):
+            p.sample_barrier(args, 'read', publish, wrong_peer)
+        def failed_peer(*unused):
+            raise RuntimeError('peer failed')
+        with self.assertRaises(RuntimeError):
+            p.sample_barrier(args, 'write', publish, failed_peer)
+        def duplicate_attempt(url, run_id, name, timeout):
+            value = wait(url, run_id, name, timeout)
+            value['bm_run_id'] = args.run_id
+            return value
+        with self.assertRaises(ValueError):
+            p.sample_barrier(args, 'write', publish, duplicate_attempt)
+        def timed_out(*unused):
+            raise TimeoutError('barrier timeout')
+        with self.assertRaises(TimeoutError):
+            p.sample_barrier(args, 'read', publish, timed_out)
+
     def test_host_g2g_sampling_parameters(self):
         import registered_host_rdma_probe as p
         base = ['--rank', '0', '--device', '0', '--store-url', 'tcp://127.0.0.1:19001',
@@ -34,6 +83,9 @@ class Checks(unittest.TestCase):
         self.assertEqual(len(result['samples']), 30)
         self.assertEqual(result['completed_bytes'], 33*64)
         self.assertTrue(result['passed'])
+        self.assertTrue(all(item['end_monotonic_ns'] >= item['start_monotonic_ns']
+                            for item in result['samples']))
+        self.assertTrue(result['clock_host_id'])
         returns = iter([0, 0, -2, 0])
         result = p.sample_sync_copy(lambda: next(returns), 1, 30, 64)
         self.assertFalse(result['passed'])

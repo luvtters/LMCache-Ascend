@@ -216,3 +216,46 @@ Sampling also explicitly accepts `--local-endpoint host --copy-interface g2g`
 for the verified registered HOST GVA route. It uses the identical timing loop
 and unchanged owner A/B full-content verification outside that loop. Sampling
 still rejects the original H2G/G2H interface and HAL DEVICE staging mode.
+
+## Optional independent-session write/read sampling barriers
+
+For a new explicitly paired attempt, start a separate `direct_coordination.py`
+HTTP server with a fresh global run-id, separate from either BM attempt and
+its normal owner/source coordination run. On each **source rank0** add:
+
+```text
+--sample-barrier-url http://137_COMMUNICATION_IP:GLOBAL_COORD_PORT
+--sample-barrier-run-id fresh-global-pair01
+--sample-barrier-participant A
+--sample-barrier-participants A,B
+```
+
+The other source uses participant B. Both retain distinct BM store/group
+processes, distinct BM run-ids, normal per-group coordination and explicitly
+assigned cards. Owner rank1 need not receive barrier flags. All four barrier
+options are required together; sampling must be enabled, participant IDs must
+be distinct and simple ASCII identifiers, and the global ID must differ from
+the local BM run-id. Default execution has no cross-session barrier.
+
+After source allocation/registration/initialization and owner-address readiness,
+source A/B publish immutable `sample-ready-write-A/B` metadata, validate both
+ready records, then enter their write warmup/measured loop. After each owner's
+full A verification and source overwrite, they independently rendezvous at
+`sample-ready-read-A/B` before their read loop. No KV bytes travel through this
+barrier. Each ready record includes exact payload/iteration/warmup/interface
+contract and source process identity; duplicate BM attempts/processes,
+conflicting events, participant disagreement, peer failure or timeout abort.
+Source errors also publish global failed-participant metadata so a peer waiting
+in the other phase can stop. Every wait shares one bounded phase deadline.
+All HTTP and validation occurs outside the timed copy loop.
+
+Each warmup and measured copy now records `start_monotonic_ns` and
+`end_monotonic_ns` as outer bounds around its `perf_counter_ns` API timing.
+The result carries `clock_host_id` (hostname plus boot ID where available) and
+start/end monotonic-to-Unix clock anchors. Compare intervals directly only
+when clock_host_id is identical. Anchors do not establish cross-host clock
+synchronization. The paired source processes on137 can therefore be audited
+for actual overlapping synchronous copy API intervals rather than mere process
+coexistence. Report observed overlap (or lack of overlap) from raw samples;
+the barrier itself does not prove overlap, physical DMA concurrency, TP2,
+aggregate throughput gain or model benefit.
