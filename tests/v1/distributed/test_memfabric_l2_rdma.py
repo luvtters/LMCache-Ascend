@@ -118,6 +118,7 @@ class CpuMemoryObjContracts(unittest.TestCase):
     def native_session(self):
         module, session, handle, bm = rdma_cpu.RdmaContracts.make_session(self)
         bm.BmCopyType.H2G, bm.BmCopyType.G2H = 5, 6
+        session._join_barrier_complete = True  # Fake native I/O unit boundary, not readiness proof.
         return module, session, handle
 
     def test_exact_range_registration_copy_unregister_then_release_real_lease(self):
@@ -206,7 +207,8 @@ class AdapterContracts(unittest.TestCase):
                       store_url="cpu-only")
         if rdma:
             params.update(data_op_type="DEVICE_RDMA", device_nic="tcp://127.0.0.1:10005",
-                          enable_56bits_gva=True)
+                          enable_56bits_gva=True, join_coord_url="http://127.0.0.1:29595",
+                          join_group_id="cpu-only-fresh")
         adapter = load_adapter(factory)(params)
         return adapter, sessions[0]
 
@@ -282,7 +284,8 @@ class AdapterContracts(unittest.TestCase):
             output = Path(directory) / "plan.json"
             with patch.dict("sys.modules", {"torch": None}), contextlib.redirect_stdout(io.StringIO()):
                 gate.main(["--store-url", "tcp://127.0.0.1:28580", "--device-nic",
-                    "tcp://127.0.0.1:10005", "--enable-56bits-gva", "--output", str(output)])
+                    "tcp://127.0.0.1:10005", "--enable-56bits-gva", "--join-coord-url",
+                    "http://127.0.0.1:29595", "--join-group-id", "fresh-plan", "--output", str(output)])
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "PLAN_ONLY")
             self.assertEqual(report["payload_bytes"], 18 << 20)

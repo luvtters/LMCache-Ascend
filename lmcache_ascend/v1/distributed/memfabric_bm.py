@@ -2,9 +2,12 @@
 """One fixed-membership BM session, owned by its calling thread."""
 
 import importlib.metadata
+import json
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
+import urllib.request
+import uuid
 
 from packaging.version import Version
 
@@ -18,7 +21,13 @@ class BMSession:
 
     def __init__(self, *, device_id, rank_id, world_size, pool_gb, store_url,
                  init_timeout=90, pool_memory_type="host", data_op_type="SDMA",
-                 device_nic=None, enable_56bits_gva=False):
+                 device_nic=None, enable_56bits_gva=False,
+                 join_coord_url=None, join_group_id=None):
+        if bool(join_coord_url) != bool(join_group_id):
+            raise ValueError("join_coord_url and join_group_id must be configured together")
+        if join_coord_url and (urlparse(join_coord_url).scheme not in ("http", "https")
+                or not urlparse(join_coord_url).netloc):
+            raise ValueError("join_coord_url requires an HTTP(S) endpoint")
         if data_op_type not in ("SDMA", "DEVICE_RDMA"):
             raise ValueError("data_op_type must be SDMA or DEVICE_RDMA")
         if type(enable_56bits_gva) is not bool:
@@ -50,6 +59,13 @@ class BMSession:
             BMSession._active = True
         self.thread_id = threading.get_ident()
         self.rank_id = rank_id
+        self.world_size = world_size
+        self._local_join_complete = threading.Event()
+        self._join_barrier_complete = False
+        self._join_nonce = uuid.uuid4().hex
+        self._join_contract = dict(world_size=world_size, store_url=store_url,
+            pool_gb=pool_gb, pool_memory_type=pool_memory_type,
+            data_op_type=data_op_type, enable_56bits_gva=enable_56bits_gva)
         self.device_id = device_id
         self.data_op_type = data_op_type
         self._registered_tensors = {}
@@ -119,6 +135,8 @@ class BMSession:
                 self.peer_departed.wait(0.1)
             if self.peer_departed.is_set():
                 raise RuntimeError("BM peer left while the fixed group was joining")
+            if join_coord_url:
+                self.wait_fixed_group_ready(join_coord_url, join_group_id, init_timeout)
         except BaseException:
             self.close()
             raise
@@ -138,6 +156,57 @@ class BMSession:
         if rank != self.rank_id and event == self.bm.BmGroupEvent.LEAVE_EVENT:
             self.departed_rank = rank
             self.peer_departed.set()
+        elif rank == self.rank_id and event == self.bm.BmGroupEvent.JOIN_EVENT:
+            # SDK JoinHandle emits this only after import, mmap and its final
+            # group-result barrier. Never count missing callbacks for old peers.
+            self._local_join_complete.set()
+
+    def wait_fixed_group_ready(self, coord_url, group_id, timeout):
+        """All ranks acknowledge their own after-mmap JOIN before any payload I/O."""
+        self._check_thread()
+        deadline = time.monotonic() + timeout
+        if not self._local_join_complete.wait(max(0, deadline - time.monotonic())):
+            raise TimeoutError("BM local after-mmap JOIN callback did not complete")
+        base = coord_url.rstrip("/") + "/runs/" + quote(group_id, safe="") + "/events"
+        name = "bm-joined-" + str(self.rank_id)
+        own = dict(name=name, rank=self.rank_id, nonce=self._join_nonce,
+                   contract=self._join_contract, protocol="bm-after-mmap-join-v1")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def request(url, data=None):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("BM fixed-group JOIN metadata barrier timed out")
+            req = urllib.request.Request(url, data=None if data is None else json.dumps(data).encode(),
+                headers={"Content-Type": "application/json"})
+            with opener.open(req, timeout=min(5, remaining)) as response:
+                return json.load(response)
+
+        request(base + "/" + name, own)
+        expected = {"bm-joined-" + str(rank) for rank in range(self.world_size)}
+        while True:
+            if self.peer_departed.is_set():
+                raise RuntimeError("BM peer left during JOIN metadata barrier")
+            events = request(base)["events"]
+            for key, value in events.items():
+                if not key.startswith("bm-joined-"):
+                    continue
+                if (key not in expected or value.get("name") != key
+                        or value.get("rank") != int(key.removeprefix("bm-joined-"))
+                        or value.get("protocol") != "bm-after-mmap-join-v1"
+                        or value.get("contract") != self._join_contract):
+                    raise ValueError("BM fixed-group JOIN metadata contract mismatch")
+            if expected <= events.keys():
+                if events[name] != own:
+                    raise ValueError("BM JOIN event belongs to another session")
+                self._join_barrier_complete = True
+                print(f"MEMFABRIC_JOIN_BARRIER_READY rank={self.rank_id} world_size={self.world_size} "
+                      f"group_id={group_id} contract=bm-after-mmap-join-v1", flush=True)
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("BM fixed-group JOIN metadata barrier timed out")
+            self.peer_departed.wait(min(0.02, remaining))
 
     def peer_address(self, rank):
         self._check_thread()
@@ -161,6 +230,8 @@ class BMSession:
             raise ValueError("Registered CPU MemoryObj copies require DEVICE_RDMA")
         if self.closed or self._completion_unknown:
             raise RuntimeError("BM session is closed or completion is unknown")
+        if not self._join_barrier_complete:
+            raise RuntimeError("RDMA CPU MemoryObj requires the fixed-group JOIN metadata barrier")
         raw = obj.raw_tensor
         pointer = obj.data_ptr
         if (raw is None or raw.device.type != "cpu" or not raw.is_contiguous()

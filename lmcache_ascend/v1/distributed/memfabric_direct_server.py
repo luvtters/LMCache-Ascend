@@ -35,7 +35,8 @@ class MemFabricDirectServerModule(DiscoverableModule):
                  quiesce_device_callbacks=None):
         fields = {"device_id", "rank_id", "world_size", "pool_gb", "slot_size_mb", "store_url"}
         if not fields <= set(config) or set(config) - fields - {
-                "init_timeout", "tp_size", "pool_memory_type", "data_op_type", "device_nic", "enable_56bits_gva"}:
+                "init_timeout", "tp_size", "pool_memory_type", "data_op_type", "device_nic", "enable_56bits_gva",
+                "join_coord_url", "join_group_id"}:
             raise ValueError("MemFabric direct config requires %s and optional init_timeout" % sorted(fields))
         init_timeout = config.get("init_timeout", 90)
         if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
@@ -80,7 +81,7 @@ class MemFabricDirectServerModule(DiscoverableModule):
             optional = {"init_timeout": config["init_timeout"]} if "init_timeout" in config else {}
             if "pool_memory_type" in config:
                 optional["pool_memory_type"] = config["pool_memory_type"]
-            for name in ("data_op_type", "device_nic", "enable_56bits_gva"):
+            for name in ("data_op_type", "device_nic", "enable_56bits_gva", "join_coord_url", "join_group_id"):
                 if name in config:
                     optional[name] = config[name]
             session = session_factory(device_id=config["device_id"],

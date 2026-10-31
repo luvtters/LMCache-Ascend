@@ -35,12 +35,16 @@ class _Entry:
 class MemFabricL2Adapter(L2AdapterInterface):
     def __init__(self, params, l1_memory_desc=None):
         allowed = {"device_id", "world_size", "pool_gb", "storage_rank",
-                   "slot_size_mb", "store_url", "data_op_type", "device_nic", "enable_56bits_gva"}
+                   "slot_size_mb", "store_url", "data_op_type", "device_nic", "enable_56bits_gva",
+                   "join_coord_url", "join_group_id"}
         if set(params) - allowed:
             raise ValueError(f"Unknown MemFabric options: {set(params) - allowed}")
         device = params.get("device_id", 0)
         self._data_op_type = params.get("data_op_type", "SDMA")
         self._enable_56bits_gva = params.get("enable_56bits_gva", False)
+        if self._data_op_type == "DEVICE_RDMA" and not (
+                params.get("join_coord_url") and params.get("join_group_id")):
+            raise ValueError("L2 DEVICE_RDMA requires explicit join_coord_url and fresh join_group_id")
         world = params.get("world_size", 1)
         pool_gb = params.get("pool_gb", 1)
         self.storage_rank = params.get("storage_rank", world - 1)
@@ -72,7 +76,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mf-bm")
         try:
             optional = {name: params[name] for name in (
-                "data_op_type", "device_nic", "enable_56bits_gva") if name in params}
+                "data_op_type", "device_nic", "enable_56bits_gva", "join_coord_url", "join_group_id") if name in params}
             self._session = self._executor.submit(
                 BMSession, device_id=device, rank_id=0, world_size=world,
                 pool_gb=pool_gb, store_url=params.get("store_url", "tcp://127.0.0.1:28580"), **optional

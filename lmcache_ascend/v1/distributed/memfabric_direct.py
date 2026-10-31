@@ -171,7 +171,8 @@ class MemFabricDirectTransferContext(TransferContext):
             raise ValueError("Direct chunk token count differs from adapter")
         required = {"device_id", "rank_id", "world_size", "pool_gb", "store_url"}
         if not required <= set(self.config) or set(self.config) - required - {
-                "init_timeout", "pool_memory_type", "data_op_type", "device_nic", "enable_56bits_gva"}:
+                "init_timeout", "pool_memory_type", "data_op_type", "device_nic", "enable_56bits_gva",
+                "join_coord_url", "join_group_id"}:
             raise ValueError(f"Direct BM config requires {sorted(required)} and optional init_timeout")
         init_timeout = self.config.get("init_timeout", 90)
         if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:

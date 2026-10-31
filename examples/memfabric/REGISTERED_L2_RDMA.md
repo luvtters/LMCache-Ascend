@@ -31,6 +31,42 @@ native registration and is reported explicitly with its exact size and return.
 
 ## Real allocator / 18 MiB L2 gate
 
+### Required startup synchronization after the first-device failure
+
+Frozen `e741c05` reached CPU registration before remote HOST import. The complete
+forward log's first native ERROR at 03:34:35.772916 was
+`Direction mismatch: specified=0 except:1`; remote rank 1 JoinHandle did not
+begin until 03:34:36.413553. In fixed SDK source,
+`hybm_data_op_entry.cpp:35-50` rejects that mask before entity CopyData;
+`hybm_va_manager.cpp:260-283` returns address mask 0 for reserved but unimported
+GVA. Thus the source was LOCAL_HOST while the destination GVA was not imported.
+This failure is earlier than a payload RDMA completion. Existing unknown-copy
+and lease retention remains conservative and unchanged.
+
+The follow-up requires `join_coord_url` and a fresh `join_group_id` for L2 RDMA.
+Every rank waits for its **own** JOIN callback, then publishes an immutable
+`bm-joined-<rank>` event and waits for all configured ranks. This does not count
+or assume replay of JOIN events for peers that were already present. SDK
+`smem_bm_entry.cpp:260-340` orders import, group-result barrier, mmap, another
+group-result barrier, then JOIN callback; `GroupOpBarrier:237-255` calls
+`GroupGatherResult`. The fixed-group contract requires all ranks to acknowledge
+their own completion on the fresh group before payload I/O. The two-rank CPU
+HTTP checks validate this control mechanism; new device acceptance is required.
+
+Do not substitute public rank/address queries for this barrier:
+`GetRankIdByGva:662-672` only computes a rank from reserved address geometry;
+remote HOST RDMA mmap records `{gva,0,0,...}` in
+`hybm_conn_based_segment.cpp:238`, so converting that remote address to LOCAL_HOST
+or LOCAL_DEVICE is not an available readiness test. `CanReachDataOperators:1302`
+reports the configured RDMA bit without checking import/connection completion.
+
+Start the existing CPU-only coordinator first, with a fresh directory/group:
+
+```sh
+python -u examples/memfabric/direct_coordination.py --bind 192.168.0.223 \
+  --port 29595 --directory /private/new-run/join --run-id l2-fresh-after-mmap
+```
+
 The new gate is PLAN_ONLY by default. With `--allow-npu`, it allocates two real
 MemoryObjs through `HostMemoryAllocator(use_paging=True)`, backed by
 `PagedTensorMemoryAllocator`. It records actual addresses, alignment, parent
@@ -55,7 +91,8 @@ export MF_HYBM_RDMA_SWAP_SPACE_SIZE=0
 python -u examples/memfabric/pool_member.py --device 0 --rank 1 --world-size 2 \
   --pool-gb 1 --store-url tcp://192.168.0.223:28731 \
   --data-op-type DEVICE_RDMA --device-nic tcp://127.0.0.1:10005 \
-  --enable-56bits-gva
+  --enable-56bits-gva --join-coord-url http://192.168.0.223:29595 \
+  --join-group-id l2-fresh-after-mmap
 ```
 
 L2 gate on rank 0, with a disjoint authorized physical NPU mapped as logical 0:
@@ -65,6 +102,7 @@ export MF_HYBM_RDMA_SWAP_SPACE_SIZE=0
 python -u examples/memfabric/l2_rdma_memoryobj_gate.py --device 0 \
   --store-url tcp://192.168.0.223:28731 --storage-rank 1 --world-size 2 \
   --device-nic tcp://127.0.0.1:10005 --enable-56bits-gva \
+  --join-coord-url http://192.168.0.223:29595 --join-group-id l2-fresh-after-mmap \
   --payload-bytes 18874368 --output /private/new-run/l2-memoryobj.json --allow-npu
 ```
 
@@ -89,7 +127,9 @@ The normal L2 plugin structure is unchanged. Its `adapter_params` may now includ
   "store_url": "tcp://192.168.0.223:28731",
   "data_op_type": "DEVICE_RDMA",
   "device_nic": "tcp://127.0.0.1:10005",
-  "enable_56bits_gva": true
+  "enable_56bits_gva": true,
+  "join_coord_url": "http://192.168.0.223:29595",
+  "join_group_id": "l2-fresh-after-mmap"
 }
 ```
 
@@ -110,7 +150,13 @@ These are fake native SDK / allocator control contracts. The real allocator
 gate, native registration on service arenas, NPU/RDMA transport, inference and
 performance remain NOT_VERIFIED by this local development task.
 
-Local results: 9 new L2 contracts, 10 existing RDMA contracts and 4 default BM
-contracts pass (23 total); changed Python files also compile and `git diff
+Local results: 9 new L2 contracts, 5 two-rank HTTP startup contracts,
+10 existing RDMA contracts and 4 default BM contracts pass (28 total);
+changed Python files also compile and `git diff
 --check` passes. No SSH, device initialization, installation or pushing was
 performed by this development task.
+
+The same BMSession constructor fields can be explicitly configured in a worker
+`lmcache.mp.direct` and its direct-service module config in this follow-up branch.
+That reuse does not modify the frozen `a9d30974` worker candidate or establish
+that candidate's prior startup safety or new device results.

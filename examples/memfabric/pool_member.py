@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--data-op-type", choices=("SDMA", "DEVICE_RDMA"), default="SDMA")
     parser.add_argument("--device-nic")
     parser.add_argument("--enable-56bits-gva", action="store_true")
+    parser.add_argument("--join-coord-url")
+    parser.add_argument("--join-group-id")
     args = parser.parse_args()
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -25,7 +27,8 @@ def main():
     session = BMSession(device_id=args.device, rank_id=args.rank,
                         world_size=args.world_size, pool_gb=args.pool_gb,
                         store_url=args.store_url, data_op_type=args.data_op_type,
-                        device_nic=args.device_nic, enable_56bits_gva=args.enable_56bits_gva)
+                        device_nic=args.device_nic, enable_56bits_gva=args.enable_56bits_gva,
+                        join_coord_url=args.join_coord_url, join_group_id=args.join_group_id)
 
     def on_member_event(rank, event):
         if rank == 0 and event == session.bm.BmGroupEvent.LEAVE_EVENT:

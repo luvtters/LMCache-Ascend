@@ -16,6 +16,8 @@ def parse_args(argv=None):
     parser.add_argument("--store-url", required=True)
     parser.add_argument("--device-nic", required=True)
     parser.add_argument("--enable-56bits-gva", action="store_true")
+    parser.add_argument("--join-coord-url", required=True)
+    parser.add_argument("--join-group-id", required=True)
     parser.add_argument("--payload-bytes", type=int, default=18 << 20)
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--output", type=Path, required=True)
@@ -114,7 +116,8 @@ def main(argv=None):
         adapter_params=dict(device_id=args.device, world_size=args.world_size,
             storage_rank=args.storage_rank, pool_gb=args.pool_gb, slot_size_mb=32,
             store_url=args.store_url, data_op_type="DEVICE_RDMA", device_nic=args.device_nic,
-            enable_56bits_gva=args.enable_56bits_gva))
+            enable_56bits_gva=args.enable_56bits_gva,
+            join_coord_url=args.join_coord_url, join_group_id=args.join_group_id))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", encoding="utf-8") as stream:
         json.dump(report, stream, indent=2)
