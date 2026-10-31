@@ -3,11 +3,27 @@
 import ctypes
 import contextlib
 import io
+import json
 import sys
 import unittest
 
 
 class Checks(unittest.TestCase):
+    def test_actual_event_emitter_tensor_metadata(self):
+        import registered_host_rdma_probe as p
+        args = p.arguments(['--rank', '0', '--device', '0', '--store-url',
+            'tcp://127.0.0.1:19001', '--coord-url', 'http://127.0.0.1:19002',
+            '--run-id', 'cpu-emitter', '--output', 'unused.json'])
+        events, stdout = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            p.emit_event(args, events, 'REAL_NPU_TENSORS', source_ptr=123,
+                         restore_ptr=456, tensor_device='npu:0', bytes=64)
+        record = json.loads(events.getvalue())
+        self.assertEqual(record['device'], 0)
+        self.assertEqual(record['tensor_device'], 'npu:0')
+        self.assertEqual(record['event'], 'REAL_NPU_TENSORS')
+        self.assertEqual(stdout.getvalue(), events.getvalue())
+
     def test_device_endpoint_plan_and_mapping(self):
         import registered_host_rdma_probe as p
         base = ['--rank', '0', '--device', '0', '--store-url', 'tcp://127.0.0.1:19001',

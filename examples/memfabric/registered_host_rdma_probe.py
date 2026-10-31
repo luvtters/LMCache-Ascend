@@ -250,7 +250,7 @@ def run(a, report, emit):
                 if tensor.device.type != 'npu' or not tensor.is_contiguous() or tensor.numel() != n:
                     raise ValueError('staging requires contiguous real NPU byte tensors')
             report['npu_tensors'] = dict(source_ptr=source_tensor.data_ptr(),
-                restore_ptr=restored_tensor.data_ptr(), device=str(source_tensor.device), bytes=n)
+                restore_ptr=restored_tensor.data_ptr(), tensor_device=str(source_tensor.device), bytes=n)
             emit('REAL_NPU_TENSORS', **report['npu_tensors'])
 
         def stage_to_pool(tensor, target_gva, step):
@@ -354,6 +354,15 @@ def run(a, report, emit):
         raise RuntimeError('SDK cleanup failed')
 
 
+def emit_event(a, events, event, **data):
+    line = json.dumps(dict(event=event, unix_ns=time.time_ns(), mono_ns=time.monotonic_ns(),
+        pid=os.getpid(), hostname=socket.gethostname(), rank=a.rank, device=a.device,
+        run_id=a.run_id, **data), sort_keys=True)
+    events.write(line + '\n')
+    events.flush()
+    print(line, flush=True)
+
+
 def main(argv=None):
     a = arguments(argv)
     report = build_plan(a)
@@ -365,12 +374,7 @@ def main(argv=None):
         return
     with a.output.with_suffix(a.output.suffix + '.events.jsonl').open('x', encoding='utf-8') as events:
         def emit(event, **data):
-            line = json.dumps(dict(event=event, unix_ns=time.time_ns(), mono_ns=time.monotonic_ns(),
-                pid=os.getpid(), hostname=socket.gethostname(), rank=a.rank, device=a.device,
-                run_id=a.run_id, **data), sort_keys=True)
-            events.write(line + '\n')
-            events.flush()
-            print(line, flush=True)
+            emit_event(a, events, event, **data)
         report.update(status='RUNNING', payload_passed=False,
                       completed_write_bytes=0, completed_read_bytes=0)
         try:
