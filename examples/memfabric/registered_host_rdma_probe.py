@@ -47,8 +47,9 @@ def arguments(argv=None):
         p.error('torch-registered local endpoint requires --copy-interface l2g-g2l and vice versa')
     if not 0 <= a.benchmark_iterations <= 10000 or not 0 <= a.benchmark_warmup <= 1000:
         p.error('benchmark iterations must be 0..10000 and warmup 0..1000')
-    if a.benchmark_iterations and a.local_endpoint != 'torch-registered':
-        p.error('benchmark requires --local-endpoint torch-registered')
+    if a.benchmark_iterations and (a.local_endpoint, a.copy_interface) not in (
+            ('torch-registered', 'l2g-g2l'), ('host', 'g2g')):
+        p.error('benchmark requires torch-registered/l2g-g2l or host/g2g')
     if not 0 < a.payload_bytes <= MAX_PAYLOAD or a.payload_bytes % 32:
         p.error('payload-bytes must be a positive multiple of 32, at most 64 MiB')
     if a.device < 0 or a.timeout <= 0 or a.init_timeout <= 0:

@@ -211,3 +211,8 @@ bytes still describe the final single payload verified by owner. Preserve raw
 per-call samples; compare only paired same-host/cross-host groups at equal
 size and conditions. These are synchronous primitive API timings, not model
 TTFT, throughput, or production-adapter results.
+
+Sampling also explicitly accepts `--local-endpoint host --copy-interface g2g`
+for the verified registered HOST GVA route. It uses the identical timing loop
+and unchanged owner A/B full-content verification outside that loop. Sampling
+still rejects the original H2G/G2H interface and HAL DEVICE staging mode.

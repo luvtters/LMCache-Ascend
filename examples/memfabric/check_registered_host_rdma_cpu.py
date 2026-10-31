@@ -9,6 +9,19 @@ import unittest
 
 
 class Checks(unittest.TestCase):
+    def test_host_g2g_sampling_parameters(self):
+        import registered_host_rdma_probe as p
+        base = ['--rank', '0', '--device', '0', '--store-url', 'tcp://127.0.0.1:19001',
+            '--coord-url', 'http://127.0.0.1:19002', '--run-id', 'cpu-host-bench',
+            '--output', 'unused.json', '--benchmark-iterations', '30', '--benchmark-warmup', '3']
+        args = p.arguments(base + ['--local-endpoint', 'host', '--copy-interface', 'g2g'])
+        self.assertEqual(args.benchmark_iterations, 30)
+        self.assertEqual(p.build_plan(args)['local_endpoint'], 'host')
+        for extra in (['--local-endpoint', 'host', '--copy-interface', 'h2g-g2h'],
+                      ['--local-endpoint', 'device', '--copy-interface', 'g2g']):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                p.arguments(base + extra)
+
     def test_sync_sampling_counts_and_failure_truncation(self):
         import registered_host_rdma_probe as p
         calls = []
