@@ -8,6 +8,19 @@ import unittest
 
 
 class Checks(unittest.TestCase):
+    def test_registered_gva_copy_interface(self):
+        import registered_host_rdma_probe as p
+        # Both endpoints are managed HOST GVAs; no HVA is passed as a DEVICE pointer.
+        own, remote, hva, restore, size = 0x100000000000000, 0x100000040000000, 0x12c1c0000000, 0x12c1c0200000, 1 << 20
+        push = p.copy_request('g2g', 'write', own, remote, hva, restore, size)
+        pull = p.copy_request('g2g', 'read', own, remote, hva, restore, size)
+        self.assertEqual(push, (own, remote, 'G2G'))
+        self.assertEqual(pull, (remote, own + 2*size, 'G2G'))
+        self.assertEqual(p.copy_request('h2g-g2h', 'write', own, remote, hva, restore, size),
+                         (hva, remote, 'H2G'))
+        self.assertEqual(p.copy_request('h2g-g2h', 'read', own, remote, hva, restore, size),
+                         (remote, restore, 'G2H'))
+
     def test_invalid_parameters(self):
         import registered_host_rdma_probe as p
         base = ['--rank', '0', '--device', '0', '--store-url', 'tcp://127.0.0.1:19001',

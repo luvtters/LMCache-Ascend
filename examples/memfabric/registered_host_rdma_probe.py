@@ -26,6 +26,8 @@ def arguments(argv=None):
     p.add_argument('--payload-bytes', type=int, default=1 << 20)
     p.add_argument('--device-nic', default='tcp://127.0.0.1:10005')
     p.add_argument('--enable-56bits-gva', action='store_true')
+    p.add_argument('--copy-interface', choices=('h2g-g2h', 'g2g'), default='h2g-g2h',
+                   help='g2g uses managed HOST GVAs at both endpoints; local CPU access still uses HVA')
     p.add_argument('--store-url', required=True)
     p.add_argument('--coord-url', required=True)
     p.add_argument('--run-id', required=True)
@@ -55,6 +57,7 @@ def build_plan(a):
     return dict(status='PLAN_ONLY', rank=a.rank, world_size=2, device=a.device,
         run_id=a.run_id, store_url=a.store_url, coord_url=a.coord_url,
         payload_bytes=a.payload_bytes, source_offset=0, restore_offset=2*a.payload_bytes,
+        copy_interface=a.copy_interface,
         data_op_type='DEVICE_RDMA', device_nic=a.device_nic,
         swap_space_size='0', fallback_allowed=False, payload_via_rpc=False,
         create2=dict(id=0, local_dram_size=POOL_BYTES, max_dram_size=POOL_BYTES,
@@ -64,6 +67,16 @@ def build_plan(a):
         completion_basis='synchronous copy return + full owner/reader contents + external process wait',
         scope='independent_registered_HOST_DEVICE_RDMA_primitive_not_SDMA_or_LMCache',
         actual_transport='NOT_VERIFIED_READ_NATIVE_LOG')
+
+
+def copy_request(interface, direction, own_gva, remote, hva, restore_hva, size):
+    if direction not in ('write', 'read') or interface not in ('h2g-g2h', 'g2g'):
+        raise ValueError('unsupported copy interface or direction')
+    if interface == 'g2g':
+        return ((own_gva, remote, 'G2G') if direction == 'write' else
+                (remote, own_gva + 2*size, 'G2G'))
+    return ((hva, remote, 'H2G') if direction == 'write' else
+            (remote, restore_hva, 'G2H'))
 
 
 def pattern(size, label):
@@ -142,7 +155,7 @@ def run(a, report, emit):
     error = error_tb = None
     n = a.payload_bytes
     contract = {k: report[k] for k in ('world_size', 'store_url', 'payload_bytes',
-        'device_nic', 'create2', 'source_offset', 'restore_offset', 'swap_space_size')}
+        'device_nic', 'create2', 'source_offset', 'restore_offset', 'swap_space_size', 'copy_interface')}
 
     def mark(name, **data):
         publish(a.coord_url, a.run_id, name, dict(name=name, rank=a.rank,
@@ -206,8 +219,9 @@ def run(a, report, emit):
         if peer.get('owner_gva') != remote or peer.get('pool_size') != pool_size:
             raise ValueError('owner address or pool size mismatch')
         if a.rank == 0:
-            call_step('H2G_A', lambda: handle.copy_data(hva, remote, n, bm.BmCopyType.H2G, 0),
-                      emit, requested_bytes=n, src=hva, dst=remote, flags=0)
+            src, dst, copy_type = copy_request(a.copy_interface, 'write', own_gva, remote, hva, restore, n)
+            call_step(copy_type + '_WRITE_A', lambda: handle.copy_data(src, dst, n, getattr(bm.BmCopyType, copy_type), 0),
+                      emit, requested_bytes=n, src=src, dst=dst, flags=0, copy_interface=a.copy_interface)
             report['completed_write_bytes'] = n
             mark('push-complete', completed_bytes=n)
             owner = wait('owner-verified-A')
@@ -220,8 +234,9 @@ def run(a, report, emit):
                     mark('request-owner-B')
                     wait('owner-wrote-B')
                     write_local(restore, bytes([90])*n)
-                call_step('G2H_' + label, lambda: handle.copy_data(remote, restore, n, bm.BmCopyType.G2H, 0),
-                          emit, requested_bytes=n, src=remote, dst=restore, flags=0)
+                src, dst, copy_type = copy_request(a.copy_interface, 'read', own_gva, remote, hva, restore, n)
+                call_step(copy_type + '_READ_' + label, lambda: handle.copy_data(src, dst, n, getattr(bm.BmCopyType, copy_type), 0),
+                          emit, requested_bytes=n, src=src, dst=dst, flags=0, copy_interface=a.copy_interface)
                 report['completed_read_bytes'] += n
                 verify(restore, label, 'reader_' + label)
             mark('reader-verified-B', verified_bytes=n, equal=True)

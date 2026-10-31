@@ -84,3 +84,33 @@ Linux live maps behavior or NPU/RDMA success. NPU initialization, HOST/HVA
 mapping, actual registration and transport, full cross-host data completion,
 native exit and device release remain **NOT_VERIFIED** until a separate
 authorized run supplies the raw evidence.
+
+## Explicit managed-GVA interface after D3 direction rejection
+
+The D3 run registered HOST MR and produced valid CPU HVA mappings, but failed
+before transport dispatch: `hybm_data_op_entry.cpp:49` reported
+`Direction mismatch: specified=0 except:36`. Completed payload bytes were zero.
+This is an interface/address-classification failure, not evidence that RDMA
+payload transfer failed or succeeded.
+
+On this A3 run the allocator's HVA `0x12c1c0000000` lies inside the SDK's
+static device VA interval. `ClassifyAddressMask` falls through to
+`GetLocalMemoryType` for the HVA and returns LOCAL_DEVICE (mask 4); the remote
+HOST GVA returns GLOBAL_HOST (mask 2), producing `4 | (2 << 4) = 36`.
+H2G requires LOCAL_HOST (mask 1), so it is rejected. Selecting L2G or AUTO
+would preserve that incorrect device classification and is not the fix.
+
+For a separate attempt add **`--copy-interface g2g` to both ranks**. The public
+G2G API takes the local managed HOST GVA and remote HOST GVA for the write,
+and remote HOST GVA and local restore HOST GVA for reads. `SmemBmEntry` derives
+HOST-to-HOST direction 4 from both managed GVAs. `DataOpDeviceRDMA::TransformVa`
+then converts the local GVA to the original registered HOST HVA and retains
+the remote GVA. CPU initialization and full-byte checks continue to use only
+validated HVA ranges; the RDMA backend, HOST pool and swap=0 remain fixed.
+
+The original `h2g-g2h` interface remains the default for a direct comparison.
+The selected interface is recorded and must match across ranks. Source basis:
+`smem_bm_entry.cpp:590-621`, `hybm_data_op_entry.cpp:35-51`,
+`hybm_va_manager.cpp:233-293`, `hybm_data_op_device_rdma.cpp:115-133,379-398`.
+The CPU request checks verify exact GVA source/destination selection; they do
+not prove that the device run passes direction checking or RDMA completion.
