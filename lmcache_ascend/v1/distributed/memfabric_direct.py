@@ -170,7 +170,8 @@ class MemFabricDirectTransferContext(TransferContext):
         if lmcache_chunk_tokens not in (None, self.tokens_per_chunk):
             raise ValueError("Direct chunk token count differs from adapter")
         required = {"device_id", "rank_id", "world_size", "pool_gb", "store_url"}
-        if not required <= set(self.config) or set(self.config) - required - {"init_timeout", "pool_memory_type"}:
+        if not required <= set(self.config) or set(self.config) - required - {
+                "init_timeout", "pool_memory_type", "data_op_type", "device_nic", "enable_56bits_gva"}:
             raise ValueError(f"Direct BM config requires {sorted(required)} and optional init_timeout")
         init_timeout = self.config.get("init_timeout", 90)
         if type(init_timeout) is not int or not 1 <= init_timeout <= 3600:
@@ -196,6 +197,9 @@ class MemFabricDirectTransferContext(TransferContext):
         self.model_name = model_name
         self.session = self._session_factory(**self.config)
         try:
+            if self.config.get("data_op_type", "SDMA") == "DEVICE_RDMA":
+                self.transfer.synchronize()
+                self.session.register_npu_tensor(self.transfer.buffer)
             registration = {
                 "rank": self.config["rank_id"], "member_id": self.member_id,
                 "shard": self.shard, "tp_size": self.tp_size,
