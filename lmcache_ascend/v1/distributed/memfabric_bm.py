@@ -69,6 +69,8 @@ class BMSession:
         self.device_id = device_id
         self.data_op_type = data_op_type
         self._registered_cpu_objects = {}
+        self._cpu_arena = None
+        self._cpu_arena_registered = False
         self._completion_unknown = False
         self.pool_memory_type = pool_memory_type
         # The first device-pool candidate deliberately preserves the 1 GiB
@@ -221,8 +223,26 @@ class BMSession:
         self._copy(src, dst, size, self.bm.BmCopyType.H2G if store
                    else self.bm.BmCopyType.G2H)
 
+    def set_cpu_registration_arena(self, pointer, size):
+        """Configure an allocator-owned stable prefix; register on first use.
+
+        L1 must outlive this session. Core closes L2 adapters before L1, and
+        propagates close failures instead of freeing registered backing. Defer
+        the native registration until a real object lease can be retained on
+        error, after construction of the storage manager has completed.
+        """
+        self._check_thread()
+        if self.data_op_type != "DEVICE_RDMA" or self.closed or self._completion_unknown:
+            raise RuntimeError("CPU arena registration requires a healthy DEVICE_RDMA session")
+        if self._cpu_arena is not None or self._registered_cpu_objects:
+            raise RuntimeError("CPU registration arena must be configured once before I/O")
+        if (type(pointer) is not int or type(size) is not int or pointer <= 0
+                or size <= 0 or pointer % 4096 or size % 4096):
+            raise ValueError("CPU registration arena requires exact page-aligned bounds")
+        self._cpu_arena = (pointer, size)
+
     def copy_cpu_object(self, obj, address, size, *, store):
-        """Register exactly one CPU MemoryObj while holding its allocator lease."""
+        """Copy under an object lease, reusing an explicitly configured arena."""
         self._check_thread()
         if self.data_op_type != "DEVICE_RDMA":
             raise ValueError("Registered CPU MemoryObj copies require DEVICE_RDMA")
@@ -241,21 +261,35 @@ class BMSession:
                              f"pointer={pointer:#x} modulo4096={pointer % 4096} bytes={size}")
         if pointer in self._registered_cpu_objects:
             raise RuntimeError("CPU MemoryObj is already registered")
+        in_arena = False
+        if self._cpu_arena is not None:
+            base, arena_size = self._cpu_arena
+            in_arena = base <= pointer and pointer + size <= base + arena_size
+            if not in_arena and pointer < base + arena_size and base < pointer + size:
+                raise ValueError("CPU MemoryObj straddles the registered arena boundary")
         obj.ref_count_up()
         # A Tensor reference alone does not stop LMCache recycling this slice.
         self._registered_cpu_objects[pointer] = (obj, raw, size)
         try:
-            self.check(self.handle.register(pointer, size),
-                       f"BM register CPU MemoryObj bytes={size} modulo4096={pointer % 4096}")
+            if in_arena:
+                if not self._cpu_arena_registered:
+                    self.check(self.handle.register(*self._cpu_arena),
+                               f"BM register CPU L1 arena bytes={self._cpu_arena[1]}")
+                    self._cpu_arena_registered = True
+            else:
+                self.check(self.handle.register(pointer, size),
+                           f"BM register CPU MemoryObj bytes={size} modulo4096={pointer % 4096}")
             src, dst = (pointer, address) if store else (address, pointer)
             self._copy(src, dst, size, self.bm.BmCopyType.H2G if store else self.bm.BmCopyType.G2H)
-            self.check(self.handle.unregister(pointer), "BM unregister CPU MemoryObj")
+            if not in_arena:
+                self.check(self.handle.unregister(pointer), "BM unregister CPU MemoryObj")
         except BaseException:
             self._retain_unknown_completion()
             raise
         # Only successful synchronous copy AND unregister permit allocator reuse.
         obj.ref_count_down()
         del self._registered_cpu_objects[pointer]
+        return "l1_arena" if in_arena else "per_object"
 
 
 
@@ -302,6 +336,10 @@ class BMSession:
         try:
             if self.handle is not None:
                 self.wait()
+                if self._cpu_arena_registered:
+                    self.check(self.handle.unregister(self._cpu_arena[0]),
+                               "BM unregister CPU L1 arena")
+                    self._cpu_arena_registered = False
                 if self.joined:
                     self.check(self.handle.leave(), "BM leave")
                 self.handle.destroy()

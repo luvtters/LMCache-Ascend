@@ -36,11 +36,25 @@ class MemFabricL2Adapter(L2AdapterInterface):
     def __init__(self, params, l1_memory_desc=None):
         allowed = {"device_id", "world_size", "pool_gb", "storage_rank",
                    "slot_size_mb", "store_url", "data_op_type", "device_nic", "enable_56bits_gva",
-                   "join_coord_url", "join_group_id"}
+                   "join_coord_url", "join_group_id", "register_l1_arena"}
         if set(params) - allowed:
             raise ValueError(f"Unknown MemFabric options: {set(params) - allowed}")
         device = params.get("device_id", 0)
         self._data_op_type = params.get("data_op_type", "SDMA")
+        self._register_l1_arena = params.get("register_l1_arena", False)
+        if type(self._register_l1_arena) is not bool:
+            raise ValueError("register_l1_arena must be a bool")
+        self._registration_arena_bytes = 0
+        if self._register_l1_arena:
+            stable_size = getattr(l1_memory_desc, "stable_host_registration_size", None)
+            pointer = getattr(l1_memory_desc, "ptr", None)
+            capacity = getattr(l1_memory_desc, "size", None)
+            if (self._data_op_type != "DEVICE_RDMA"
+                    or type(pointer) is not int or type(stable_size) is not int
+                    or type(capacity) is not int or pointer <= 0 or pointer % 4096
+                    or stable_size <= 0 or stable_size % 4096 or stable_size > capacity):
+                raise ValueError("register_l1_arena requires DEVICE_RDMA and an exact stable host L1 prefix")
+            self._registration_arena_bytes = stable_size
         self._enable_56bits_gva = params.get("enable_56bits_gva", False)
         if self._data_op_type == "DEVICE_RDMA" and not (
                 params.get("join_coord_url") and params.get("join_group_id")):
@@ -84,6 +98,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
             self._base = self._executor.submit(
                 self._session.peer_address, self.storage_rank
             ).result()
+            if self._register_l1_arena:
+                self._executor.submit(self._session.set_cpu_registration_arena,
+                                      pointer, stable_size).result()
         except BaseException:
             if hasattr(self, "_session"):
                 self._executor.submit(self._session.close).result()
@@ -107,6 +124,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
         with self._task_lock:
             if self._closed:
                 raise RuntimeError("MemFabric adapter is closed")
+            if self._poisoned:
+                raise RuntimeError(self._last_error or "BM is unavailable")
             tid = self._next_id
             self._next_id += 1
             future = self._executor.submit(operation, *args)
@@ -164,6 +183,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
         with self._task_lock:
             if self._closed:
                 raise RuntimeError("MemFabric adapter is closed")
+            if self._poisoned:
+                raise RuntimeError(self._last_error or "BM is unavailable")
             self._executor.submit(operation, list(keys))
 
     def submit_unlock(self, keys):
@@ -205,7 +226,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
             try:
                 logger.info("MEMFABRIC_CPU_REGISTER pointer=%#x modulo4096=%d bytes=%d direction=%s",
                             obj.data_ptr, obj.data_ptr % 4096, size, "H2G" if store else "G2H")
-                self._session.copy_cpu_object(obj, address, size, store=store)
+                registration = self._session.copy_cpu_object(obj, address, size, store=store)
+                logger.info("MEMFABRIC_CPU_COPY registration=%s bytes=%d direction=%s",
+                            registration, size, "H2G" if store else "G2H")
             except BaseException as exc:
                 self._poisoned = True
                 self._last_error = str(exc)
@@ -313,6 +336,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
 
     def _unlock(self, keys):
         with self._state_lock:
+            if self._poisoned:
+                raise RuntimeError(self._last_error or "BM is unavailable")
             for key in keys:
                 entry = self._entries.get(key)
                 if entry is not None and entry.pins:
@@ -322,6 +347,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
 
     def _delete(self, keys):
         with self._state_lock:
+            if self._poisoned:
+                raise RuntimeError(self._last_error or "BM is unavailable")
             for key in keys:
                 entry = self._entries.get(key)
                 if entry is not None:
@@ -346,6 +373,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
             self._observe_peer_departure()
             return {"is_healthy": not self._closed and not self._poisoned,
                     "protocol": self._data_op_type, "enable_56bits_gva": self._enable_56bits_gva,
+                    "register_l1_arena": self._register_l1_arena,
+                    "registration_arena_bytes": self._registration_arena_bytes,
                     "pool_memory_type": "host", "storage_rank": self.storage_rank,
                     "objects": len(self._entries), "free_slots": len(self._free),
                     "locked_objects": sum(e.pins > 0 for e in self._entries.values()),

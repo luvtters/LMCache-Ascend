@@ -67,6 +67,10 @@ class Session:
     def peer_address(self, rank):
         return 1 << 30
 
+    def set_cpu_registration_arena(self, pointer, size):
+        assert self.owner == threading.get_ident()
+        self.arena = (pointer, size)
+
     def copy_cpu_object(self, obj, address, size, *, store):
         assert self.owner == threading.get_ident()
         self.operations.append("registered_cpu")
@@ -197,8 +201,91 @@ class CpuMemoryObjContracts(unittest.TestCase):
         handle.copy_data.assert_not_called()
         self.assertEqual(obj.refs, 2)
 
+    def test_arena_reuses_registration_and_unregisters_once_before_leave(self):
+        _, session, handle = self.native_session()
+        size = 18 << 20
+        session.set_cpu_registration_arena(4096, size * 2)
+        first, second = MemoryObj(), MemoryObj(pointer=4096 + size)
+        for obj, store in ((first, True), (second, False), (first, False)):
+            self.assertEqual(session.copy_cpu_object(obj, 1 << 30, size, store=store), "l1_arena")
+            self.assertEqual(obj.refs, 1)
+        handle.register.assert_called_once_with(4096, size * 2)
+        handle.unregister.assert_not_called()
+        session.close()
+        handle.unregister.assert_called_once_with(4096)
+        calls = [c[0] for c in handle.method_calls]
+        self.assertLess(calls.index("unregister"), calls.index("leave"))
+
+    def test_arena_does_not_cover_outside_or_partial_objects(self):
+        _, session, handle = self.native_session()
+        session.set_cpu_registration_arena(4096, 18 << 20)
+        outside = MemoryObj(pointer=4096 + (36 << 20))
+        self.assertEqual(session.copy_cpu_object(outside, 1 << 30, outside.size, store=True), "per_object")
+        handle.register.assert_called_once_with(outside.data_ptr, outside.size)
+        handle.unregister.assert_called_once_with(outside.data_ptr)
+        crossing = MemoryObj(pointer=8192)
+        with self.assertRaisesRegex(ValueError, "straddles"):
+            session.copy_cpu_object(crossing, 1 << 30, crossing.size, store=True)
+        self.assertEqual(crossing.refs, 1)
+        session.close()
+
+    def test_arena_unknown_completion_keeps_lease_and_prevents_unregister(self):
+        for stage in ("register", "copy_data"):
+            with self.subTest(stage=stage):
+                module, session, handle = self.native_session()
+                session.set_cpu_registration_arena(4096, 18 << 20)
+                obj = MemoryObj()
+                getattr(handle, stage).return_value = -1
+                with self.assertRaises(RuntimeError):
+                    session.copy_cpu_object(obj, 1 << 30, obj.size, store=True)
+                self.assertEqual(obj.refs, 2)
+                with self.assertRaisesRegex(RuntimeError, "completion unknown"):
+                    session.close()
+                handle.unregister.assert_not_called()
+                self.assertIn(session, module.BMSession._uncertain_sessions)
+
+    def test_arena_unregister_failure_prevents_session_destruction(self):
+        _, session, handle = self.native_session()
+        session.set_cpu_registration_arena(4096, 18 << 20)
+        obj = MemoryObj()
+        session.copy_cpu_object(obj, 1 << 30, obj.size, store=True)
+        handle.unregister.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, "unregister CPU L1 arena"):
+            session.close()
+        handle.leave.assert_not_called()
+        handle.destroy.assert_not_called()
+
 
 class AdapterContracts(unittest.TestCase):
+    def test_arena_requires_explicit_host_descriptor_before_sdk_start(self):
+        factory = MagicMock()
+        adapter_type = load_adapter(factory)
+        params = dict(data_op_type="DEVICE_RDMA", register_l1_arena=True)
+        for desc in (None, SimpleNamespace(ptr=4096, size=1 << 30,
+                                          stable_registration_size=1 << 30),
+                     SimpleNamespace(ptr=4096, size=4096,
+                                     stable_host_registration_size=8192)):
+            with self.subTest(desc=desc), self.assertRaises(ValueError):
+                adapter_type(params, desc)
+        factory.assert_not_called()
+
+    def test_explicit_arena_configuration_runs_on_session_owner(self):
+        sessions = []
+        def factory(**kwargs):
+            sessions.append(Session(**kwargs))
+            return sessions[-1]
+        params = dict(data_op_type="DEVICE_RDMA", register_l1_arena=True,
+                      join_coord_url="http://127.0.0.1:29595", join_group_id="cpu-only")
+        desc = SimpleNamespace(ptr=4096, size=1 << 30,
+                               stable_registration_size=None,
+                               stable_host_registration_size=18 << 20)
+        adapter = load_adapter(factory)(params, desc)
+        try:
+            self.assertEqual(sessions[0].arena, (4096, 18 << 20))
+            self.assertEqual(adapter.report_status()["registration_arena_bytes"], 18 << 20)
+        finally:
+            adapter.close()
+
     def adapter(self, rdma=True):
         sessions = []
         def factory(**kwargs):
@@ -304,6 +391,13 @@ class AdapterContracts(unittest.TestCase):
                 status = adapter.report_status()
                 self.assertFalse(status["is_healthy"])
                 self.assertEqual(status["last_error"], "native close completion unknown")
+                for action in (lambda: adapter.submit_unlock(["a"]),
+                               lambda: adapter.delete(["a"]),
+                               lambda: adapter.submit_store_task(["a"], [MemoryObj()]),
+                               lambda: adapter._executor.submit(adapter._unlock, ["a"]).result(),
+                               lambda: adapter._executor.submit(adapter._delete, ["a"]).result()):
+                    with self.assertRaisesRegex(RuntimeError, "native close completion unknown"):
+                        action()
         finally:
             session.close = original_close
             adapter.close()
