@@ -244,6 +244,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     self._notify_keys_stored([key], [size])
                     total += size
                     self._written_bytes += size
+                    logger.debug("MEMFABRIC_L2_OBJECT_COMPLETE direction=STORE key=%r bytes=%d", key, size)
                 logger.info("MEMFABRIC_STORE keys=%d bytes=%d rank=%d",
                             len(keys), total, self.storage_rank)
                 return L2StoreResult(True, total)
@@ -300,6 +301,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     found.set(i)
                     total += size
                     self._read_bytes += size
+                    logger.debug("MEMFABRIC_L2_OBJECT_COMPLETE direction=LOAD key=%r bytes=%d", key, size)
                 except Exception as exc:
                     self._last_error = str(exc)
                     logger.exception("MemFabric load failed")
