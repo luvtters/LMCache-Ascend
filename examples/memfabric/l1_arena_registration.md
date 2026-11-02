@@ -26,3 +26,19 @@ Registration is deferred until first real I/O, so its cost must be reported
 as first-use setup rather than silently removed from request latency. Runtime
 validation of the actual SHM backing, cross-host content, KV source, bytes,
 process exits, and performance is required separately from CPU contract tests.
+
+`l1_registration_chunk_mb: 32` optionally registers only touched fixed 32 MiB
+regions within the stable prefix. Its default `0` keeps whole-arena behavior.
+An object can span regions: register all its missing regions, then split the
+synchronous copy at local registration boundaries with continuous pool offsets.
+This avoids assuming the provider combines distinct registrations into one MR.
+The final region is clipped to the allocator's actual stable prefix. Regions
+remain registered until normal close, so allocator reuse inside that stable
+backing can reuse registration; no extra object references are held after a
+successful copy. A partial registration/copy failure retains the entire object
+lease and every established region and blocks further reuse or cleanup.
+
+The motivation is a measured cold-start cost: registering a 2 GiB arena took
+about one second even for a 180 MiB request. The segmented option reduces
+unused upfront registration, but its cold-request and repeated-request results
+must be measured independently; it does not guarantee a transport speedup.

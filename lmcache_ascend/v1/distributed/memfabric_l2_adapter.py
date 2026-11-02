@@ -37,7 +37,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
     def __init__(self, params, l1_memory_desc=None):
         allowed = {"device_id", "world_size", "pool_gb", "storage_rank",
                    "slot_size_mb", "store_url", "data_op_type", "device_nic", "enable_56bits_gva",
-                   "join_coord_url", "join_group_id", "register_l1_arena"}
+                   "join_coord_url", "join_group_id", "register_l1_arena", "l1_registration_chunk_mb"}
         if set(params) - allowed:
             raise ValueError(f"Unknown MemFabric options: {set(params) - allowed}")
         device = params.get("device_id", 0)
@@ -45,6 +45,10 @@ class MemFabricL2Adapter(L2AdapterInterface):
         self._register_l1_arena = params.get("register_l1_arena", False)
         if type(self._register_l1_arena) is not bool:
             raise ValueError("register_l1_arena must be a bool")
+        chunk_mb = params.get("l1_registration_chunk_mb", 0)
+        if type(chunk_mb) is not int or chunk_mb < 0 or (chunk_mb and not self._register_l1_arena):
+            raise ValueError("l1_registration_chunk_mb requires a nonnegative integer and register_l1_arena")
+        self._registration_chunk_bytes = chunk_mb << 20
         self._registration_arena_bytes = 0
         if self._register_l1_arena:
             stable_size = getattr(l1_memory_desc, "stable_host_registration_size", None)
@@ -101,7 +105,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
             ).result()
             if self._register_l1_arena:
                 self._executor.submit(self._session.set_cpu_registration_arena,
-                                      pointer, stable_size).result()
+                                      pointer, stable_size, self._registration_chunk_bytes).result()
         except BaseException:
             if hasattr(self, "_session"):
                 self._executor.submit(self._session.close).result()
@@ -378,6 +382,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     "protocol": self._data_op_type, "enable_56bits_gva": self._enable_56bits_gva,
                     "register_l1_arena": self._register_l1_arena,
                     "registration_arena_bytes": self._registration_arena_bytes,
+                    "registration_chunk_bytes": self._registration_chunk_bytes,
+                    "registered_l1_bytes": sum(getattr(self._session, "_cpu_arena_ranges", {}).values()),
+                    "registered_l1_regions": len(getattr(self._session, "_cpu_arena_ranges", {})),
                     "pool_memory_type": "host", "storage_rank": self.storage_rank,
                     "objects": len(self._entries), "free_slots": len(self._free),
                     "locked_objects": sum(e.pins > 0 for e in self._entries.values()),

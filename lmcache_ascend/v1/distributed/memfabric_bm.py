@@ -71,6 +71,8 @@ class BMSession:
         self._registered_cpu_objects = {}
         self._cpu_arena = None
         self._cpu_arena_registered = False
+        self._cpu_arena_chunk_bytes = 0
+        self._cpu_arena_ranges = {}
         self._completion_unknown = False
         self.pool_memory_type = pool_memory_type
         # The first device-pool candidate deliberately preserves the 1 GiB
@@ -223,7 +225,7 @@ class BMSession:
         self._copy(src, dst, size, self.bm.BmCopyType.H2G if store
                    else self.bm.BmCopyType.G2H)
 
-    def set_cpu_registration_arena(self, pointer, size):
+    def set_cpu_registration_arena(self, pointer, size, chunk_size=0):
         """Configure an allocator-owned stable prefix; register on first use.
 
         L1 must outlive this session. Core closes L2 adapters before L1, and
@@ -239,7 +241,10 @@ class BMSession:
         if (type(pointer) is not int or type(size) is not int or pointer <= 0
                 or size <= 0 or pointer % 4096 or size % 4096):
             raise ValueError("CPU registration arena requires exact page-aligned bounds")
+        if type(chunk_size) is not int or chunk_size < 0 or chunk_size % 4096:
+            raise ValueError("CPU registration chunk size must be zero or page-aligned")
         self._cpu_arena = (pointer, size)
+        self._cpu_arena_chunk_bytes = chunk_size
 
     def copy_cpu_object(self, obj, address, size, *, store):
         """Copy under an object lease, reusing an explicitly configured arena."""
@@ -272,18 +277,41 @@ class BMSession:
         self._registered_cpu_objects[pointer] = (obj, raw, size)
         try:
             if in_arena:
-                if not self._cpu_arena_registered:
+                base, arena_size = self._cpu_arena
+                grain = self._cpu_arena_chunk_bytes or arena_size
+                begin = (pointer - base) // grain * grain
+                # Only these fixed, disjoint ranges can be registered. The
+                # final range is clipped to the allocator's stable prefix,
+                # never rounded into unowned/lazy-growing backing.
+                for offset in range(begin, pointer + size - base, grain):
+                    region = base + offset
+                    if region in self._cpu_arena_ranges:
+                        continue
+                    region_size = min(grain, arena_size - offset)
                     started = time.perf_counter_ns()
-                    self.check(self.handle.register(*self._cpu_arena),
-                               f"BM register CPU L1 arena bytes={self._cpu_arena[1]}")
+                    self.check(self.handle.register(region, region_size),
+                               f"BM register CPU L1 arena bytes={region_size}")
+                    self._cpu_arena_ranges[region] = region_size
                     self._cpu_arena_registered = True
-                    print(f"MEMFABRIC_ARENA_REGISTER bytes={self._cpu_arena[1]} "
+                    print(f"MEMFABRIC_ARENA_REGISTER pointer={region:#x} bytes={region_size} "
                           f"elapsed_ns={time.perf_counter_ns() - started}", flush=True)
             else:
                 self.check(self.handle.register(pointer, size),
                            f"BM register CPU MemoryObj bytes={size} modulo4096={pointer % 4096}")
-            src, dst = (pointer, address) if store else (address, pointer)
-            self._copy(src, dst, size, self.bm.BmCopyType.H2G if store else self.bm.BmCopyType.G2H)
+            offset = 0
+            while offset < size:
+                part = size - offset
+                if in_arena:
+                    # A single RDMA request must not rely on the provider
+                    # combining separate registrations. Split at each local
+                    # MR boundary while preserving the object's pool offsets.
+                    boundary = base + ((pointer + offset - base) // grain + 1) * grain
+                    part = min(part, boundary - pointer - offset)
+                src, dst = ((pointer + offset, address + offset) if store
+                            else (address + offset, pointer + offset))
+                self._copy(src, dst, part,
+                           self.bm.BmCopyType.H2G if store else self.bm.BmCopyType.G2H)
+                offset += part
             if not in_arena:
                 self.check(self.handle.unregister(pointer), "BM unregister CPU MemoryObj")
         except BaseException:
@@ -292,7 +320,7 @@ class BMSession:
         # Only successful synchronous copy AND unregister permit allocator reuse.
         obj.ref_count_down()
         del self._registered_cpu_objects[pointer]
-        return "l1_arena" if in_arena else "per_object"
+        return ("l1_chunks" if self._cpu_arena_chunk_bytes else "l1_arena") if in_arena else "per_object"
 
 
 
@@ -339,12 +367,13 @@ class BMSession:
         try:
             if self.handle is not None:
                 self.wait()
-                if self._cpu_arena_registered:
+                for pointer, size in list(self._cpu_arena_ranges.items()):
                     started = time.perf_counter_ns()
-                    self.check(self.handle.unregister(self._cpu_arena[0]),
+                    self.check(self.handle.unregister(pointer),
                                "BM unregister CPU L1 arena")
-                    self._cpu_arena_registered = False
-                    print(f"MEMFABRIC_ARENA_UNREGISTER bytes={self._cpu_arena[1]} "
+                    del self._cpu_arena_ranges[pointer]
+                    self._cpu_arena_registered = bool(self._cpu_arena_ranges)
+                    print(f"MEMFABRIC_ARENA_UNREGISTER pointer={pointer:#x} bytes={size} "
                           f"elapsed_ns={time.perf_counter_ns() - started}", flush=True)
                 if self.joined:
                     self.check(self.handle.leave(), "BM leave")
