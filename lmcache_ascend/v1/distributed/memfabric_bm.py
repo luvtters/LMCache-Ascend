@@ -273,9 +273,12 @@ class BMSession:
         try:
             if in_arena:
                 if not self._cpu_arena_registered:
+                    started = time.perf_counter_ns()
                     self.check(self.handle.register(*self._cpu_arena),
                                f"BM register CPU L1 arena bytes={self._cpu_arena[1]}")
                     self._cpu_arena_registered = True
+                    print(f"MEMFABRIC_ARENA_REGISTER bytes={self._cpu_arena[1]} "
+                          f"elapsed_ns={time.perf_counter_ns() - started}", flush=True)
             else:
                 self.check(self.handle.register(pointer, size),
                            f"BM register CPU MemoryObj bytes={size} modulo4096={pointer % 4096}")
@@ -337,9 +340,12 @@ class BMSession:
             if self.handle is not None:
                 self.wait()
                 if self._cpu_arena_registered:
+                    started = time.perf_counter_ns()
                     self.check(self.handle.unregister(self._cpu_arena[0]),
                                "BM unregister CPU L1 arena")
                     self._cpu_arena_registered = False
+                    print(f"MEMFABRIC_ARENA_UNREGISTER bytes={self._cpu_arena[1]} "
+                          f"elapsed_ns={time.perf_counter_ns() - started}", flush=True)
                 if self.joined:
                     self.check(self.handle.leave(), "BM leave")
                 self.handle.destroy()

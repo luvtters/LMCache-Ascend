@@ -114,6 +114,9 @@ def read_config(path):
             or len(set(service_devices)) != len(service_devices)):
         raise ValueError("devices.service must list distinct physical devices")
     params = cfg["l2"]["adapter_params"]
+    max_tokens = cfg.get("max_tokens", 32)
+    if type(max_tokens) is not int or max_tokens <= 0:
+        raise ValueError("max_tokens must be a positive integer")
     device_id = params["device_id"]
     if type(device_id) is not int or not 0 <= device_id < len(service_devices):
         raise ValueError("l2.adapter_params.device_id must index devices.service")
@@ -430,7 +433,8 @@ def inference_gate(cfg):
             response.raise_for_status()
             before[role] = response.text
             (out / (role + "_metrics_before.txt")).write_text(response.text, encoding="utf-8")
-        body = {"model": "mf-l2-gate", "temperature": 0, "max_tokens": 32,
+        body = {"model": "mf-l2-gate", "temperature": 0,
+                "max_tokens": cfg.get("max_tokens", 32),
                 "chat_template_kwargs": {"enable_thinking": False}, "messages": [
                     {"role": "system", "content": "Reply with exactly ORCHID."},
                     {"role": "user", "content": "\n".join(
@@ -508,6 +512,7 @@ def inference_gate(cfg):
                            if shard_review["status"] == "PASS"
                            else "FUNCTION_PENDING_SHARD_LOG_REVIEW")
             summary = {**gate, "d_request_id": result["id"], "prompt_tokens": tokens,
+                       "max_tokens_requested": cfg.get("max_tokens", 32),
                        "d_external_tokens": external, "d_computed_tokens": computed,
                        "source_metric_rank_scale": metric_scale,
                        "prompt_metric_rank_scale": prompt_metric_scale,
@@ -530,8 +535,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--role", choices=("plan", "service", "p", "d", "proxy", "gate"), default="plan")
+    parser.add_argument("--max-tokens", type=int,
+                        help="gate request max_tokens override; defaults to config or 32")
     args = parser.parse_args()
     cfg = read_config(args.config)
+    if args.max_tokens is not None:
+        if args.max_tokens <= 0:
+            parser.error("--max-tokens must be positive")
+        cfg["max_tokens"] = args.max_tokens
     argv = commands(cfg, str(Path(args.config).resolve()))
     if args.role == "plan":
         print(json.dumps({"status": "PLAN_ONLY_NOT_EXECUTED", "commands": argv,

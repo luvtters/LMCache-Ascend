@@ -10,6 +10,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import threading
+import time
 
 from lmcache.lmcache_native import Bitmap
 from lmcache.logging import init_logger
@@ -226,9 +227,11 @@ class MemFabricL2Adapter(L2AdapterInterface):
             try:
                 logger.info("MEMFABRIC_CPU_REGISTER pointer=%#x modulo4096=%d bytes=%d direction=%s",
                             obj.data_ptr, obj.data_ptr % 4096, size, "H2G" if store else "G2H")
+                started = time.perf_counter_ns()
                 registration = self._session.copy_cpu_object(obj, address, size, store=store)
-                logger.info("MEMFABRIC_CPU_COPY registration=%s bytes=%d direction=%s",
-                            registration, size, "H2G" if store else "G2H")
+                elapsed = time.perf_counter_ns() - started
+                logger.info("MEMFABRIC_CPU_COPY registration=%s bytes=%d direction=%s elapsed_ns=%d",
+                            registration, size, "H2G" if store else "G2H", elapsed)
             except BaseException as exc:
                 self._poisoned = True
                 self._last_error = str(exc)
