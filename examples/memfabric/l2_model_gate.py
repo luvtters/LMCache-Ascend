@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-request TP1/TP2 P/D L2 correctness gate, using unchanged official core.
+"""Single-request TP1/TP2/TP4/TP8 P/D L2 correctness gate, using unchanged official core.
 
 Print the plan by default. The caller owns process startup, logs and bounded
 shutdown; this entry point neither SSHes nor retries/restarts failed roles.
@@ -96,8 +96,11 @@ def read_config(path):
     ports = cfg["ports"]
     assert len(set(ports.values())) == len(ports)
     tp_size = cfg.get("tensor_parallel_size", 1)
-    if type(tp_size) is not int or tp_size not in (1, 2):
-        raise ValueError("tensor_parallel_size must be 1 or 2")
+    if type(tp_size) is not int or tp_size not in (1, 2, 4, 8):
+        raise ValueError("tensor_parallel_size must be 1, 2, 4, or 8")
+    chunk_size = cfg.get("chunk_size", 128)
+    if type(chunk_size) is not int or chunk_size < 128 or chunk_size % 128:
+        raise ValueError("chunk_size must be a positive multiple of block size 128")
     devices = cfg["devices"]
     for role in ("p", "d"):
         role_devices = devices[role]
@@ -146,7 +149,7 @@ def commands(cfg, config_path):
                     "--role", "service"],
         "service_cli": ["server", "--host", "127.0.0.1", "--port", str(p["rpc"]),
                         "--http-host", "127.0.0.1", "--http-port", str(p["http"]),
-                        "--prometheus-port", str(p["metrics"]), "--chunk-size", "128",
+                        "--prometheus-port", str(p["metrics"]), "--chunk-size", str(cfg.get("chunk_size", 128)),
                         "--l1-size-gb", "2", "--max-gpu-workers", str(2 * cfg.get("tensor_parallel_size", 1)),
                         "--eviction-policy", "LRU", "--supported-transfer-mode", "lmcache_driven",
                         "--l2-store-policy", "skip_l1", "--l2-prefetch-policy", "default",
@@ -448,8 +451,9 @@ def inference_gate(cfg):
             assert result["choices"][0]["message"]["content"].strip() == "ORCHID", result
             assert gate, "No controlled L2 drain event"
             tokens = result["usage"]["prompt_tokens"]
-            expected_external = tokens // 128 * 128
-            expected_chunks = tokens // 128
+            chunk_size = cfg.get("chunk_size", 128)
+            expected_external = tokens // chunk_size * chunk_size
+            expected_chunks = tokens // chunk_size
             gate["expected_chunks"] = expected_chunks
             # Every TP shard has a distinct ObjectKey. Shard byte sizes vary
             # with the model/TP layout, so validate total bytes and full shard
