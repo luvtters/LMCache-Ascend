@@ -121,8 +121,19 @@ class MemFabricL2Adapter(L2AdapterInterface):
 
     def pop_completed_store_tasks(self):
         with self._task_lock:
-            done = {tid: future.result() for tid, future in self._tasks["store"].items()
-                    if future.done()}
+            done = {}
+            for tid, future in list(self._tasks["store"].items()):
+                if not future.done():
+                    continue
+                try:
+                    done[tid] = future.result()
+                except BaseException:
+                    # Consume this failed completion before propagating it, or
+                    # every later pop will replay the same exception forever.
+                    # Keep successful futures queued until the full scan returns
+                    # so a later failure cannot discard results the caller missed.
+                    del self._tasks["store"][tid]
+                    raise
             for tid in done:
                 del self._tasks["store"][tid]
             return done

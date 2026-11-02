@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU lease/configuration controls only; the native SDK is a fake boundary."""
 import gc
+from concurrent.futures import wait as wait_futures
 import importlib.util
 import contextlib
 import io
@@ -244,6 +245,38 @@ class AdapterContracts(unittest.TestCase):
                         adapter._executor.submit(adapter._lookup, ["a"], {}).result()
                 finally:
                     adapter.close()
+
+    def test_failed_store_completion_is_consumed_and_next_success_is_returned(self):
+        adapter, session = self.adapter()
+        try:
+            earlier_tid = adapter.submit_store_task(["earlier"], [MemoryObj(size=64)])
+            earlier_future = adapter._tasks["store"][earlier_tid]
+            done, _ = wait_futures([earlier_future], timeout=5)
+            self.assertIn(earlier_future, done)
+
+            failed_tid = adapter.submit_store_task(["bad"], [MemoryObj(size=0)])
+            failed_future = adapter._tasks["store"][failed_tid]
+            done, _ = wait_futures([failed_future], timeout=5)
+            self.assertIn(failed_future, done)
+            with self.assertRaisesRegex(ValueError, "contiguous CPU MemoryObj"):
+                adapter.pop_completed_store_tasks()
+            self.assertNotIn(failed_tid, adapter._tasks["store"])
+            self.assertIn(earlier_tid, adapter._tasks["store"])
+
+            earlier_result = adapter.pop_completed_store_tasks()
+            self.assertEqual(set(earlier_result), {earlier_tid})
+            self.assertTrue(earlier_result[earlier_tid].success)
+
+            success_tid = adapter.submit_store_task(["good"], [MemoryObj(size=64)])
+            success_future = adapter._tasks["store"][success_tid]
+            done, _ = wait_futures([success_future], timeout=5)
+            self.assertIn(success_future, done)
+            completed = adapter.pop_completed_store_tasks()
+            self.assertEqual(set(completed), {success_tid})
+            self.assertTrue(completed[success_tid].success)
+            self.assertEqual(session.operations, ["registered_cpu", "registered_cpu"])
+        finally:
+            adapter.close()
 
     def test_default_sdma_uses_unchanged_raw_copy_and_ref_count_path(self):
         adapter, session = self.adapter(rdma=False)
