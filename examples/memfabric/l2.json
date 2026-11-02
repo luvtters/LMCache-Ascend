@@ -1,0 +1,13 @@
+{
+  "type": "plugin",
+  "module_path": "lmcache_ascend.v1.distributed.memfabric_l2_adapter",
+  "class_name": "MemFabricL2Adapter",
+  "adapter_params": {
+    "device_id": 0,
+    "world_size": 2,
+    "pool_gb": 1,
+    "storage_rank": 1,
+    "slot_size_mb": 32,
+    "store_url": "tcp://127.0.0.1:28580"
+  }
+}
