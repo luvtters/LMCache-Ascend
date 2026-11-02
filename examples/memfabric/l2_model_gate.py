@@ -447,8 +447,12 @@ def inference_gate(cfg):
             while not server.started:
                 assert thread.is_alive() and time.monotonic() < deadline
                 time.sleep(0.05)
+            request_started = time.perf_counter_ns()
             response = client.post(base["proxy"] + "/v1/chat/completions", json=body)
-            save("http_response", {"status": response.status_code, "body": response.text})
+            request_elapsed = time.perf_counter_ns() - request_started
+            save("http_response", {"status": response.status_code, "body": response.text,
+                                   "request_elapsed_ns": request_elapsed,
+                                   "timing_boundary": "proxy nonstream request to full response; not TTFT"})
             response.raise_for_status()
             result = response.json()
             save("response", result)
@@ -513,6 +517,7 @@ def inference_gate(cfg):
                            else "FUNCTION_PENDING_SHARD_LOG_REVIEW")
             summary = {**gate, "d_request_id": result["id"], "prompt_tokens": tokens,
                        "max_tokens_requested": cfg.get("max_tokens", 32),
+                       "proxy_request_elapsed_ns": request_elapsed,
                        "d_external_tokens": external, "d_computed_tokens": computed,
                        "source_metric_rank_scale": metric_scale,
                        "prompt_metric_rank_scale": prompt_metric_scale,
