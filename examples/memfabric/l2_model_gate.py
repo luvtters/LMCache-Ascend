@@ -14,6 +14,20 @@ import threading
 import time
 
 
+def _protocol(cfg):
+    params = cfg["l2"]["adapter_params"]
+    protocol = params.get("data_op_type")
+    if protocol not in ("SDMA", "DEVICE_RDMA"):
+        raise ValueError(f"Unsupported L2 data_op_type: {protocol!r}")
+    enable_56bits_gva = params.get("enable_56bits_gva")
+    expected_gva = protocol == "DEVICE_RDMA"
+    if type(enable_56bits_gva) is not bool or enable_56bits_gva is not expected_gva:
+        raise ValueError(
+            f"{protocol} requires enable_56bits_gva={expected_gva}"
+        )
+    return protocol
+
+
 def read_config(path):
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
     ports = cfg["ports"]
@@ -21,12 +35,17 @@ def read_config(path):
     assert cfg["devices"]["p"] == [8] and cfg["devices"]["d"] == [10]
     assert cfg["devices"]["service"] == [8, 10, 12]
     assert cfg["l2"]["adapter_params"]["device_id"] == 2
+    _protocol(cfg)
     return cfg
 
 
 def commands(cfg, config_path):
+    _protocol(cfg)
     py = cfg["python"]
     p = cfg["ports"]
+    shutdown_timeout = cfg.get("shutdown_timeout")
+    if "shutdown_timeout" in cfg and (type(shutdown_timeout) is not int or shutdown_timeout < 0):
+        raise ValueError("shutdown_timeout must be a nonnegative integer (not bool)")
     connector = {"kv_connector": "LMCacheMPConnector", "kv_role": "kv_both",
                  "kv_connector_module_path": "lmcache.integration.vllm.lmcache_mp_connector",
                  "kv_connector_extra_config": {"lmcache.mp.host": "tcp://127.0.0.1",
@@ -38,6 +57,8 @@ def commands(cfg, config_path):
               "--gpu-memory-utilization", "0.7", "--block-size", "128",
               "--no-enable-prefix-caching", "--enforce-eager", "--host", "127.0.0.1",
               "--kv-transfer-config", json.dumps(connector)]
+    if "shutdown_timeout" in cfg:
+        engine += ["--shutdown-timeout", str(shutdown_timeout)]
     return {
         "service": [py, "-u", str(Path(__file__).resolve()), "--config", config_path,
                     "--role", "service"],
@@ -58,9 +79,10 @@ def commands(cfg, config_path):
     }
 
 
-def pool(status):
+def pool(status, cfg):
     adapters = status["storage_manager"]["l2_adapters"]
-    assert len(adapters) == 1 and adapters[0]["protocol"] == "DEVICE_RDMA", adapters
+    protocol = _protocol(cfg)
+    assert len(adapters) == 1 and adapters[0]["protocol"] == protocol, adapters
     assert adapters[0]["is_healthy"], adapters[0]
     return adapters[0]
 
@@ -111,7 +133,7 @@ def inference_gate(cfg):
                 response.raise_for_status()
                 snapshot = response.json()
                 sm = snapshot["storage_manager"]
-                bm, l1, ctrl = pool(snapshot), sm["l1_manager"], sm["store_controller"]
+                bm, l1, ctrl = pool(snapshot, cfg), sm["l1_manager"], sm["store_controller"]
                 if (bm["objects"] > 0 and bm["store_bytes"] == bm["objects"] * (18 << 20)
                         and bm["load_bytes"] == 0 and l1["total_object_count"] == 0
                         and l1["memory_used_bytes"] == 0 and ctrl["pending_keys_count"] == 0
@@ -135,7 +157,8 @@ def inference_gate(cfg):
     with httpx.Client(timeout=180, trust_env=False) as client:
         initial = status(client)
         save("initial", initial)
-        assert pool(initial)["objects"] == pool(initial)["store_bytes"] == pool(initial)["load_bytes"] == 0
+        assert (pool(initial, cfg)["objects"] == pool(initial, cfg)["store_bytes"]
+                == pool(initial, cfg)["load_bytes"] == 0)
         before = {}
         for role in ("p", "d"):
             response = client.get(base[role] + "/metrics")
@@ -190,7 +213,7 @@ def inference_gate(cfg):
             assert delta("p", source, 'source="local_compute"') == tokens
             assert delta("p", source, 'source="external_kv_transfer"') == 0
             snapshot = status(client)
-            assert pool(snapshot)["load_bytes"] == gate["store_bytes"] > 0
+            assert pool(snapshot, cfg)["load_bytes"] == gate["store_bytes"] > 0
             save("after_decode", snapshot)
             with service_log.open("rb") as stream:
                 stream.seek(log_offset)
@@ -206,7 +229,7 @@ def inference_gate(cfg):
             assert internal_id == public_id or internal_id.startswith(public_id + "-"), rows
             summary = {**gate, "d_request_id": result["id"], "prompt_tokens": tokens,
                        "d_external_tokens": external, "d_computed_tokens": computed,
-                       "l2_load_bytes": pool(snapshot)["load_bytes"], "answer": "ORCHID",
+                       "l2_load_bytes": pool(snapshot, cfg)["load_bytes"], "answer": "ORCHID",
                        "prefetch_zero_l1": True, "manual_l1_clear": False,
                        "status": "FUNCTION_PASS_LIFECYCLE_REQUIRES_ROLE_WAITS"}
             save("summary", summary)

@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import threading
 import time
@@ -146,11 +147,14 @@ def main():
     args = parser.parse_args()
     if not args.run_id or any(not (c.isalnum() or c in '-_') for c in args.run_id):
         parser.error('invalid run-id')
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     server = make_server(args.bind, args.port, args.directory, args.run_id, args.trace_dir)
     print(json.dumps(dict(event='listening', bind=args.bind, port=server.server_port,
                           host_id=host_identity(), run_id=args.run_id)), flush=True)
     try:
         server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
         server.server_close()
 
