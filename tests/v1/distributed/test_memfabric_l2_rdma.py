@@ -67,6 +67,11 @@ class Session:
     def peer_address(self, rank):
         return 1 << 30
 
+    def set_cpu_registration_arena(self, pointer, size, chunk_size=0):
+        assert self.owner == threading.get_ident()
+        self.arena = (pointer, size)
+        self.arena_chunk_size = chunk_size
+
     def copy_cpu_object(self, obj, address, size, *, store):
         assert self.owner == threading.get_ident()
         self.operations.append("registered_cpu")
@@ -197,8 +202,238 @@ class CpuMemoryObjContracts(unittest.TestCase):
         handle.copy_data.assert_not_called()
         self.assertEqual(obj.refs, 2)
 
+    def test_arena_reuses_registration_and_unregisters_once_before_leave(self):
+        _, session, handle = self.native_session()
+        size = 18 << 20
+        session.set_cpu_registration_arena(4096, size * 2)
+        first, second = MemoryObj(), MemoryObj(pointer=4096 + size)
+        for obj, store in ((first, True), (second, False), (first, False)):
+            self.assertEqual(session.copy_cpu_object(obj, 1 << 30, size, store=store), "l1_arena")
+            self.assertEqual(obj.refs, 1)
+        handle.register.assert_called_once_with(4096, size * 2)
+        handle.unregister.assert_not_called()
+        session.close()
+        handle.unregister.assert_called_once_with(4096)
+        calls = [c[0] for c in handle.method_calls]
+        self.assertLess(calls.index("unregister"), calls.index("leave"))
+
+    def test_chunked_arena_registers_overlapped_regions_once_and_unregisters_each_once(self):
+        _, session, handle = self.native_session()
+        base, chunk, obj_size = 4096, 32 << 20, 18 << 20
+        session.set_cpu_registration_arena(base, 64 << 20, chunk)
+        first = MemoryObj(pointer=base, size=obj_size)
+        second = MemoryObj(pointer=base + obj_size, size=obj_size)
+        for obj, store in ((first, True), (second, False), (first, False)):
+            self.assertEqual(session.copy_cpu_object(obj, 1 << 30, obj_size, store=store),
+                             "l1_chunks")
+            self.assertEqual(obj.refs, 1)
+        regions = [(base, chunk), (base + chunk, chunk)]
+        self.assertEqual([call.args for call in handle.register.call_args_list], regions)
+        handle.unregister.assert_not_called()
+
+        session.close()
+        self.assertEqual([call.args[0] for call in handle.unregister.call_args_list],
+                         [base, base + chunk])
+        self.assertEqual(len(handle.unregister.call_args_list), 2)
+        calls = [call[0] for call in handle.method_calls]
+        self.assertLess(calls.index("unregister"), calls.index("leave"))
+
+    def test_chunked_arena_splits_h2g_and_g2h_at_mr_boundary_with_contiguous_pool_offsets(self):
+        _, session, handle = self.native_session()
+        base, chunk, obj_size, pool = 4096, 32 << 20, 18 << 20, 1 << 30
+        pointer = base + obj_size
+        first_part, second_part = 14 << 20, 4 << 20
+        session.set_cpu_registration_arena(base, 64 << 20, chunk)
+        obj = MemoryObj(pointer=pointer, size=obj_size)
+
+        self.assertEqual(session.copy_cpu_object(obj, pool, obj_size, store=True), "l1_chunks")
+        self.assertEqual(session.copy_cpu_object(obj, pool, obj_size, store=False), "l1_chunks")
+        self.assertEqual(obj.refs, 1)
+        self.assertEqual([call.args for call in handle.copy_data.call_args_list], [
+            (pointer, pool, first_part, 5, 0),
+            (pointer + first_part, pool + first_part, second_part, 5, 0),
+            (pool, pointer, first_part, 6, 0),
+            (pool + first_part, pointer + first_part, second_part, 6, 0),
+        ])
+        self.assertEqual(first_part + second_part, obj_size)
+        self.assertEqual(first_part, (base + chunk) - pointer)
+        self.assertEqual([call.args for call in handle.register.call_args_list], [
+            (base, chunk), (base + chunk, chunk)])
+        session.close()
+
+    def test_second_chunk_copy_failure_retains_object_and_all_regions_without_unregister(self):
+        module, session, handle = self.native_session()
+        base, chunk, obj_size, pool = 4096, 32 << 20, 18 << 20, 1 << 30
+        pointer = base + obj_size
+        session.set_cpu_registration_arena(base, 64 << 20, chunk)
+        obj = MemoryObj(pointer=pointer, size=obj_size)
+        handle.copy_data.side_effect = [0, -1]
+
+        with self.assertRaisesRegex(RuntimeError, "failed: -1"):
+            session.copy_cpu_object(obj, pool, obj_size, store=True)
+        self.assertEqual([call.args for call in handle.copy_data.call_args_list], [
+            (pointer, pool, 14 << 20, 5, 0),
+            (pointer + (14 << 20), pool + (14 << 20), 4 << 20, 5, 0),
+        ])
+        self.assertEqual(obj.refs, 2)
+        self.assertIs(session._registered_cpu_objects[pointer][0], obj)
+        self.assertEqual(session._cpu_arena_ranges,
+                         {base: chunk, base + chunk: chunk})
+        self.assertTrue(session._completion_unknown)
+        self.assertIn(session, module.BMSession._uncertain_sessions)
+        with self.assertRaisesRegex(RuntimeError, "completion unknown"):
+            session.close()
+        handle.unregister.assert_not_called()
+        handle.leave.assert_not_called()
+        handle.destroy.assert_not_called()
+
+    def test_chunked_arena_tail_registration_uses_only_stable_prefix_remainder(self):
+        _, session, handle = self.native_session()
+        base, chunk, stable_size = 4096, 32 << 20, 50 << 20
+        tail_size = stable_size - chunk
+        session.set_cpu_registration_arena(base, stable_size, chunk)
+        obj = MemoryObj(pointer=base + chunk, size=tail_size)
+        try:
+            self.assertEqual(session.copy_cpu_object(obj, 1 << 30, tail_size, store=True),
+                             "l1_chunks")
+            self.assertEqual([call.args for call in handle.register.call_args_list],
+                             [(base + chunk, tail_size)])
+            session.close()
+            self.assertEqual([call.args for call in handle.unregister.call_args_list],
+                             [(base + chunk,)])
+        finally:
+            if not session.closed and not session._completion_unknown:
+                session.close()
+
+    def test_chunked_arena_second_region_register_failure_retains_lease_and_first_region(self):
+        module, session, handle = self.native_session()
+        base, chunk, obj_size = 4096, 32 << 20, 18 << 20
+        session.set_cpu_registration_arena(base, 64 << 20, chunk)
+        obj = MemoryObj(pointer=base + obj_size, size=obj_size)
+        handle.register.side_effect = [0, -1]
+
+        with self.assertRaisesRegex(RuntimeError, "BM register CPU L1 arena bytes=33554432 failed: -1"):
+            session.copy_cpu_object(obj, 1 << 30, obj_size, store=True)
+        self.assertEqual(obj.refs, 2)
+        self.assertIs(session._registered_cpu_objects[obj.data_ptr][0], obj)
+        self.assertEqual(session._cpu_arena_ranges, {base: chunk})
+        self.assertTrue(session._completion_unknown)
+        self.assertIn(session, module.BMSession._uncertain_sessions)
+
+        with self.assertRaisesRegex(RuntimeError, "completion unknown"):
+            session.close()
+        handle.unregister.assert_not_called()
+        handle.leave.assert_not_called()
+        handle.destroy.assert_not_called()
+
+    def test_arena_does_not_cover_outside_or_partial_objects(self):
+        _, session, handle = self.native_session()
+        session.set_cpu_registration_arena(4096, 18 << 20)
+        outside = MemoryObj(pointer=4096 + (36 << 20))
+        self.assertEqual(session.copy_cpu_object(outside, 1 << 30, outside.size, store=True), "per_object")
+        handle.register.assert_called_once_with(outside.data_ptr, outside.size)
+        handle.unregister.assert_called_once_with(outside.data_ptr)
+        crossing = MemoryObj(pointer=8192)
+        with self.assertRaisesRegex(ValueError, "straddles"):
+            session.copy_cpu_object(crossing, 1 << 30, crossing.size, store=True)
+        self.assertEqual(crossing.refs, 1)
+        session.close()
+
+    def test_arena_unknown_completion_keeps_lease_and_prevents_unregister(self):
+        for stage in ("register", "copy_data"):
+            with self.subTest(stage=stage):
+                module, session, handle = self.native_session()
+                session.set_cpu_registration_arena(4096, 18 << 20)
+                obj = MemoryObj()
+                getattr(handle, stage).return_value = -1
+                with self.assertRaises(RuntimeError):
+                    session.copy_cpu_object(obj, 1 << 30, obj.size, store=True)
+                self.assertEqual(obj.refs, 2)
+                with self.assertRaisesRegex(RuntimeError, "completion unknown"):
+                    session.close()
+                handle.unregister.assert_not_called()
+                self.assertIn(session, module.BMSession._uncertain_sessions)
+
+    def test_arena_unregister_failure_prevents_session_destruction(self):
+        _, session, handle = self.native_session()
+        session.set_cpu_registration_arena(4096, 18 << 20)
+        obj = MemoryObj()
+        session.copy_cpu_object(obj, 1 << 30, obj.size, store=True)
+        handle.unregister.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, "unregister CPU L1 arena"):
+            session.close()
+        handle.leave.assert_not_called()
+        handle.destroy.assert_not_called()
+
 
 class AdapterContracts(unittest.TestCase):
+    def test_arena_requires_explicit_host_descriptor_before_sdk_start(self):
+        factory = MagicMock()
+        adapter_type = load_adapter(factory)
+        params = dict(data_op_type="DEVICE_RDMA", register_l1_arena=True)
+        for desc in (None, SimpleNamespace(ptr=4096, size=1 << 30,
+                                          stable_registration_size=1 << 30),
+                     SimpleNamespace(ptr=4096, size=4096,
+                                     stable_host_registration_size=8192)):
+            with self.subTest(desc=desc), self.assertRaises(ValueError):
+                adapter_type(params, desc)
+        factory.assert_not_called()
+
+    def test_explicit_arena_configuration_runs_on_session_owner(self):
+        sessions = []
+        def factory(**kwargs):
+            sessions.append(Session(**kwargs))
+            return sessions[-1]
+        params = dict(data_op_type="DEVICE_RDMA", register_l1_arena=True,
+                      join_coord_url="http://127.0.0.1:29595", join_group_id="cpu-only")
+        desc = SimpleNamespace(ptr=4096, size=1 << 30,
+                               stable_registration_size=None,
+                               stable_host_registration_size=18 << 20)
+        adapter = load_adapter(factory)(params, desc)
+        try:
+            self.assertEqual(sessions[0].arena, (4096, 18 << 20))
+            self.assertEqual(sessions[0].arena_chunk_size, 0)
+            self.assertEqual(adapter.report_status()["registration_arena_bytes"], 18 << 20)
+        finally:
+            adapter.close()
+
+    def test_chunk_option_requires_rdma_arena_and_forwards_bytes_on_owner_thread(self):
+        factory = MagicMock()
+        adapter_type = load_adapter(factory)
+        desc = SimpleNamespace(ptr=4096, size=1 << 30,
+                               stable_registration_size=None,
+                               stable_host_registration_size=64 << 20)
+        common = dict(register_l1_arena=True, l1_registration_chunk_mb=32,
+                      join_coord_url="http://127.0.0.1:29595", join_group_id="cpu-chunks")
+        invalid = [
+            dict(data_op_type="DEVICE_RDMA", register_l1_arena=False,
+                 l1_registration_chunk_mb=32),
+            dict(data_op_type="SDMA", **common),
+            dict(data_op_type="DEVICE_RDMA", register_l1_arena=True,
+                 l1_registration_chunk_mb=-1),
+            dict(data_op_type="DEVICE_RDMA", register_l1_arena=True,
+                 l1_registration_chunk_mb=1.5),
+            dict(data_op_type="DEVICE_RDMA", register_l1_arena=True,
+                 l1_registration_chunk_mb=True),
+        ]
+        for params in invalid:
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                adapter_type(params, desc)
+        factory.assert_not_called()
+
+        sessions = []
+        def session_factory(**kwargs):
+            sessions.append(Session(**kwargs))
+            return sessions[-1]
+        params = dict(data_op_type="DEVICE_RDMA", **common)
+        adapter = load_adapter(session_factory)(params, desc)
+        try:
+            self.assertEqual(sessions[0].arena, (desc.ptr, desc.stable_host_registration_size))
+            self.assertEqual(sessions[0].arena_chunk_size, 32 << 20)
+            self.assertEqual(adapter.report_status()["registration_arena_bytes"], 64 << 20)
+        finally:
+            adapter.close()
+
     def adapter(self, rdma=True):
         sessions = []
         def factory(**kwargs):
@@ -304,6 +539,13 @@ class AdapterContracts(unittest.TestCase):
                 status = adapter.report_status()
                 self.assertFalse(status["is_healthy"])
                 self.assertEqual(status["last_error"], "native close completion unknown")
+                for action in (lambda: adapter.submit_unlock(["a"]),
+                               lambda: adapter.delete(["a"]),
+                               lambda: adapter.submit_store_task(["a"], [MemoryObj()]),
+                               lambda: adapter._executor.submit(adapter._unlock, ["a"]).result(),
+                               lambda: adapter._executor.submit(adapter._delete, ["a"]).result()):
+                    with self.assertRaisesRegex(RuntimeError, "native close completion unknown"):
+                        action()
         finally:
             session.close = original_close
             adapter.close()
