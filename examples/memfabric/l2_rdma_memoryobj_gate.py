@@ -14,6 +14,7 @@ def parse_args(argv=None):
     parser.add_argument("--storage-rank", type=int, default=1)
     parser.add_argument("--pool-gb", type=int, default=1)
     parser.add_argument("--store-url", required=True)
+    parser.add_argument("--data-op-type", choices=("SDMA", "DEVICE_RDMA"), default="DEVICE_RDMA")
     parser.add_argument("--device-nic", required=True)
     parser.add_argument("--enable-56bits-gva", action="store_true")
     parser.add_argument("--join-coord-url", required=True)
@@ -115,7 +116,7 @@ def main(argv=None):
         payload_bytes=args.payload_bytes, fallback_allowed=False,
         adapter_params=dict(device_id=args.device, world_size=args.world_size,
             storage_rank=args.storage_rank, pool_gb=args.pool_gb, slot_size_mb=32,
-            store_url=args.store_url, data_op_type="DEVICE_RDMA", device_nic=args.device_nic,
+            store_url=args.store_url, data_op_type=args.data_op_type, device_nic=args.device_nic,
             enable_56bits_gva=args.enable_56bits_gva,
             join_coord_url=args.join_coord_url, join_group_id=args.join_group_id))
     args.output.parent.mkdir(parents=True, exist_ok=True)

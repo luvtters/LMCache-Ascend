@@ -1,0 +1,21 @@
+{
+  "python": "/workspace/d00896497/venv/bin/python",
+  "core_path": "/workspace/d00896497/review_device_20261102_152552/routes/l2/LMCache",
+  "ascend_path": "/workspace/d00896497/review_device_20261102_152552/routes/l2/LMCache-Ascend",
+  "model_path": "/workspace/d00896497/models/Qwen3-8B",
+  "case_root": "/workspace/d00896497/review_device_20261102_152552/routes/l2/model_gate_01",
+  "devices": {"p": [8], "d": [10], "service": [8, 10, 12]},
+  "ports": {"rpc": 25555, "http": 28080, "metrics": 29090, "p": 28001, "d": 28002, "proxy": 28000, "telemetry": 25768, "gate": 25769},
+  "l2": {
+    "type": "plugin",
+    "module_path": "lmcache_ascend.v1.distributed.memfabric_l2_adapter",
+    "class_name": "MemFabricL2Adapter",
+    "adapter_params": {
+      "device_id": 2, "world_size": 2, "pool_gb": 1, "storage_rank": 1,
+      "slot_size_mb": 32, "store_url": "tcp://127.0.0.1:28580",
+      "data_op_type": "DEVICE_RDMA", "device_nic": "tcp://REPLACE_WITH_M8_COMMUNICATION_IPV4:28582",
+      "enable_56bits_gva": true,
+      "join_coord_url": "http://127.0.0.1:28581", "join_group_id": "m8-l2-model-20261102-01"
+    }
+  }
+}
