@@ -1,0 +1,11 @@
+{
+  "module_path": "lmcache_ascend.v1.distributed.memfabric_direct_server",
+  "config": {
+    "device_id": 0,
+    "rank_id": 0,
+    "world_size": 3,
+    "pool_gb": 2,
+    "slot_size_mb": 32,
+    "store_url": "tcp://127.0.0.1:28680"
+  }
+}
