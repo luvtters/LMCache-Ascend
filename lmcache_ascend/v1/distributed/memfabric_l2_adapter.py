@@ -50,16 +50,24 @@ class MemFabricL2Adapter(L2AdapterInterface):
             raise ValueError("l1_registration_chunk_mb requires a nonnegative integer and register_l1_arena")
         self._registration_chunk_bytes = chunk_mb << 20
         self._registration_arena_bytes = 0
+        self._registration_fallback_reason = ""
+        if self._register_l1_arena and self._data_op_type != "DEVICE_RDMA":
+            raise ValueError("register_l1_arena requires DEVICE_RDMA")
         if self._register_l1_arena:
-            stable_size = getattr(l1_memory_desc, "stable_host_registration_size", None)
+            # Official core describes final capacity separately from the stable
+            # prefix. In particular POSIX SHM exposes None for this public field.
+            # Never turn size, an allocator class or private state into a lease.
+            stable_size = getattr(l1_memory_desc, "stable_registration_size", None)
             pointer = getattr(l1_memory_desc, "ptr", None)
             capacity = getattr(l1_memory_desc, "size", None)
-            if (self._data_op_type != "DEVICE_RDMA"
-                    or type(pointer) is not int or type(stable_size) is not int
-                    or type(capacity) is not int or pointer <= 0 or pointer % 4096
+            if stable_size is None:
+                self._registration_fallback_reason = "stable_prefix_not_exposed"
+            elif (type(pointer) is not int or type(capacity) is not int
+                    or type(stable_size) is not int or pointer <= 0 or pointer % 4096
                     or stable_size <= 0 or stable_size % 4096 or stable_size > capacity):
-                raise ValueError("register_l1_arena requires DEVICE_RDMA and an exact stable host L1 prefix")
-            self._registration_arena_bytes = stable_size
+                raise ValueError("Invalid public stable L1 prefix for BM registration")
+            else:
+                self._registration_arena_bytes = stable_size
         self._enable_56bits_gva = params.get("enable_56bits_gva", False)
         if self._data_op_type == "DEVICE_RDMA" and not (
                 params.get("join_coord_url") and params.get("join_group_id")):
@@ -103,7 +111,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
             self._base = self._executor.submit(
                 self._session.peer_address, self.storage_rank
             ).result()
-            if self._register_l1_arena:
+            if self._registration_arena_bytes:
                 self._executor.submit(self._session.set_cpu_registration_arena,
                                       pointer, stable_size, self._registration_chunk_bytes).result()
         except BaseException:
@@ -115,6 +123,10 @@ class MemFabricL2Adapter(L2AdapterInterface):
             raise
         logger.info("MEMFABRIC_READY protocol=%s storage_rank=%d capacity=%d slot=%d",
                     self._data_op_type, self.storage_rank, capacity, self._slot_size)
+        if self._register_l1_arena:
+            logger.info("MEMFABRIC_ARENA_SOURCE source=%s bytes=%d fallback_reason=%s",
+                        "stable_registration_size" if self._registration_arena_bytes else "per_object",
+                        self._registration_arena_bytes, self._registration_fallback_reason or "none")
 
     def get_store_event_fd(self):
         return self._events["store"].fileno()
@@ -382,6 +394,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     "protocol": self._data_op_type, "enable_56bits_gva": self._enable_56bits_gva,
                     "register_l1_arena": self._register_l1_arena,
                     "registration_arena_bytes": self._registration_arena_bytes,
+                    "registration_source": "stable_registration_size" if self._registration_arena_bytes else "per_object",
+                    "registration_fallback_reason": self._registration_fallback_reason,
                     "registration_chunk_bytes": self._registration_chunk_bytes,
                     "registered_l1_bytes": sum(getattr(self._session, "_cpu_arena_ranges", {}).values()),
                     "registered_l1_regions": len(getattr(self._session, "_cpu_arena_ranges", {})),
