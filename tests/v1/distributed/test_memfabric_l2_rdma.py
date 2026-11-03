@@ -18,10 +18,11 @@ import test_memfabric_rdma as rdma_cpu
 
 
 class MemoryObj:
-    def __init__(self, pointer=4096, size=18 << 20):
+    def __init__(self, pointer=4096, size=18 << 20, parent_allocator=None):
         self.data_ptr, self.size, self.refs = pointer, size, 1
         self.raw_tensor = rdma_cpu.tensor(pointer, size)
         self.raw_tensor.device.type = "cpu"
+        self.parent_allocator = parent_allocator
         self.released = False
 
     def get_size(self):
@@ -62,13 +63,16 @@ class Session:
         self.peer_departed = threading.Event()
         self.departed_rank = None
         self.failure = False
+        self.close_failure = False
         self.operations = []
+        self.arena_calls = []
 
     def peer_address(self, rank):
         return 1 << 30
 
     def set_cpu_registration_arena(self, pointer, size, chunk_size=0):
         assert self.owner == threading.get_ident()
+        self.arena_calls.append((pointer, size, chunk_size))
         self.arena = (pointer, size)
         self.arena_chunk_size = chunk_size
 
@@ -86,6 +90,17 @@ class Session:
 
     def close(self):
         assert self.owner == threading.get_ident()
+        if self.close_failure:
+            raise RuntimeError("fake session close failed")
+
+
+class MixedMemoryAllocator:
+    def __init__(self, pointer=4096, size=18 << 20, shm_name="lmcache_l1_pool_cpu"):
+        self.buffer = rdma_cpu.tensor(pointer, size)
+        self.buffer.device.type = "cpu"
+        self.size = size
+        self.shm_name = shm_name
+        self._unregistered = False
 
 
 def load_adapter(factory):
@@ -104,6 +119,11 @@ def load_adapter(factory):
         "lmcache.v1.distributed.internal_api": dict(L2StoreResult=lambda success, size:
             SimpleNamespace(success=success, size=size)),
         "lmcache.v1.distributed.l2_adapters.base": dict(L2AdapterInterface=Base),
+        "lmcache": dict(__path__=[]),
+        "lmcache.v1": dict(__path__=[]),
+        "lmcache.v1.memory_allocators": dict(__path__=[]),
+        "lmcache.v1.memory_allocators.mixed_memory_allocator": dict(
+            MixedMemoryAllocator=MixedMemoryAllocator),
         "lmcache.v1.platform": dict(create_event_notifier=lambda: MagicMock()),
         "lmcache_ascend.v1.distributed.memfabric_bm": dict(BMSession=factory),
     }
@@ -117,6 +137,7 @@ def load_adapter(factory):
     modules[spec.name] = module
     with patch.dict("sys.modules", modules):
         spec.loader.exec_module(module)
+    module.MemFabricL2Adapter._cpu_import_modules = modules
     return module.MemFabricL2Adapter
 
 
@@ -367,42 +388,125 @@ class CpuMemoryObjContracts(unittest.TestCase):
 
 
 class AdapterContracts(unittest.TestCase):
-    def test_arena_requires_explicit_host_descriptor_before_sdk_start(self):
-        factory = MagicMock()
-        adapter_type = load_adapter(factory)
-        params = dict(data_op_type="DEVICE_RDMA", register_l1_arena=True)
-        for desc in (None, SimpleNamespace(ptr=4096, size=1 << 30,
-                                          stable_registration_size=1 << 30),
-                     SimpleNamespace(ptr=4096, size=4096,
-                                     stable_host_registration_size=8192)):
-            with self.subTest(desc=desc), self.assertRaises(ValueError):
-                adapter_type(params, desc)
-        factory.assert_not_called()
-
-    def test_explicit_arena_configuration_runs_on_session_owner(self):
+    def adapter(self, rdma=True, register_arena=False, desc=None):
         sessions = []
         def factory(**kwargs):
             sessions.append(Session(**kwargs))
             return sessions[-1]
-        params = dict(data_op_type="DEVICE_RDMA", register_l1_arena=True,
-                      join_coord_url="http://127.0.0.1:29595", join_group_id="cpu-only")
-        desc = SimpleNamespace(ptr=4096, size=1 << 30,
-                               stable_registration_size=None,
-                               stable_host_registration_size=18 << 20)
+        params = dict(device_id=0, world_size=2, pool_gb=1, storage_rank=1, slot_size_mb=32,
+                      store_url="cpu-only")
+        if rdma:
+            params.update(data_op_type="DEVICE_RDMA", device_nic="tcp://127.0.0.1:10005",
+                          enable_56bits_gva=True, join_coord_url="http://127.0.0.1:29595",
+                          join_group_id="cpu-only-fresh")
+        if register_arena:
+            params["register_l1_arena"] = True
         adapter = load_adapter(factory)(params, desc)
+        return adapter, sessions[0]
+
+    @staticmethod
+    def desc(pointer=4096, size=64 << 20):
+        # Fixed official core descriptor: deliberately has no new field.
+        return SimpleNamespace(ptr=pointer, size=size, align_bytes=4096)
+
+    def store(self, adapter, key, obj):
+        with patch.dict("sys.modules", adapter.__class__._cpu_import_modules):
+            return adapter._executor.submit(adapter._store, [key], [obj]).result()
+
+    def test_fixed_shm_first_copy_configures_once_and_reuses_owner(self):
+        base, size = 4096, 64 << 20
+        owner = MixedMemoryAllocator(base, size)
+        adapter, session = self.adapter(register_arena=True, desc=self.desc(base, size))
+        first = MemoryObj(base, 18 << 20, owner)
+        second = MemoryObj(base + (18 << 20), 18 << 20, owner)
         try:
-            self.assertEqual(sessions[0].arena, (4096, 18 << 20))
-            self.assertEqual(sessions[0].arena_chunk_size, 0)
-            self.assertEqual(adapter.report_status()["registration_arena_bytes"], 18 << 20)
+            self.assertTrue(self.store(adapter, "first", first).success)
+            self.assertTrue(self.store(adapter, "second", second).success)
+            self.assertEqual(session.arena_calls, [(base, size, 0)])
+            self.assertEqual(session.arena, (base, size))
+            self.assertIs(adapter._registration_owner, owner)
+            status = adapter.report_status()
+            self.assertEqual(status["registration_source"], "fixed_shm_allocator")
+            self.assertEqual(status["registration_arena_bytes"], size)
+        finally:
+            adapter.close()
+
+    def test_fixed_shm_owner_is_retained_until_session_close_succeeds(self):
+        owner = MixedMemoryAllocator(size=64 << 20)
+        adapter, session = self.adapter(register_arena=True, desc=self.desc())
+        try:
+            self.assertTrue(self.store(adapter, "key", MemoryObj(parent_allocator=owner)).success)
+            owner_seen_at_close = []
+            original_close = session.close
+            def close_and_observe_owner():
+                owner_seen_at_close.append(adapter._registration_owner)
+                original_close()
+            session.close = close_and_observe_owner
+
+            session.close_failure = True
+            with self.assertRaisesRegex(RuntimeError, "fake session close failed"):
+                adapter.close()
+            self.assertIs(adapter._registration_owner, owner)
+            self.assertIs(owner_seen_at_close[0], owner)
+
+            session.close_failure = False
+            adapter.close()
+            self.assertIs(owner_seen_at_close[1], owner)
+            self.assertIsNone(adapter._registration_owner)
+        finally:
+            if not adapter._closed:
+                session.close_failure = False
+                adapter.close()
+
+    def test_lazy_and_unknown_allocator_fall_back_to_per_object(self):
+        class LazyMemoryAllocator:
+            pass
+        for parent in (LazyMemoryAllocator(), object()):
+            with self.subTest(parent=type(parent).__name__):
+                adapter, session = self.adapter(register_arena=True, desc=self.desc())
+                try:
+                    obj = MemoryObj(parent_allocator=parent)
+                    self.assertTrue(self.store(adapter, "key", obj).success)
+                    self.assertEqual(session.arena_calls, [])
+                    status = adapter.report_status()
+                    self.assertEqual(status["registration_source"], "per_object")
+                    self.assertEqual(status["registration_fallback_reason"],
+                                     "not_fixed_shm_allocator")
+                finally:
+                    adapter.close()
+
+    def test_descriptor_backing_mismatch_falls_back_without_arena_registration(self):
+        base, size = 4096, 64 << 20
+        owner = MixedMemoryAllocator(base, size)
+        for desc in (self.desc(base + 4096, size), self.desc(base, size - 4096)):
+            with self.subTest(desc=desc):
+                adapter, session = self.adapter(register_arena=True, desc=desc)
+                try:
+                    obj = MemoryObj(base, 18 << 20, owner)
+                    self.assertTrue(self.store(adapter, "key", obj).success)
+                    self.assertEqual(session.arena_calls, [])
+                    status = adapter.report_status()
+                    self.assertEqual(status["registration_source"], "per_object")
+                    self.assertEqual(status["registration_fallback_reason"],
+                                     "fixed_shm_bounds_not_proven")
+                finally:
+                    adapter.close()
+
+    def test_registration_opt_out_keeps_per_object_path(self):
+        owner = MixedMemoryAllocator()
+        adapter, session = self.adapter(register_arena=False, desc=self.desc())
+        try:
+            self.assertTrue(self.store(adapter, "key", MemoryObj(parent_allocator=owner)).success)
+            self.assertEqual(session.arena_calls, [])
+            self.assertIsNone(adapter._registration_owner)
+            self.assertEqual(adapter.report_status()["registration_source"], "per_object")
         finally:
             adapter.close()
 
     def test_chunk_option_requires_rdma_arena_and_forwards_bytes_on_owner_thread(self):
         factory = MagicMock()
         adapter_type = load_adapter(factory)
-        desc = SimpleNamespace(ptr=4096, size=1 << 30,
-                               stable_registration_size=None,
-                               stable_host_registration_size=64 << 20)
+        desc = self.desc(4096, 64 << 20)
         common = dict(register_l1_arena=True, l1_registration_chunk_mb=32,
                       join_coord_url="http://127.0.0.1:29595", join_group_id="cpu-chunks")
         invalid = [
@@ -427,26 +531,15 @@ class AdapterContracts(unittest.TestCase):
             return sessions[-1]
         params = dict(data_op_type="DEVICE_RDMA", **common)
         adapter = load_adapter(session_factory)(params, desc)
+        owner = MixedMemoryAllocator(size=64 << 20)
         try:
-            self.assertEqual(sessions[0].arena, (desc.ptr, desc.stable_host_registration_size))
+            self.assertIsNone(getattr(sessions[0], "arena", None))
+            self.assertTrue(self.store(adapter, "key", MemoryObj(parent_allocator=owner)).success)
+            self.assertEqual(sessions[0].arena_calls, [(desc.ptr, desc.size, 32 << 20)])
             self.assertEqual(sessions[0].arena_chunk_size, 32 << 20)
             self.assertEqual(adapter.report_status()["registration_arena_bytes"], 64 << 20)
         finally:
             adapter.close()
-
-    def adapter(self, rdma=True):
-        sessions = []
-        def factory(**kwargs):
-            sessions.append(Session(**kwargs))
-            return sessions[-1]
-        params = dict(device_id=0, world_size=2, pool_gb=1, storage_rank=1, slot_size_mb=32,
-                      store_url="cpu-only")
-        if rdma:
-            params.update(data_op_type="DEVICE_RDMA", device_nic="tcp://127.0.0.1:10005",
-                          enable_56bits_gva=True, join_coord_url="http://127.0.0.1:29595",
-                          join_group_id="cpu-only-fresh")
-        adapter = load_adapter(factory)(params)
-        return adapter, sessions[0]
 
     def test_configuration_and_success_use_registered_entry_on_owner_thread(self):
         adapter, session = self.adapter()
