@@ -123,6 +123,8 @@ def read_config(path):
     service_context = cfg.get("service_context_logical_device", 0)
     if type(service_context) is not int or not 0 <= service_context < len(service_devices):
         raise ValueError("service_context_logical_device must index devices.service")
+    if "l1_shm_name" in cfg and not isinstance(cfg["l1_shm_name"], str):
+        raise ValueError("l1_shm_name must be a string; empty selects fixed non-SHM backing")
     _protocol(cfg)
     return cfg
 
@@ -147,7 +149,7 @@ def commands(cfg, config_path):
               "--kv-transfer-config", json.dumps(connector)]
     if "shutdown_timeout" in cfg:
         engine += ["--shutdown-timeout", str(shutdown_timeout)]
-    return {
+    argv = {
         "service": [py, "-u", str(Path(__file__).resolve()), "--config", config_path,
                     "--role", "service"],
         "service_cli": ["server", "--host", "127.0.0.1", "--port", str(p["rpc"]),
@@ -165,6 +167,10 @@ def commands(cfg, config_path):
                   "--decoder-host", "127.0.0.1", "--decoder-port", str(p["d"]),
                   "--telemetry-port", str(p["telemetry"])],
     }
+    if "l1_shm_name" in cfg:
+        # Use existing official configuration, not a core/allocator patch.
+        argv["service_cli"] += ["--shm-name", cfg["l1_shm_name"], "--no-l1-use-lazy"]
+    return argv
 
 
 def pool(status, cfg):
