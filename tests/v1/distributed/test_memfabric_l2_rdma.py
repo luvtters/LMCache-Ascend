@@ -94,15 +94,6 @@ class Session:
             raise RuntimeError("fake session close failed")
 
 
-class MixedMemoryAllocator:
-    def __init__(self, pointer=4096, size=18 << 20, shm_name="lmcache_l1_pool_cpu"):
-        self.buffer = rdma_cpu.tensor(pointer, size)
-        self.buffer.device.type = "cpu"
-        self.size = size
-        self.shm_name = shm_name
-        self._unregistered = False
-
-
 def load_adapter(factory):
     class Base:
         def __init__(self, **kwargs):
@@ -122,8 +113,6 @@ def load_adapter(factory):
         "lmcache": dict(__path__=[]),
         "lmcache.v1": dict(__path__=[]),
         "lmcache.v1.memory_allocators": dict(__path__=[]),
-        "lmcache.v1.memory_allocators.mixed_memory_allocator": dict(
-            MixedMemoryAllocator=MixedMemoryAllocator),
         "lmcache.v1.platform": dict(create_event_notifier=lambda: MagicMock()),
         "lmcache_ascend.v1.distributed.memfabric_bm": dict(BMSession=factory),
     }
@@ -405,100 +394,76 @@ class AdapterContracts(unittest.TestCase):
         return adapter, sessions[0]
 
     @staticmethod
-    def desc(pointer=4096, size=64 << 20):
-        # Fixed official core descriptor: deliberately has no new field.
-        return SimpleNamespace(ptr=pointer, size=size, align_bytes=4096)
+    def desc(pointer=4096, size=64 << 20, stable=32 << 20):
+        return SimpleNamespace(ptr=pointer, size=size, align_bytes=4096,
+                               stable_registration_size=stable)
 
     def store(self, adapter, key, obj):
         with patch.dict("sys.modules", adapter.__class__._cpu_import_modules):
             return adapter._executor.submit(adapter._store, [key], [obj]).result()
 
-    def test_fixed_shm_first_copy_configures_once_and_reuses_owner(self):
-        base, size = 4096, 64 << 20
-        owner = MixedMemoryAllocator(base, size)
-        adapter, session = self.adapter(register_arena=True, desc=self.desc(base, size))
-        first = MemoryObj(base, 18 << 20, owner)
-        second = MemoryObj(base + (18 << 20), 18 << 20, owner)
+    def test_public_stable_prefix_registers_prefix_not_descriptor_capacity(self):
+        base, capacity, stable = 4096, 64 << 20, 32 << 20
+        adapter, session = self.adapter(register_arena=True,
+                                        desc=self.desc(base, capacity, stable))
         try:
-            self.assertTrue(self.store(adapter, "first", first).success)
-            self.assertTrue(self.store(adapter, "second", second).success)
-            self.assertEqual(session.arena_calls, [(base, size, 0)])
-            self.assertEqual(session.arena, (base, size))
-            self.assertIs(adapter._registration_owner, owner)
+            self.assertEqual(session.arena_calls, [(base, stable, 0)])
+            self.assertEqual(session.arena, (base, stable))
+            self.assertTrue(self.store(adapter, "inside-prefix", MemoryObj(base, 18 << 20)).success)
             status = adapter.report_status()
-            self.assertEqual(status["registration_source"], "fixed_shm_allocator")
-            self.assertEqual(status["registration_arena_bytes"], size)
+            self.assertEqual(status["registration_source"], "stable_registration_size")
+            self.assertEqual(status["registration_arena_bytes"], stable)
+            self.assertLess(status["registration_arena_bytes"], capacity)
         finally:
             adapter.close()
 
-    def test_fixed_shm_owner_is_retained_until_session_close_succeeds(self):
-        owner = MixedMemoryAllocator(size=64 << 20)
-        adapter, session = self.adapter(register_arena=True, desc=self.desc())
-        try:
-            self.assertTrue(self.store(adapter, "key", MemoryObj(parent_allocator=owner)).success)
-            owner_seen_at_close = []
-            original_close = session.close
-            def close_and_observe_owner():
-                owner_seen_at_close.append(adapter._registration_owner)
-                original_close()
-            session.close = close_and_observe_owner
-
-            session.close_failure = True
-            with self.assertRaisesRegex(RuntimeError, "fake session close failed"):
-                adapter.close()
-            self.assertIs(adapter._registration_owner, owner)
-            self.assertIs(owner_seen_at_close[0], owner)
-
-            session.close_failure = False
-            adapter.close()
-            self.assertIs(owner_seen_at_close[1], owner)
-            self.assertIsNone(adapter._registration_owner)
-        finally:
-            if not adapter._closed:
-                session.close_failure = False
-                adapter.close()
-
-    def test_lazy_and_unknown_allocator_fall_back_to_per_object(self):
-        class LazyMemoryAllocator:
-            pass
-        for parent in (LazyMemoryAllocator(), object()):
-            with self.subTest(parent=type(parent).__name__):
-                adapter, session = self.adapter(register_arena=True, desc=self.desc())
-                try:
-                    obj = MemoryObj(parent_allocator=parent)
-                    self.assertTrue(self.store(adapter, "key", obj).success)
-                    self.assertEqual(session.arena_calls, [])
-                    status = adapter.report_status()
-                    self.assertEqual(status["registration_source"], "per_object")
-                    self.assertEqual(status["registration_fallback_reason"],
-                                     "not_fixed_shm_allocator")
-                finally:
-                    adapter.close()
-
-    def test_descriptor_backing_mismatch_falls_back_without_arena_registration(self):
-        base, size = 4096, 64 << 20
-        owner = MixedMemoryAllocator(base, size)
-        for desc in (self.desc(base + 4096, size), self.desc(base, size - 4096)):
+    def test_shm_none_and_missing_public_descriptor_fall_back_to_per_object(self):
+        base, capacity = 4096, 64 << 20
+        descriptors = (
+            None,
+            SimpleNamespace(ptr=base, size=capacity, align_bytes=4096),
+            self.desc(base, capacity, None),
+        )
+        for desc in descriptors:
             with self.subTest(desc=desc):
                 adapter, session = self.adapter(register_arena=True, desc=desc)
                 try:
-                    obj = MemoryObj(base, 18 << 20, owner)
-                    self.assertTrue(self.store(adapter, "key", obj).success)
                     self.assertEqual(session.arena_calls, [])
+                    self.assertTrue(self.store(adapter, "key", MemoryObj()).success)
                     status = adapter.report_status()
                     self.assertEqual(status["registration_source"], "per_object")
                     self.assertEqual(status["registration_fallback_reason"],
-                                     "fixed_shm_bounds_not_proven")
+                                     "stable_prefix_not_exposed")
+                    self.assertEqual(session.operations, ["registered_cpu"])
                 finally:
                     adapter.close()
 
+    def test_invalid_public_stable_prefix_is_rejected_before_session_creation(self):
+        factory = MagicMock()
+        adapter_type = load_adapter(factory)
+        invalid_descriptors = (
+            self.desc(stable=0),
+            self.desc(stable=-4096),
+            self.desc(stable=4097),
+            self.desc(size=32 << 20, stable=64 << 20),
+            self.desc(pointer=4097, stable=32 << 20),
+            SimpleNamespace(ptr=4096, size=64 << 20, stable_registration_size="32MiB"),
+        )
+        params = dict(device_id=0, world_size=2, pool_gb=1, storage_rank=1,
+                      slot_size_mb=32, store_url="cpu-only", data_op_type="DEVICE_RDMA",
+                      device_nic="tcp://127.0.0.1:10005", enable_56bits_gva=True,
+                      join_coord_url="http://127.0.0.1:29595", join_group_id="cpu-invalid-desc",
+                      register_l1_arena=True)
+        for desc in invalid_descriptors:
+            with self.subTest(desc=desc), self.assertRaisesRegex(ValueError, "Invalid public stable L1 prefix"):
+                adapter_type(params, desc)
+        factory.assert_not_called()
+
     def test_registration_opt_out_keeps_per_object_path(self):
-        owner = MixedMemoryAllocator()
         adapter, session = self.adapter(register_arena=False, desc=self.desc())
         try:
-            self.assertTrue(self.store(adapter, "key", MemoryObj(parent_allocator=owner)).success)
+            self.assertTrue(self.store(adapter, "key", MemoryObj()).success)
             self.assertEqual(session.arena_calls, [])
-            self.assertIsNone(adapter._registration_owner)
             self.assertEqual(adapter.report_status()["registration_source"], "per_object")
         finally:
             adapter.close()
@@ -506,7 +471,7 @@ class AdapterContracts(unittest.TestCase):
     def test_chunk_option_requires_rdma_arena_and_forwards_bytes_on_owner_thread(self):
         factory = MagicMock()
         adapter_type = load_adapter(factory)
-        desc = self.desc(4096, 64 << 20)
+        desc = self.desc(4096, 64 << 20, 48 << 20)
         common = dict(register_l1_arena=True, l1_registration_chunk_mb=32,
                       join_coord_url="http://127.0.0.1:29595", join_group_id="cpu-chunks")
         invalid = [
@@ -531,13 +496,12 @@ class AdapterContracts(unittest.TestCase):
             return sessions[-1]
         params = dict(data_op_type="DEVICE_RDMA", **common)
         adapter = load_adapter(session_factory)(params, desc)
-        owner = MixedMemoryAllocator(size=64 << 20)
         try:
-            self.assertIsNone(getattr(sessions[0], "arena", None))
-            self.assertTrue(self.store(adapter, "key", MemoryObj(parent_allocator=owner)).success)
-            self.assertEqual(sessions[0].arena_calls, [(desc.ptr, desc.size, 32 << 20)])
+            self.assertEqual(sessions[0].arena_calls, [(desc.ptr, desc.stable_registration_size, 32 << 20)])
+            self.assertTrue(self.store(adapter, "key", MemoryObj()).success)
+            self.assertEqual(sessions[0].arena_calls, [(desc.ptr, desc.stable_registration_size, 32 << 20)])
             self.assertEqual(sessions[0].arena_chunk_size, 32 << 20)
-            self.assertEqual(adapter.report_status()["registration_arena_bytes"], 64 << 20)
+            self.assertEqual(adapter.report_status()["registration_arena_bytes"], 48 << 20)
         finally:
             adapter.close()
 
