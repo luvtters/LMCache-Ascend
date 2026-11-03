@@ -103,6 +103,19 @@ class JoinBarrierTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "requires the fixed-group JOIN"):
             session.copy_cpu_object(MemoryObj(), 1 << 30, 18 << 20, store=True)
 
+    def test_shared_directory_rank_refuses_single_service_peer(self):
+        def join(rank):
+            session = self.session(rank)
+            if rank == 0:
+                session._join_contract["directory_epoch"] = "new-directory"
+            session._on_group_event(rank, 0)
+            with self.assertRaisesRegex(ValueError, "contract mismatch"):
+                session.wait_fixed_group_ready(self.url, "fresh", 2)
+            self.assertFalse(session._join_barrier_complete)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(join, (0, 1)))
+
 
 if __name__ == "__main__":
     unittest.main()

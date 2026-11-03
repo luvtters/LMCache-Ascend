@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental single-service LMCache L2 backed by a MemFabric DRAM rank.
+"""LMCache L2 backed by a fixed MemFabric DRAM rank.
 
 Keys are immutable and the index is volatile. Fixed-size slots keep allocation
 simple. One I/O thread owns BM; lookup locks protect slots from eviction until
-unlock. This first version targets a fixed group on one A3 host.
+unlock. Two independent services can opt into a common volatile directory.
 """
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 import threading
 import time
+from types import MappingProxyType
 
 from lmcache.lmcache_native import Bitmap
 from lmcache.logging import init_logger
@@ -36,6 +38,7 @@ class _Entry:
 class MemFabricL2Adapter(L2AdapterInterface):
     def __init__(self, params, l1_memory_desc=None):
         allowed = {"device_id", "world_size", "pool_gb", "storage_rank",
+                   "rank_id", "shared_directory",
                    "slot_size_mb", "store_url", "data_op_type", "device_nic", "enable_56bits_gva",
                    "join_coord_url", "join_group_id", "register_l1_arena", "l1_registration_chunk_mb"}
         if set(params) - allowed:
@@ -74,6 +77,17 @@ class MemFabricL2Adapter(L2AdapterInterface):
             raise ValueError("L2 DEVICE_RDMA requires explicit join_coord_url and fresh join_group_id")
         world = params.get("world_size", 1)
         pool_gb = params.get("pool_gb", 1)
+        self._rank = params.get("rank_id", 0)
+        shared = params.get("shared_directory", False)
+        if type(shared) is not bool or type(self._rank) is not int:
+            raise ValueError("shared_directory must be a bool and rank_id an integer")
+        if shared and (world != 2 or self._rank not in (0, 1) or "rank_id" not in params
+                       or self._data_op_type != "DEVICE_RDMA"):
+            raise ValueError("shared_directory requires two DEVICE_RDMA adapters with explicit rank_ids 0 and 1")
+        if shared and ("storage_rank" not in params or not params.get("store_url")):
+            raise ValueError("shared_directory requires an explicit storage_rank and BM store_url")
+        if not shared and self._rank != 0:
+            raise ValueError("Nonzero adapter rank_id requires shared_directory")
         self.storage_rank = params.get("storage_rank", world - 1)
         slot_mb = params.get("slot_size_mb", 32)
         values = (device, world, pool_gb, self.storage_rank, slot_mb)
@@ -86,7 +100,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
         if capacity % self._slot_size:
             raise ValueError("slot_size_mb must divide pool_gb * 1024")
         super().__init__(max_capacity_bytes=capacity)
-        self._free = list(reversed(range(capacity // self._slot_size)))
+        self._slot_count = capacity // self._slot_size
+        self._free = [] if shared else list(reversed(range(self._slot_count)))
+        self._directory = None
         self._entries = OrderedDict()
         self._quarantine = []
         self._state_lock = threading.RLock()
@@ -104,9 +120,19 @@ class MemFabricL2Adapter(L2AdapterInterface):
         try:
             optional = {name: params[name] for name in (
                 "data_op_type", "device_nic", "enable_56bits_gva", "join_coord_url", "join_group_id") if name in params}
+            store_url = params.get("store_url", "tcp://127.0.0.1:28580")
+            if shared:
+                from lmcache_ascend.v1.distributed.memfabric_directory_rpc import DirectoryClient
+
+                contract = dict(world_size=world, storage_rank=self.storage_rank,
+                                pool_gb=pool_gb, slot_size_mb=slot_mb, store_url=store_url)
+                self._directory = DirectoryClient(params["join_coord_url"], params["join_group_id"],
+                                                  self._rank, contract)
+                self._directory.on_retired = self._notify_retired
+                optional["directory_epoch"] = self._directory.epoch
             self._session = self._executor.submit(
-                BMSession, device_id=device, rank_id=0, world_size=world,
-                pool_gb=pool_gb, store_url=params.get("store_url", "tcp://127.0.0.1:28580"), **optional
+                BMSession, device_id=device, rank_id=self._rank, world_size=world,
+                pool_gb=pool_gb, store_url=store_url, **optional
             ).result()
             self._base = self._executor.submit(
                 self._session.peer_address, self.storage_rank
@@ -123,6 +149,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
             raise
         logger.info("MEMFABRIC_READY protocol=%s storage_rank=%d capacity=%d slot=%d",
                     self._data_op_type, self.storage_rank, capacity, self._slot_size)
+        if shared:
+            logger.info("MEMFABRIC_SHARED_DIRECTORY rank=%d owner=%d epoch=%s",
+                        self._rank, self.storage_rank, self._directory.epoch)
         if self._register_l1_arena:
             logger.info("MEMFABRIC_ARENA_SOURCE source=%s bytes=%d fallback_reason=%s",
                         "stable_registration_size" if self._registration_arena_bytes else "per_object",
@@ -202,7 +231,19 @@ class MemFabricL2Adapter(L2AdapterInterface):
                 raise RuntimeError("MemFabric adapter is closed")
             if self._poisoned:
                 raise RuntimeError(self._last_error or "BM is unavailable")
-            self._executor.submit(operation, list(keys))
+            future = self._executor.submit(operation, list(keys))
+            if self._directory:
+                future.add_done_callback(self._observe_background_error)
+
+    def _observe_background_error(self, future):
+        # Core provides no result handle for delete/unlock. Surface a rejected
+        # control operation through health and the next submitted task.
+        exc = future.exception()
+        if exc is not None:
+            with self._state_lock:
+                self._poisoned = True
+                self._last_error = str(exc)
+            logger.error("MemFabric shared-directory operation failed: %s", exc)
 
     def submit_unlock(self, keys):
         self._enqueue(self._unlock, keys)
@@ -237,6 +278,46 @@ class MemFabricL2Adapter(L2AdapterInterface):
             self._remove(victim)
             self._evicted_objects += 1
         return self._free.pop()
+
+    @staticmethod
+    def _wire_key(key):
+        # Official core includes KV shard, object group and cache salt.
+        return json.dumps(asdict(key.to_encoded_object_key()), sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _wire_layout(shapes, dtypes, memory_format=None):
+        result = [[list(shape) for shape in shapes], [str(dtype) for dtype in dtypes]]
+        if memory_format is not None:
+            result.append(str(memory_format))
+        return result
+
+    def _notify_retired(self, retired):
+        # The directory delivers a retired key once to the rank that published
+        # it, even when the peer triggered deletion/eviction. This balances the
+        # original core notification and its per-publisher byte accounting.
+        from lmcache.v1.distributed.api import EncodedObjectKey
+
+        keys = [EncodedObjectKey(**json.loads(key)).to_object_key() for key, _ in retired]
+        self._notify_keys_deleted(keys, [size for _, size in retired])
+
+    def _directory_call(self, op, **args):
+        try:
+            return self._directory.call(op, **args)
+        except ValueError:
+            raise  # Definitive rejection, e.g. a full pool.
+        except Exception as exc:
+            # The reply can be lost *after* a mutation. Never retry or free an
+            # uncertain reservation/pin. Rebuild both ranks with a fresh group.
+            self._poisoned = True
+            self._last_error = str(exc)
+            raise
+
+    def _slot_address(self, slot):
+        if type(slot) is not int or not 0 <= slot < self._slot_count:
+            self._poisoned = True
+            self._last_error = f"Invalid BM slot returned: {slot!r}"
+            raise RuntimeError(self._last_error)
+        return self._base + slot * self._slot_size
 
     def _copy(self, obj, address, size, *, store):
         if self._data_op_type == "DEVICE_RDMA":
@@ -275,14 +356,24 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     raise RuntimeError(self._last_error or "BM is unavailable")
                 for key, obj in zip(keys, objects, strict=True):
                     _, size, layout = self._buffer(obj)
-                    if key in self._entries:
+                    if self._directory:
+                        wire_key = self._wire_key(key)
+                        slot = self._directory_call("reserve", key=wire_key, size=size,
+                                                    layout=self._wire_layout(*layout), cache_salt=key.cache_salt)
+                        if slot is None:
+                            continue
+                    elif key in self._entries:
                         old = self._entries[key]
                         if (old.size, old.layout) != (size, layout):
                             raise ValueError("An existing key has a different layout")
                         continue
-                    slot = self._reserve()
-                    self._copy(obj, self._base + slot * self._slot_size, size, store=True)
-                    self._entries[key] = _Entry(slot, size, layout)
+                    else:
+                        slot = self._reserve()
+                    self._copy(obj, self._slot_address(slot), size, store=True)
+                    if self._directory:
+                        self._directory_call("commit", key=wire_key, slot=slot)
+                    else:
+                        self._entries[key] = _Entry(slot, size, layout)
                     self._notify_keys_stored([key], [size])
                     total += size
                     self._written_bytes += size
@@ -306,10 +397,16 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     raise RuntimeError(self._last_error or "BM RDMA is unavailable")
                 return found
             for i, key in enumerate(keys):
+                hint = layouts.get(key.object_group_id)
+                if self._directory:
+                    match = None if hint is None else self._wire_layout(hint.shapes, hint.dtypes)
+                    entry = self._directory_call("pin", key=self._wire_key(key), hint=match)
+                    if entry is not None:
+                        found.set(i)
+                    continue
                 entry = self._entries.get(key)
                 if entry is None or entry.delete_pending:
                     continue
-                hint = layouts.get(key.object_group_id)
                 if hint is not None:
                     expected = (tuple(tuple(s) for s in hint.shapes), tuple(hint.dtypes))
                     if entry.layout[:2] != expected:
@@ -330,16 +427,26 @@ class MemFabricL2Adapter(L2AdapterInterface):
             for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
                 if self._poisoned:
                     break
-                entry = self._entries.get(key)
-                if entry is None:
-                    continue
                 try:
+                    if self._directory:
+                        pinned = self._directory_call("load", key=self._wire_key(key))
+                        if pinned is None:
+                            continue
+                        slot = pinned["slot"]
+                    else:
+                        entry = self._entries.get(key)
+                        if entry is None:
+                            continue
+                        slot = entry.slot
                     _, size, layout = self._buffer(obj)
-                    if (entry.size, entry.layout) != (size, layout):
+                    if self._directory:
+                        if pinned["size"] != size or pinned["layout"] != self._wire_layout(*layout):
+                            continue
+                    elif (entry.size, entry.layout) != (size, layout):
                         continue
-                    self._copy(obj, self._base + entry.slot * self._slot_size,
-                               size, store=False)
-                    self._entries.move_to_end(key)
+                    self._copy(obj, self._slot_address(slot), size, store=False)
+                    if not self._directory:
+                        self._entries.move_to_end(key)
                     found.set(i)
                     total += size
                     self._read_bytes += size
@@ -358,6 +465,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
             if self._poisoned:
                 raise RuntimeError(self._last_error or "BM is unavailable")
             for key in keys:
+                if self._directory:
+                    self._directory_call("unpin", key=self._wire_key(key))
+                    continue
                 entry = self._entries.get(key)
                 if entry is not None and entry.pins:
                     entry.pins -= 1
@@ -369,6 +479,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
             if self._poisoned:
                 raise RuntimeError(self._last_error or "BM is unavailable")
             for key in keys:
+                if self._directory:
+                    self._directory_call("delete", key=self._wire_key(key))
+                    continue
                 entry = self._entries.get(key)
                 if entry is not None:
                     if entry.pins:
@@ -377,7 +490,17 @@ class MemFabricL2Adapter(L2AdapterInterface):
                         self._remove(key)
 
     def get_memory_tags(self):
-        return MemoryTags(MemorySegment.DRAM, MemoryResidency.LOCAL)
+        return MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE if self._directory else MemoryResidency.LOCAL)
+
+    def get_usage(self):
+        if not self._directory:
+            return super().get_usage()
+        from lmcache.v1.distributed.l2_adapters.base import AdapterUsage
+
+        with self._state_lock:
+            stats = self._directory_call("status")
+        return AdapterUsage(stats["total_bytes_used"], self._slot_count * self._slot_size,
+                            MappingProxyType(stats["bytes_by_cache_salt"]))
 
     def _observe_peer_departure(self):
         if not self._poisoned and self._session.peer_departed.is_set():
@@ -390,6 +513,15 @@ class MemFabricL2Adapter(L2AdapterInterface):
     def report_status(self):
         with self._state_lock:
             self._observe_peer_departure()
+            shared_stats = {}
+            if self._directory:
+                try:
+                    shared_stats = self._directory_call("status")
+                except Exception:
+                    # Preserve the diagnostic path even when the directory is
+                    # offline. A missing response cannot establish an empty pool.
+                    shared_stats = dict.fromkeys(("objects", "free_slots", "locked_objects",
+                                                  "total_pins", "evicted_objects", "pending_writes"))
             return {"is_healthy": not self._closed and not self._poisoned,
                     "protocol": self._data_op_type, "enable_56bits_gva": self._enable_56bits_gva,
                     "register_l1_arena": self._register_l1_arena,
@@ -405,7 +537,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     "total_pins": sum(e.pins for e in self._entries.values()),
                     "evicted_objects": self._evicted_objects,
                     "store_bytes": self._written_bytes, "load_bytes": self._read_bytes,
-                    "last_error": self._last_error}
+                    "rank_id": self._rank, "shared_directory": self._directory is not None,
+                    "last_error": self._last_error, **shared_stats}
 
     def _close_bm(self):
         self._session.wait()

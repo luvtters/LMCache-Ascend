@@ -22,7 +22,7 @@ class BMSession:
     def __init__(self, *, device_id, rank_id, world_size, pool_gb, store_url,
                  init_timeout=90, pool_memory_type="host", data_op_type="SDMA",
                  device_nic=None, enable_56bits_gva=False,
-                 join_coord_url=None, join_group_id=None):
+                 join_coord_url=None, join_group_id=None, directory_epoch=None):
         if bool(join_coord_url) != bool(join_group_id):
             raise ValueError("join_coord_url and join_group_id must be configured together")
         if join_coord_url and (urlparse(join_coord_url).scheme not in ("http", "https")
@@ -66,6 +66,10 @@ class BMSession:
         self._join_contract = dict(world_size=world_size, store_url=store_url,
             pool_gb=pool_gb, pool_memory_type=pool_memory_type,
             data_op_type=data_op_type, enable_56bits_gva=enable_56bits_gva)
+        if directory_epoch is not None:
+            # Every data-plane member must have claimed this same directory
+            # incarnation before any member can touch its assigned slots.
+            self._join_contract["directory_epoch"] = directory_epoch
         self.device_id = device_id
         self.data_op_type = data_op_type
         self._registered_cpu_objects = {}

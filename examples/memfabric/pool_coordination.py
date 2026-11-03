@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import runpy
 import signal
 import socket
 import threading
@@ -12,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 
 def host_identity():
@@ -50,12 +52,75 @@ def wait_event(base, run_id, name, timeout):
         time.sleep(min(.02, max(0, deadline - time.monotonic())))
 
 
-def make_server(bind, port, directory, run_id, trace_dir=None):
+class SharedDirectory:
+    """One volatile slot directory and two fixed adapter identities for one run."""
+
+    def __init__(self, geometry):
+        required = {'storage_rank', 'pool_gb', 'slot_size_mb'}
+        if set(geometry) != required or any(type(v) is not int for v in geometry.values()):
+            raise ValueError('invalid shared L2 pool geometry')
+        pool_mb, slot_mb = geometry['pool_gb'] * 1024, geometry['slot_size_mb']
+        if (geometry['storage_rank'] not in (0, 1) or pool_mb <= 0 or slot_mb <= 0
+                or pool_mb % slot_mb):
+            raise ValueError('invalid two-rank shared L2 pool geometry')
+        # Standalone CPU coordinator. Importing lmcache_ascend activates platform
+        # hooks, so load only its stdlib directory implementation from this checkout.
+        source = Path(__file__).resolve().parents[2] / 'lmcache_ascend/v1/distributed/memfabric_directory.py'
+        self.pool = runpy.run_path(str(source))['PoolDirectory'](pool_mb // slot_mb, slot_mb << 20)
+        self.geometry = dict(world_size=2, **geometry)
+        self.store_url = None
+        self.epoch = uuid.uuid4().hex
+        self.claims = {}
+        self.lock = threading.Lock()
+
+    def handle(self, method, request):
+        rank = request.get('rank')
+        if type(rank) is not int or rank not in (0, 1):
+            raise ValueError('shared L2 requires adapter rank 0 or 1')
+        with self.lock:
+            if method == 'claim':
+                contract = request.get('contract')
+                if (set(request) != {'contract', 'rank'} or not isinstance(contract, dict)
+                        or set(contract) != self.geometry.keys() | {'store_url'}):
+                    raise ValueError('invalid shared L2 claim')
+                if any(type(contract[k]) is not int or contract[k] != v for k, v in self.geometry.items()):
+                    return 409, {'error': 'shared L2 geometry contract mismatch'}
+                store_url = contract['store_url']
+                if not isinstance(store_url, str) or not store_url:
+                    raise ValueError('invalid shared L2 store_url')
+                if self.store_url is not None and store_url != self.store_url:
+                    return 409, {'error': 'shared L2 store_url contract mismatch'}
+                if rank in self.claims:
+                    return 409, {'error': 'shared L2 adapter rank already claimed'}
+                self.store_url = store_url
+                self.claims[rank] = uuid.uuid4().hex
+                return 200, dict(epoch=self.epoch, claim=self.claims[rank])
+            if (set(request) != {'rank', 'epoch', 'claim', 'op', 'args'}
+                    or not isinstance(request['op'], str) or not isinstance(request['args'], dict)):
+                raise ValueError('invalid shared L2 call')
+            if (request['epoch'] != self.epoch or rank not in self.claims
+                    or request['claim'] != self.claims[rank]):
+                return 409, {'error': 'stale shared L2 epoch or invalid rank claim'}
+            try:
+                # apply is the directory's closed operation and argument whitelist.
+                result = self.pool.apply(rank, request['op'], request['args'])
+            except ValueError as error:
+                return 422, dict(epoch=self.epoch, error=str(error))
+            return 200, dict(epoch=self.epoch, result=result, retired=self.pool.take_retired(rank))
+
+
+def make_server(bind, port, directory, run_id, trace_dir=None, *, shared_directory=None):
     """One explicit attempt per server; durable immutable events reject overwrite."""
     directory = Path(directory) / run_id
-    directory.mkdir(parents=True, exist_ok=True)
+    shared = None
+    if shared_directory is not None:
+        if not run_id or any(not (c.isalnum() or c in '-_') for c in run_id):
+            raise ValueError('invalid shared L2 run-id')
+        shared = SharedDirectory(shared_directory)
+    directory.mkdir(parents=True, exist_ok=shared is None)
     lock = threading.Lock()
     prefix = '/runs/' + urllib.parse.quote(run_id, safe='') + '/events'
+    shared_prefix = '/runs/' + urllib.parse.quote(run_id, safe='') + '/directory/'
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -63,6 +128,10 @@ def make_server(bind, port, directory, run_id, trace_dir=None):
 
         def respond(self, code, value):
             data = json.dumps(value).encode('utf-8')
+            if self.path.startswith(shared_prefix) and len(data) > 65536:
+                # The operation may already have consumed retirement events.
+                # A recoverable (422) rejection would let the caller keep using stale state.
+                code, data = 500, b'{"error":"shared L2 directory response exceeds 65536 bytes"}'
             self.send_response(code)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
@@ -110,6 +179,25 @@ def make_server(bind, port, directory, run_id, trace_dir=None):
             self.respond(200, dict(run_id=run_id, events=events))
 
         def do_POST(self):
+            if shared is not None and self.path in (shared_prefix + 'claim', shared_prefix + 'call'):
+                try:
+                    size = int(self.headers.get('Content-Length', 0))
+                    if (self.headers.get_content_type() != 'application/json' or not 0 < size <= 65536
+                            or self.headers.get('Transfer-Encoding')):
+                        raise ValueError('shared L2 requires a JSON metadata body of 1..65536 bytes')
+                    raw = self.rfile.read(size)
+                    if len(raw) != size:
+                        raise ValueError('incomplete shared L2 metadata')
+                    value = json.loads(raw)
+                    if not isinstance(value, dict):
+                        raise ValueError('shared L2 metadata must be an object')
+                except (ValueError, RecursionError) as error:
+                    return self.respond(400, {'error': str(error)})
+                try:
+                    code, result = shared.handle(self.path[len(shared_prefix):], value)
+                except ValueError as error:
+                    return self.respond(400, {'error': str(error)})
+                return self.respond(code, result)
             name = urllib.parse.unquote(self.path[len(prefix) + 1:])
             if (not self.path.startswith(prefix + '/') or not name or
                     any(not (char.isalnum() or char in '-_') for char in name)):
@@ -144,11 +232,23 @@ def main():
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--trace-dir', type=Path)
+    parser.add_argument('--shared-l2', action='store_true',
+                        help='create a volatile shared L2 directory for two adapter ranks in a fresh run')
+    parser.add_argument('--storage-rank', type=int, choices=(0, 1))
+    parser.add_argument('--pool-gb', type=int)
+    parser.add_argument('--slot-size-mb', type=int)
     args = parser.parse_args()
     if not args.run_id or any(not (c.isalnum() or c in '-_') for c in args.run_id):
         parser.error('invalid run-id')
+    geometry = dict(storage_rank=args.storage_rank, pool_gb=args.pool_gb, slot_size_mb=args.slot_size_mb)
+    if args.shared_l2:
+        if any(v is None for v in geometry.values()):
+            parser.error('--shared-l2 requires --storage-rank, --pool-gb and --slot-size-mb')
+    elif any(v is not None for v in geometry.values()):
+        parser.error('shared L2 geometry requires --shared-l2')
     signal.signal(signal.SIGINT, signal.default_int_handler)
-    server = make_server(args.bind, args.port, args.directory, args.run_id, args.trace_dir)
+    server = make_server(args.bind, args.port, args.directory, args.run_id, args.trace_dir,
+                         shared_directory=geometry if args.shared_l2 else None)
     print(json.dumps(dict(event='listening', bind=args.bind, port=server.server_port,
                           host_id=host_identity(), run_id=args.run_id)), flush=True)
     try:
