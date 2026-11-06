@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""LMCache L2 backed by a fixed MemFabric DRAM rank.
+"""LMCache L2 backed by MemFabric DRAM segments.
 
 Keys are immutable and the index is volatile. Fixed-size slots keep allocation
 simple. One I/O thread owns BM; lookup locks protect slots from eviction until
@@ -37,7 +37,7 @@ class _Entry:
 
 class MemFabricL2Adapter(L2AdapterInterface):
     def __init__(self, params, l1_memory_desc=None):
-        allowed = {"device_id", "world_size", "pool_gb", "storage_rank",
+        allowed = {"device_id", "world_size", "pool_gb", "storage_rank", "storage_ranks",
                    "rank_id", "shared_directory",
                    "slot_size_mb", "store_url", "data_op_type", "device_nic", "enable_56bits_gva",
                    "join_coord_url", "join_group_id", "register_l1_arena", "l1_registration_chunk_mb"}
@@ -84,21 +84,30 @@ class MemFabricL2Adapter(L2AdapterInterface):
         if shared and (world != 2 or self._rank not in (0, 1) or "rank_id" not in params
                        or self._data_op_type != "DEVICE_RDMA"):
             raise ValueError("shared_directory requires two DEVICE_RDMA adapters with explicit rank_ids 0 and 1")
-        if shared and ("storage_rank" not in params or not params.get("store_url")):
-            raise ValueError("shared_directory requires an explicit storage_rank and BM store_url")
+        multi_owner = "storage_ranks" in params
+        if multi_owner:
+            owners = params["storage_ranks"]
+            if (not shared or "storage_rank" in params or type(owners) is not list
+                    or owners != [0, 1] or any(type(owner) is not int for owner in owners)):
+                raise ValueError("storage_ranks must be [0, 1] with shared_directory and no storage_rank")
+        if shared and (not (multi_owner or "storage_rank" in params) or not params.get("store_url")):
+            raise ValueError("shared_directory requires an explicit storage_rank or storage_ranks and BM store_url")
         if not shared and self._rank != 0:
             raise ValueError("Nonzero adapter rank_id requires shared_directory")
-        self.storage_rank = params.get("storage_rank", world - 1)
         slot_mb = params.get("slot_size_mb", 32)
-        values = (device, world, pool_gb, self.storage_rank, slot_mb)
+        values = (device, world, pool_gb, slot_mb)
         if any(type(value) is not int for value in values):
             raise ValueError("BM device, ranks, and capacities must be integers")
-        if not (0 <= self.storage_rank < world and slot_mb > 0 and pool_gb > 0):
+        self.storage_rank = None if multi_owner else params.get("storage_rank", world - 1)
+        self._owner_ranks = (0, 1) if multi_owner else (self.storage_rank,)
+        if (slot_mb <= 0 or pool_gb <= 0 or any(type(rank) is not int or not 0 <= rank < world
+                                                for rank in self._owner_ranks)):
             raise ValueError("Invalid MemFabric pool geometry")
         self._slot_size = slot_mb << 20
-        capacity = pool_gb << 30
-        if capacity % self._slot_size:
+        capacity_per_owner = pool_gb << 30
+        if capacity_per_owner % self._slot_size:
             raise ValueError("slot_size_mb must divide pool_gb * 1024")
+        capacity = capacity_per_owner * len(self._owner_ranks)
         super().__init__(max_capacity_bytes=capacity)
         self._slot_count = capacity // self._slot_size
         self._free = [] if shared else list(reversed(range(self._slot_count)))
@@ -112,6 +121,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
         self._last_error = ""
         self._written_bytes = 0
         self._read_bytes = 0
+        self._written_by_owner = dict.fromkeys(self._owner_ranks, 0) if multi_owner else {}
+        self._read_by_owner = dict.fromkeys(self._owner_ranks, 0) if multi_owner else {}
         self._evicted_objects = 0
         self._next_id = 0
         self._tasks = {kind: {} for kind in ("store", "lookup", "load")}
@@ -124,8 +135,11 @@ class MemFabricL2Adapter(L2AdapterInterface):
             if shared:
                 from lmcache_ascend.v1.distributed.memfabric_directory_rpc import DirectoryClient
 
-                contract = dict(world_size=world, storage_rank=self.storage_rank,
-                                pool_gb=pool_gb, slot_size_mb=slot_mb, store_url=store_url)
+                contract = dict(world_size=world, pool_gb=pool_gb, slot_size_mb=slot_mb, store_url=store_url)
+                if multi_owner:
+                    contract["storage_ranks"] = list(self._owner_ranks)
+                else:
+                    contract["storage_rank"] = self.storage_rank
                 self._directory = DirectoryClient(params["join_coord_url"], params["join_group_id"],
                                                   self._rank, contract)
                 self._directory.on_retired = self._notify_retired
@@ -134,9 +148,10 @@ class MemFabricL2Adapter(L2AdapterInterface):
                 BMSession, device_id=device, rank_id=self._rank, world_size=world,
                 pool_gb=pool_gb, store_url=store_url, **optional
             ).result()
-            self._base = self._executor.submit(
-                self._session.peer_address, self.storage_rank
-            ).result()
+            self._owner_bases = tuple(self._executor.submit(self._session.peer_address, rank).result()
+                                      for rank in self._owner_ranks)
+            if len(set(self._owner_bases)) != len(self._owner_bases):
+                raise RuntimeError("BM owner segments returned the same base address")
             if self._registration_arena_bytes:
                 self._executor.submit(self._session.set_cpu_registration_arena,
                                       pointer, stable_size, self._registration_chunk_bytes).result()
@@ -147,11 +162,12 @@ class MemFabricL2Adapter(L2AdapterInterface):
             for event in self._events.values():
                 event.close()
             raise
-        logger.info("MEMFABRIC_READY protocol=%s storage_rank=%d capacity=%d slot=%d",
-                    self._data_op_type, self.storage_rank, capacity, self._slot_size)
+        owner_label = self._owner_ranks if multi_owner else self.storage_rank
+        logger.info("MEMFABRIC_READY protocol=%s storage_rank=%s capacity=%d slot=%d",
+                    self._data_op_type, owner_label, capacity, self._slot_size)
         if shared:
-            logger.info("MEMFABRIC_SHARED_DIRECTORY rank=%d owner=%d epoch=%s",
-                        self._rank, self.storage_rank, self._directory.epoch)
+            logger.info("MEMFABRIC_SHARED_DIRECTORY rank=%d owner=%s epoch=%s",
+                        self._rank, owner_label, self._directory.epoch)
         if self._register_l1_arena:
             logger.info("MEMFABRIC_ARENA_SOURCE source=%s bytes=%d fallback_reason=%s",
                         "stable_registration_size" if self._registration_arena_bytes else "per_object",
@@ -317,7 +333,10 @@ class MemFabricL2Adapter(L2AdapterInterface):
             self._poisoned = True
             self._last_error = f"Invalid BM slot returned: {slot!r}"
             raise RuntimeError(self._last_error)
-        return self._base + slot * self._slot_size
+        # Match PoolDirectory's interleaved global slots. With one owner this
+        # reduces to the original owner base plus the unmodified slot offset.
+        local_slot, owner_index = divmod(slot, len(self._owner_ranks))
+        return self._owner_ranks[owner_index], self._owner_bases[owner_index] + local_slot * self._slot_size
 
     def _copy(self, obj, address, size, *, store):
         if self._data_op_type == "DEVICE_RDMA":
@@ -369,7 +388,8 @@ class MemFabricL2Adapter(L2AdapterInterface):
                         continue
                     else:
                         slot = self._reserve()
-                    self._copy(obj, self._slot_address(slot), size, store=True)
+                    owner, address = self._slot_address(slot)
+                    self._copy(obj, address, size, store=True)
                     if self._directory:
                         self._directory_call("commit", key=wire_key, slot=slot)
                     else:
@@ -378,8 +398,12 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     total += size
                     self._written_bytes += size
                     logger.debug("MEMFABRIC_L2_OBJECT_COMPLETE direction=STORE key=%r bytes=%d", key, size)
-                logger.info("MEMFABRIC_STORE keys=%d bytes=%d rank=%d",
-                            len(keys), total, self.storage_rank)
+                    if self.storage_rank is None:
+                        self._written_by_owner[owner] += size
+                        logger.debug("MEMFABRIC_L2_OWNER direction=STORE key=%r owner_rank=%d slot=%d bytes=%d",
+                                     key, owner, slot, size)
+                logger.info("MEMFABRIC_STORE keys=%d bytes=%d rank=%s",
+                            len(keys), total, self.storage_rank if self.storage_rank is not None else self._owner_ranks)
                 return L2StoreResult(True, total)
             except Exception as exc:
                 self._last_error = str(exc)
@@ -444,20 +468,25 @@ class MemFabricL2Adapter(L2AdapterInterface):
                             continue
                     elif (entry.size, entry.layout) != (size, layout):
                         continue
-                    self._copy(obj, self._slot_address(slot), size, store=False)
+                    owner, address = self._slot_address(slot)
+                    self._copy(obj, address, size, store=False)
                     if not self._directory:
                         self._entries.move_to_end(key)
                     found.set(i)
                     total += size
                     self._read_bytes += size
                     logger.debug("MEMFABRIC_L2_OBJECT_COMPLETE direction=LOAD key=%r bytes=%d", key, size)
+                    if self.storage_rank is None:
+                        self._read_by_owner[owner] += size
+                        logger.debug("MEMFABRIC_L2_OWNER direction=LOAD key=%r owner_rank=%d slot=%d bytes=%d",
+                                     key, owner, slot, size)
                 except Exception as exc:
                     self._last_error = str(exc)
                     logger.exception("MemFabric load failed")
                     if self._data_op_type == "DEVICE_RDMA":
                         raise
-            logger.info("MEMFABRIC_LOAD keys=%d bytes=%d rank=%d",
-                        len(keys), total, self.storage_rank)
+            logger.info("MEMFABRIC_LOAD keys=%d bytes=%d rank=%s",
+                        len(keys), total, self.storage_rank if self.storage_rank is not None else self._owner_ranks)
         return found
 
     def _unlock(self, keys):
@@ -522,6 +551,10 @@ class MemFabricL2Adapter(L2AdapterInterface):
                     # offline. A missing response cannot establish an empty pool.
                     shared_stats = dict.fromkeys(("objects", "free_slots", "locked_objects",
                                                   "total_pins", "evicted_objects", "pending_writes"))
+            if self.storage_rank is None:
+                shared_stats.update(storage_ranks=list(self._owner_ranks),
+                                    store_bytes_by_owner=self._written_by_owner.copy(),
+                                    load_bytes_by_owner=self._read_by_owner.copy())
             return {"is_healthy": not self._closed and not self._poisoned,
                     "protocol": self._data_op_type, "enable_56bits_gva": self._enable_56bits_gva,
                     "register_l1_arena": self._register_l1_arena,

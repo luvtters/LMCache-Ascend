@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two physical hosts, one independent L2 adapter per rank. Default: plan only."""
+"""Two independent L2 adapters with real MemoryObjs. Default: plan only."""
 import argparse
 import json
 import math
@@ -12,7 +12,7 @@ import time
 import traceback
 import uuid
 
-from l2_memoryobj_boundary_gate import load, lookup, store
+from l2_memoryobj_boundary_gate import fence, load, lookup, store
 from pool_coordination import publish, wait_event
 
 
@@ -20,7 +20,14 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--rank', type=int, choices=(0, 1), required=True, help='A=0, B=1')
     parser.add_argument('--device', type=int, default=0, help='local logical NPU')
-    parser.add_argument('--storage-rank', type=int, choices=(0, 1), default=0)
+    owners = parser.add_mutually_exclusive_group()
+    owners.add_argument('--storage-rank', type=int, choices=(0, 1), default=0)
+    owners.add_argument('--storage-ranks', type=int, choices=(0, 1), nargs=2)
+    parser.add_argument('--pool-gb', type=int, default=1, help='DDR GiB per owner')
+    parser.add_argument('--slot-size-mb', type=int, default=32)
+    parser.add_argument('--object-count', type=int, default=4, help='distinct objects in the two-owner gate')
+    parser.add_argument('--same-host', action='store_true', help='two ranks on distinct devices in one container')
+    parser.add_argument('--require-overflow', action='store_true', help='require logical bytes above one owner capacity')
     parser.add_argument('--store-url', required=True, help='BM TCP endpoint on rank 0')
     parser.add_argument('--device-nic', required=True, help='this rank\'s device NIC URI')
     parser.add_argument('--join-coord-url', required=True)
@@ -34,9 +41,20 @@ def arguments():
     parser.add_argument('--allow-npu', action='store_true')
     parser.add_argument('--_worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if (args.device < 0 or not 0 < args.payload_bytes <= 32 << 20 or args.payload_bytes % 4096
+    multi_owner = args.storage_ranks is not None
+    if (args.device < 0 or args.pool_gb <= 0 or args.slot_size_mb <= 0
+            or args.pool_gb * 1024 % args.slot_size_mb or not 0 < args.payload_bytes <= args.slot_size_mb << 20
+            or (not multi_owner and args.payload_bytes % 4096)
             or not all(math.isfinite(v) and v > 0 for v in (args.timeout, args.worker_timeout))):
-        parser.error('need nonnegative device, page-multiple payload fitting one 32 MiB slot, positive finite timeouts')
+        parser.error('invalid device, pool geometry, payload or timeouts')
+    if multi_owner and (args.storage_ranks != [0, 1]
+            or not 2 <= args.object_count <= 2 * (args.pool_gb * 1024 // args.slot_size_mb)
+            or args.payload_bytes < 8):
+        parser.error('need storage ranks 0 1 and at least two distinct objects fitting the two segments')
+    if (args.same_host or args.require_overflow) and not multi_owner:
+        parser.error('same-host and require-overflow require --storage-ranks 0 1')
+    if args.require_overflow and args.object_count * args.payload_bytes <= args.pool_gb << 30:
+        parser.error('logical payload must exceed the per-owner DDR capacity')
     if not args.join_group_id or any(not (c.isalnum() or c in '-_') for c in args.join_group_id):
         parser.error('join-group-id must contain only alphanumerics, hyphens or underscores')
     return args
@@ -46,8 +64,9 @@ def post(args, name, **data):
     return publish(args.join_coord_url, args.join_group_id, name, dict(name=name, **data), min(5, args.timeout))
 
 
-def receive(args, name):
-    return wait_event(args.join_coord_url, args.join_group_id, name, args.timeout)
+def receive(args, name, *, long_phase=False):
+    timeout = args.worker_timeout if long_phase else args.timeout
+    return wait_event(args.join_coord_url, args.join_group_id, name, timeout)
 
 
 def failure(args, stage, error):
@@ -72,14 +91,17 @@ def preflight(args, report):
     boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     uuid.UUID(boot_id)
     shared = {k: v for k, v in report['adapter_params'].items() if k not in ('device_id', 'rank_id', 'device_nic')}
-    contract = dict(params=shared, payload_bytes=args.payload_bytes, pythonhashseed=seed)
+    contract = dict(params=shared, payload_bytes=args.payload_bytes, pythonhashseed=seed,
+                    same_host=args.same_host, object_count=args.object_count, require_overflow=args.require_overflow)
     local = dict(rank=args.rank, host=socket.gethostname(), boot_id=boot_id, pid=os.getpid(),
-                 nonce=uuid.uuid4().hex, contract=contract)
+                 device=args.device, nonce=uuid.uuid4().hex, contract=contract)
     post(args, f'gate-rank-{args.rank}', **local)
     peer = receive(args, f'gate-rank-{1 - args.rank}')
     report['participants'] = [local, peer]
+    topology_matches = (peer['boot_id'] == boot_id and peer['host'] == local['host']
+                        and peer['device'] != args.device) if args.same_host else peer['boot_id'] != boot_id
     check(report, 'two_rank_contract', peer['rank'] == 1 - args.rank and peer['contract'] == contract
-          and peer['boot_id'] != boot_id, peer_host=peer['host'])
+          and topology_matches, peer_host=peer['host'])
 
 
 def exercise(args, report, adapter, key, obj, torch):
@@ -128,6 +150,52 @@ def exercise(args, report, adapter, key, obj, torch):
             post(args, phase + 'reader-unlocked')
 
 
+def exercise_multi_owner(args, report, adapter, obj, torch, object_key):
+    size = args.payload_bytes
+    total = size * args.object_count
+    owners = {'0', '1'}
+    pattern = torch.arange(256, dtype=torch.uint8).repeat((size + 255) // 256)[:size]
+    keys = [object_key(i.to_bytes(32, 'big'), 'l2-two-owner-gate', 0, 0, args.join_group_id)
+            for i in range(args.object_count)]
+    if args.rank == 1:
+        receive(args, 'two-owner-written', long_phase=True)
+    for index, key in enumerate(keys):
+        pattern[:8] = torch.tensor(list(index.to_bytes(8, 'big')), dtype=torch.uint8)
+        if args.rank == 0:
+            obj.raw_tensor.copy_(pattern)
+            result = store(adapter, key, obj, args.timeout)
+            if not result.is_successful() or result.bytes_transferred() != size:
+                raise AssertionError(f'object {index}: store did not complete {size} bytes')
+        else:
+            obj.raw_tensor.zero_()
+            if not (lookup(adapter, key, args.timeout) and load(adapter, key, obj, args.timeout)
+                    and torch.equal(obj.raw_tensor, pattern)):
+                raise AssertionError(f'object {index}: lookup, load or full content comparison failed')
+            adapter.submit_unlock([key])
+    status = fence(adapter)
+    by_owner = status['store_bytes_by_owner' if args.rank == 0 else 'load_bytes_by_owner']
+    counts = status['owners']
+    check(report, 'two-owner-payload', status['is_healthy'] and status['objects'] == len(keys)
+          and status['total_bytes_used'] == total and status['pending_writes'] == status['evicted_objects'] == 0
+          and set(counts) == owners and all(data['objects'] > 0 for data in counts.values())
+          and set(map(str, by_owner)) == owners and min(by_owner.values()) > 0 and sum(by_owner.values()) == total,
+          objects=len(keys), completed_bytes=total, owner_bytes=by_owner, owners=counts,
+          full_content_compared=args.rank == 1)
+    if args.rank == 0:
+        post(args, 'two-owner-written')
+        receive(args, 'two-owner-read', long_phase=True)
+        adapter.delete(keys[:2])
+        remaining = fence(adapter)
+        check(report, 'delete-releases-both-owners', remaining['objects'] == len(keys) - 2
+              and all(remaining['owners'][rank]['free_slots'] == counts[rank]['free_slots'] + 1 for rank in owners),
+              owners=remaining['owners'])
+        post(args, 'two-owner-deleted')
+    else:
+        post(args, 'two-owner-read')
+        receive(args, 'two-owner-deleted')
+        check(report, 'deleted-keys-miss', all(not lookup(adapter, key, args.timeout) for key in keys[:2]))
+
+
 def worker(args, report):
     preflight(args, report)
     import torch
@@ -139,7 +207,16 @@ def worker(args, report):
     torch.set_num_threads(1)
     size = args.payload_bytes
     shape = torch.Size((size,))
-    allocator = HostMemoryAllocator(size=size, use_paging=True, shapes=[shape], dtypes=[torch.uint8], fmt=MemoryFormat.BINARY)
+    if args.storage_ranks is not None:
+        from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import PagedTensorMemoryAllocator
+
+        backing = torch.empty(size + 4095, dtype=torch.uint8)
+        offset = -backing.data_ptr() % 4096
+        allocator = PagedTensorMemoryAllocator(backing[offset:offset + size], [shape], [torch.uint8],
+                                               MemoryFormat.BINARY)
+    else:
+        allocator = HostMemoryAllocator(size=size, use_paging=True, shapes=[shape],
+                                        dtypes=[torch.uint8], fmt=MemoryFormat.BINARY)
     obj = allocator.allocate([shape], [torch.uint8], MemoryFormat.BINARY)
     if obj is None or obj.get_size() != size:
         raise RuntimeError('HostMemoryAllocator could not allocate the requested MemoryObj')
@@ -147,12 +224,17 @@ def worker(args, report):
     report.update(memory_obj=type(obj).__name__, object_key=repr(key))
     adapter = MemFabricL2Adapter(report['adapter_params'])
     try:
-        exercise(args, report, adapter, key, obj, torch)
+        if args.storage_ranks is not None:
+            exercise_multi_owner(args, report, adapter, obj, torch, ObjectKey)
+        else:
+            exercise(args, report, adapter, key, obj, torch)
         status = adapter.report_status()
         report['adapter_before_close'] = status
+        expected_store = (args.object_count if args.storage_ranks is not None else 2) * size
+        expected_load = (args.object_count if args.storage_ranks is not None else 4) * size
         check(report, 'rank-complete', status['is_healthy'] and obj.get_ref_count() == 1
-              and status['store_bytes'] == (2 * size if args.rank == 0 else 0)
-              and status['load_bytes'] == (4 * size if args.rank == 1 else 0), refs=obj.get_ref_count(),
+              and status['store_bytes'] == (expected_store if args.rank == 0 else 0)
+              and status['load_bytes'] == (expected_load if args.rank == 1 else 0), refs=obj.get_ref_count(),
               store_bytes=status['store_bytes'], load_bytes=status['load_bytes'])
         # Each side publishes only after its last transfer, unlock and status check.
         post(args, f'io-done-{args.rank}')
@@ -193,13 +275,18 @@ def supervise(args, report, worker_output):
 
 def main():
     args = arguments()
-    params = dict(rank_id=args.rank, world_size=2, device_id=args.device, pool_gb=1, slot_size_mb=32,
-                  shared_directory=True, storage_rank=args.storage_rank, data_op_type=args.data_op_type,
+    placement = (dict(storage_ranks=args.storage_ranks) if args.storage_ranks is not None
+                 else dict(storage_rank=args.storage_rank))
+    params = dict(rank_id=args.rank, world_size=2, device_id=args.device, pool_gb=args.pool_gb,
+                  slot_size_mb=args.slot_size_mb, shared_directory=True, **placement, data_op_type=args.data_op_type,
                   store_url=args.store_url, device_nic=args.device_nic, enable_56bits_gva=args.enable_56bits_gva,
                   join_group_id=args.join_group_id, join_coord_url=args.join_coord_url)
     worker_output = args.output.with_name(args.output.name + '.worker.json')
     report = dict(status='PLAN_ONLY', rank=args.rank, adapter_params=params, payload_bytes=args.payload_bytes,
-                  worker_report=str(worker_output), reader_access='remote' if args.storage_rank == 0 else 'local',
+                  worker_report=str(worker_output),
+                  reader_access='both-owners' if args.storage_ranks is not None
+                  else ('remote' if args.storage_rank == 0 else 'local'),
+                  same_host=args.same_host, object_count=args.object_count, require_overflow=args.require_overflow,
                   scope='two independent adapters and real MemoryObjs; synthetic bytes, no inference')
     output = worker_output if args._worker else args.output
     output.parent.mkdir(parents=True, exist_ok=True)

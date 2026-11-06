@@ -56,17 +56,26 @@ class SharedDirectory:
     """One volatile slot directory and two fixed adapter identities for one run."""
 
     def __init__(self, geometry):
-        required = {'storage_rank', 'pool_gb', 'slot_size_mb'}
-        if set(geometry) != required or any(type(v) is not int for v in geometry.values()):
+        common = {'pool_gb', 'slot_size_mb'}
+        placement = set(geometry) - common
+        if (not common <= geometry.keys() or placement not in ({'storage_rank'}, {'storage_ranks'})
+                or any(type(geometry[k]) is not int for k in common)):
             raise ValueError('invalid shared L2 pool geometry')
         pool_mb, slot_mb = geometry['pool_gb'] * 1024, geometry['slot_size_mb']
-        if (geometry['storage_rank'] not in (0, 1) or pool_mb <= 0 or slot_mb <= 0
-                or pool_mb % slot_mb):
+        if pool_mb <= 0 or slot_mb <= 0 or pool_mb % slot_mb:
             raise ValueError('invalid two-rank shared L2 pool geometry')
+        owners = geometry.get('storage_ranks', [])
+        if 'storage_ranks' in geometry:
+            if (type(owners) is not list or owners != [0, 1]
+                    or any(type(owner) is not int for owner in owners)):
+                raise ValueError('storage_ranks must be [0, 1]')
+        elif type(geometry['storage_rank']) is not int or geometry['storage_rank'] not in (0, 1):
+            raise ValueError('storage_rank must be 0 or 1')
         # Standalone CPU coordinator. Importing lmcache_ascend activates platform
         # hooks, so load only its stdlib directory implementation from this checkout.
         source = Path(__file__).resolve().parents[2] / 'lmcache_ascend/v1/distributed/memfabric_directory.py'
-        self.pool = runpy.run_path(str(source))['PoolDirectory'](pool_mb // slot_mb, slot_mb << 20)
+        self.pool = runpy.run_path(str(source))['PoolDirectory'](
+            pool_mb // slot_mb, slot_mb << 20, owner_ranks=owners)
         self.geometry = dict(world_size=2, **geometry)
         self.store_url = None
         self.epoch = uuid.uuid4().hex
@@ -83,7 +92,9 @@ class SharedDirectory:
                 if (set(request) != {'contract', 'rank'} or not isinstance(contract, dict)
                         or set(contract) != self.geometry.keys() | {'store_url'}):
                     raise ValueError('invalid shared L2 claim')
-                if any(type(contract[k]) is not int or contract[k] != v for k, v in self.geometry.items()):
+                if (any(type(contract[k]) is not type(v) or contract[k] != v
+                        for k, v in self.geometry.items())
+                        or any(type(owner) is not int for owner in contract.get('storage_ranks', []))):
                     return 409, {'error': 'shared L2 geometry contract mismatch'}
                 store_url = contract['store_url']
                 if not isinstance(store_url, str) or not store_url:
@@ -234,16 +245,20 @@ def main():
     parser.add_argument('--trace-dir', type=Path)
     parser.add_argument('--shared-l2', action='store_true',
                         help='create a volatile shared L2 directory for two adapter ranks in a fresh run')
-    parser.add_argument('--storage-rank', type=int, choices=(0, 1))
+    placement = parser.add_mutually_exclusive_group()
+    placement.add_argument('--storage-rank', type=int, choices=(0, 1))
+    placement.add_argument('--storage-ranks', type=int, choices=(0, 1), nargs=2)
     parser.add_argument('--pool-gb', type=int)
     parser.add_argument('--slot-size-mb', type=int)
     args = parser.parse_args()
     if not args.run_id or any(not (c.isalnum() or c in '-_') for c in args.run_id):
         parser.error('invalid run-id')
-    geometry = dict(storage_rank=args.storage_rank, pool_gb=args.pool_gb, slot_size_mb=args.slot_size_mb)
+    owner = (dict(storage_ranks=args.storage_ranks) if args.storage_ranks is not None
+             else dict(storage_rank=args.storage_rank))
+    geometry = dict(**owner, pool_gb=args.pool_gb, slot_size_mb=args.slot_size_mb)
     if args.shared_l2:
         if any(v is None for v in geometry.values()):
-            parser.error('--shared-l2 requires --storage-rank, --pool-gb and --slot-size-mb')
+            parser.error('--shared-l2 requires owner rank(s), --pool-gb and --slot-size-mb')
     elif any(v is not None for v in geometry.values()):
         parser.error('shared L2 geometry requires --shared-l2')
     signal.signal(signal.SIGINT, signal.default_int_handler)

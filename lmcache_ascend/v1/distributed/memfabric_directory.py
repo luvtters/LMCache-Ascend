@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Volatile metadata for a fixed group of adapters sharing one BM owner pool."""
+"""Volatile metadata for a fixed group of adapters sharing BM owner segments."""
 from collections import OrderedDict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -45,11 +45,15 @@ class PoolDirectory:
     coordinated group restart. There is no timeout or per-client reclamation.
     """
 
-    def __init__(self, slot_count, slot_size):
+    def __init__(self, slot_count, slot_size, *, owner_ranks=()):
         if any(type(n) is not int or n <= 0 for n in (slot_count, slot_size)):
             raise ValueError("slot_count and slot_size must be positive integers")
         self._slot_size = slot_size
-        self._free = list(reversed(range(slot_count)))
+        self._owner_ranks = tuple(owner_ranks)
+        self._slots_per_owner = slot_count
+        # Global slot IDs interleave owners. Existing reserve/commit and pin
+        # semantics still protect exactly one unique slot across the group.
+        self._free = list(reversed(range(slot_count * (len(self._owner_ranks) or 1))))
         self._entries = OrderedDict()
         self._evicted = 0
         self._retired = {}
@@ -183,14 +187,27 @@ class PoolDirectory:
     def _status(self, rank):
         pending = locked = pins = 0
         usage = {}
+        owners = {str(owner): dict(objects=0, pending_writes=0, used_bytes=0,
+                                   free_slots=self._slots_per_owner,
+                                   capacity_bytes=self._slots_per_owner * self._slot_size)
+                  for owner in self._owner_ranks}
         for entry in self._entries.values():
+            if owners:
+                owner = str(self._owner_ranks[entry.slot % len(self._owner_ranks)])
+                stats = owners[owner]
+                stats['free_slots'] -= 1
+                if entry.published:
+                    stats['objects'] += 1
+                    stats['used_bytes'] += entry.size
+                else:
+                    stats['pending_writes'] += 1
             if not entry.published:
                 pending += 1
                 continue
             locked += bool(entry.pins)
             pins += sum(entry.pins.values())
             usage[entry.cache_salt] = usage.get(entry.cache_salt, 0) + entry.size
-        return {
+        status = {
             "objects": len(self._entries) - pending,
             "free_slots": len(self._free),
             "locked_objects": locked,
@@ -200,3 +217,6 @@ class PoolDirectory:
             "total_bytes_used": sum(usage.values()),
             "bytes_by_cache_salt": usage,
         }
+        if owners:
+            status['owners'] = owners
+        return status

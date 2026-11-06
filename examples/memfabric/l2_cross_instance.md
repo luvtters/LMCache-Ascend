@@ -50,6 +50,14 @@ rc=${PIPESTATUS[0]}; printf '%s\n' "$rc" > "$RUN_DIR/rank-$RANK.launcher-exit"
 | B 解锁，进入下一轮 | B 在同一 I/O 队列提交后续 lookup 并等待完成，确认 miss、全局 `total_pins=0`、`objects=0`。第二轮通过同 key 新内容验证删除后重写。 |
 | 结束 | 每端 `rank-N.json.worker.json` 保存逐项证据和 close 后的 allocator 检查。每端 `rank-N.json` 需为 `TWO_ADAPTER_CONTENT_AND_PROCESS_EXIT_PASSED`，两份 `launcher-exit` 均为 `0`。 |
 
+## 双 owner 容量验收
+
+协调器和两端参数都改用 `--storage-ranks 0 1`，每端容量和槽大小必须一致。模型插件配置对应 `"storage_ranks": [0, 1]`，省略 `storage_rank`。`pool_gb` 按 owner 计算。目录全局槽 `0, 1, 2, 3, …` 依次表示两台的本地槽 `0, 0, 1, 1, …`。
+
+- 137 单机基础关使用同一容器内两个进程、不同的设备和 NIC 端口。两端均加 `--same-host --storage-ranks 0 1 --pool-gb 1 --slot-size-mb 32 --object-count 4`，保存为单机双 rank 证据。
+- 137＋25 容量关使用不同物理机。协调器配置 `--storage-ranks 0 1 --pool-gb 8 --slot-size-mb 16`。两端使用同一组几何并加 `--object-count 960 --payload-bytes 9222144 --require-overflow --worker-timeout 1800`。按现场实际剩余授权另设独立停止措施。
+- A 写入全部对象后才放行 B。B 通过同一适配器读回并逐对象比较完整内容。两份 worker 回执中的 `two-owner-payload` 都须通过，`completed_bytes` 为 `8853258240`，两个 owner 的对象和完成字节均为正，且无待发布写入或淘汰。最后还须确认跨两个 owner 的删除释放、两个 worker 的真实退出和设备释放。此关使用合成对象。真实 GLM 精度及性能另跑。
+
 使用默认 18 MiB 对象时，A 两次 store 应合计完成 36 MiB，B 四次 load 应合计完成 72 MiB。`report_status()` 中 `objects`、`free_slots`、`locked_objects`、`total_pins` 等来自同一份共享目录，两端看到的是全池状态，不能相加。`store_bytes`、`load_bytes` 是各自适配器进程完成的对象载荷字节。链路计数、带宽、实际模型 KV 命中和生成质量均需另测。超时、原生异常退出或任一侧缺回执时保留日志和失败状态。
 
 ## 迁移到真实模型

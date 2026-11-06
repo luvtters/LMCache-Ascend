@@ -38,23 +38,30 @@ class WireKey:
         return self
 
 
-def adapter_process(rank, url, backing, pipe):
+def adapter_process(rank, url, backing, pipe, *, multi_owner=False):
     # A single slot is enough to expose premature reuse. Each process has its
     # own GVA for the same owner. The backing file only simulates BM payload I/O.
     base = (rank + 1) << 32
     class FileSession(Session):
         def peer_address(self, owner):
-            assert owner == 0
-            return base
+            assert owner in ((0, 1) if multi_owner else (0,))
+            return base + owner * (2 << 30)
 
         def copy_cpu_object(self, obj, address, size, *, store):
-            assert self.owner == threading.get_ident() and address == base
+            assert self.owner == threading.get_ident()
+            target = backing
+            if multi_owner:
+                owner, offset = divmod(address - base, 2 << 30)
+                assert owner in (0, 1) and offset in (0, 512 << 20)
+                target = backing.with_name(f"payload-{owner}-{offset}")
+            else:
+                assert address == base
             if self.failure:
                 raise RuntimeError("injected unknown copy completion")
             if store:
-                backing.write_bytes(obj.payload)
+                target.write_bytes(obj.payload)
             else:
-                obj.payload = backing.read_bytes()
+                obj.payload = target.read_bytes()
             assert len(obj.payload) == size
             return "cpu-test-file"
 
@@ -81,8 +88,9 @@ def adapter_process(rank, url, backing, pipe):
         used, capacity, dict(salts))
     sys.modules.update({**modules, name: rpc})  # Confined to this spawned process.
     try:
-        adapter = adapter_type(dict(world_size=2, rank_id=rank, storage_rank=0, shared_directory=True,
-                                    pool_gb=1, slot_size_mb=1024, data_op_type="DEVICE_RDMA",
+        placement = {"storage_ranks": [0, 1]} if multi_owner else {"storage_rank": 0}
+        adapter = adapter_type(dict(world_size=2, rank_id=rank, **placement, shared_directory=True,
+                                    pool_gb=1, slot_size_mb=512 if multi_owner else 1024, data_op_type="DEVICE_RDMA",
                                     join_coord_url=url, join_group_id="attempt", device_nic="tcp://fake:1",
                                     store_url="tcp://fake:2"))
         pipe.send(("ok", (adapter._session.config["rank_id"], adapter._session.config["directory_epoch"])))
@@ -131,6 +139,76 @@ def adapter_process(rank, url, backing, pipe):
 
 
 class SharedAdapterTest(unittest.TestCase):
+    def test_multi_owner_capacity_and_single_reader_round_trip(self):
+        ctx = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as tmp:
+            coord = source("pool_coord", "examples/memfabric/pool_coordination.py")
+            server = coord.make_server("127.0.0.1", 0, tmp, "attempt",
+                                       shared_directory=dict(storage_ranks=[0, 1], pool_gb=1, slot_size_mb=512))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            processes, pipes = [], []
+
+            def reply(rank):
+                self.assertTrue(pipes[rank].poll(10), f"rank {rank} response timed out")
+                result, value = pipes[rank].recv()
+                self.assertEqual(result, "ok", value)
+                return value
+
+            def call(rank, op, key=None, payload=None):
+                pipes[rank].send((op, key, payload))
+                return reply(rank)
+
+            try:
+                for rank in (0, 1):
+                    parent, child = ctx.Pipe()
+                    process = ctx.Process(target=adapter_process, args=(
+                        rank, f"http://127.0.0.1:{server.server_port}", Path(tmp) / "payload", child),
+                        kwargs={"multi_owner": True})
+                    process.start()
+                    child.close()
+                    pipes.append(parent)
+                    processes.append(process)
+                self.assertEqual(reply(0)[1], reply(1)[1])
+                keys = [WireKey(chunk_hash_hex=f"{i:02x}") for i in range(4)]
+                for i, key in enumerate(keys):
+                    self.assertEqual(call(0, "store", key, bytes([i]) * 64), 64)
+                self.assertEqual(call(1, "usage"), (256, 2 << 30, {"tenant": 256}))
+                stats = call(1, "status")
+                self.assertEqual(stats["free_slots"], 0)
+                self.assertEqual({rank: data["objects"] for rank, data in stats["owners"].items()},
+                                 {"0": 2, "1": 2})
+                self.assertEqual(call(0, "status")["store_bytes_by_owner"], {0: 128, 1: 128})
+                for i, key in enumerate(keys):
+                    self.assertEqual(call(1, "pin", key), 1)
+                    self.assertEqual(call(1, "load", key, b"?" * 64), (1, bytes([i]) * 64))
+                self.assertEqual(call(1, "status")["load_bytes_by_owner"], {0: 128, 1: 128})
+                self.assertEqual(len(list(Path(tmp).glob("payload-*"))), 4)
+                for key in keys[:2]:
+                    call(0, "delete", key)
+                    self.assertEqual(call(1, "pin", key), 0)
+                    self.assertEqual(call(1, "load", key, b"?" * 64)[0], 1)
+                    call(1, "unpin", key)
+                self.assertEqual(call(0, "status")["free_slots"], 2)
+                for i, key in enumerate(keys[:2]):
+                    self.assertEqual(call(0, "store", key, bytes([i + 4]) * 64), 64)
+                    self.assertEqual(call(1, "pin", key), 1)
+                    self.assertEqual(call(1, "load", key, b"?" * 64), (1, bytes([i + 4]) * 64))
+                for rank, proc in enumerate(processes):
+                    call(rank, "close")
+                    proc.join(5)
+                    self.assertEqual(proc.exitcode, 0)
+            finally:
+                for proc in processes:
+                    if proc.is_alive():
+                        proc.terminate()
+                    proc.join(5)
+                for pipe in pipes:
+                    pipe.close()
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
     def test_remote_lookup_locked_delete_and_unknown_copy(self):
         key = WireKey()
         other = replace(key, cache_salt="other-tenant")
