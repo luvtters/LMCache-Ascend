@@ -1,67 +1,35 @@
-# MemFabric L2 兼容路线：独立检视入口
+# MemFabric L2 兼容：Ascend 实现
 
-**当前结论：** 本轮 03/04/07/08 的 strict gate 均有模型功能通过记录；07/08 使用 Ascend `075186f`、官方 core `6913259`。多 chunk 冷写入与 repeat 已验证；P/D 仍以 `-6` 退出。08 不同前缀并发能正确恢复，07 同键并发的第二次 L1 reservation 被拒，原因未定。功能、并发观察、进程退出与 SDK 告警分开记录；不是性能或生产稳定性验收。
+更新日期：2026-11-07（北京时间）。本库通过原生 `L2AdapterInterface` 接入 MemFabric HOST DDR 池，保留官方 worker、NPU↔CPU L1 和原生 L1 管理链路。路线入口见[方案说明](../README.md)，分类原件见[当前验收](../报告/当前验收.md)。
 
-此分支只接入 LMCache 现有 L2 插件接口，不修改 LMCache core，不包含 Direct Connector、Direct TransferContext 或 PoolIndex。SDMA 和 DEVICE_RDMA 是同一 L2 路线的可选搬运配置，不是两条接入路线。
+## 版本与隔离
 
-## 改了什么
+- 官方 Ascend 比较基线固定为 `c5e29f15902437883dba530c22705a48ff7ce0fb`。
+- core 固定官方 `6913259264dbebb2fa5ba1665606c40ffc5c6661`，独立仓库、detached HEAD，不修改。
+- 当前双 owner payload 为 `3012c71`；本地整理分支为 `work/memfabric-l2-local-docs-20261107`，最终文档整理 SHA 由路线 TRACKING 记录。
+- 远端检视 `review/memfabric-l2` 为 `f598eb3`，与双 owner 开发节点区分，本轮不推送。
+- NPU pin `fce581a` 仍在本路线独立候选目录，仅 production CPU 验证，不混入当前已设备验证实现。
 
-`LMCacheMPConnector → 原 LMCache CPU L1 → MemFabricL2Adapter → BMSession → 池 DRAM`，读取反向。NPU 与 CPU L1 之间仍用原来的 LMCache 链路。
+本路线不依赖 L1 兼容方案的 core、worker 工厂、checkout、配置或运行产物，不使用归档或网络盘对象库。
 
-- `memfabric_l2_adapter.py`：实现已有 L2AdapterInterface，管理 key/slot、查找保护、淘汰、任务通知。
-- `memfabric_bm.py`：固定 BM 会话、成员就绪、H2G/G2H、CPU MemoryObj 注册及引用保护。
-- `pool_member.py`：贡献 HOST DRAM；`pool_coordination.py` 是本路线独立的纯 CPU HTTP 就绪协调器。
+## 接入与配置
 
-## 固定基线与来源
+service 使用原生 `lmcache server` 的 `--l2-adapter` 加载
+`lmcache_ascend.v1.distributed.memfabric_l2_adapter:MemFabricL2Adapter`。
+模型使用原生 `LMCacheMPConnector`。组件命令、环境和池成员必须按角色独立准备，不能把示例配置当成已验证的任意部署。
 
-官方 Ascend 基线 `c5e29f15902437883dba530c22705a48ff7ce0fb`。实现来自已上机的 `25ceb46eb1293e4119cc32f8c841b3b8054dcaea`，本分支删除未使用的 NPU 直传 BM 方法及对应注销分支；现有 CPU 搬运方法体保持一致。未纳入批量搬运、整段 L1 注册复用或 allocator lease 候选。
+[默认 l2.json](examples/memfabric/l2.json)仍是 **SDMA、单 owner** 示例，不代表默认开启双机聚合。双 owner 当前实测配置需显式使用 `DEVICE_RDMA`、共享目录参数 `shared_directory` 和 `storage_ranks: [0, 1]`；`pool_gb` 表示每 owner 的贡献，两个 owner 各 8 GiB 时总贡献为 16 GiB。两端还须匹配固定 BM 组、协调端点、设备及各自网卡。详见[跨实例说明](examples/memfabric/l2_cross_instance.md)。
 
-接口基于未修改的 LMCache `6913259264dbebb2fa5ba1665606c40ffc5c6661`。本轮独立路线已重新使用该官方 core 验证，不依赖 worker 的 core 修改；历史快照仍按原提交保留。
+## 已有实际依据
 
-## 已跑通与限制
+`3012c71` 配官方 core `6913259` 在 137＋25 各 8 GiB 的真实双 owner 容量关写入并读回 960 个对象，共 8,853,258,240 B，全量逐字节一致、无淘汰。合成内容一致不替代全部真实模型 KV 逐字节证明。
 
-历史 A3 SDMA 单机 L2/模型恢复通过；后续固定 SDK 1.2.1 的 DEVICE_RDMA 真实跨机 HOST 池、MixedSHM 18 MiB 正反字节和 Qwen3-8B TP1 恢复通过。P/D 同机、池跨机；1373 输入恢复 1280 tokens，实际 180 MiB。自然服务对照没有稳定性能优势；仍有生命周期和部分输出差异问题。功能通过不等于全量验收。
+GLM 26 题完整结束并核实两端 LOAD；本轮写入端与恢复端 26/26 同答，NIAH 6/6、MMLU 18/20。相对历史恢复答案仅 25/26，严格历史答案等价未通过，同服务强制重算不计正式 OFF。
 
-本轮新增 `examples/memfabric/l2_model_gate.py`、说明和配置样例；MemoryObj gate 增加协议选择，默认仍为 DEVICE_RDMA。未改生产 adapter/BM、MemFabric SDK、公共模型或驱动。
+完整 MemFabric L2＋`DEVICE_RDMA` 对 Mooncake Store＋经典 TE `ascend` 完成四组配对；输出吞吐为 5.80/5.27、16.68/16.20、24.07/17.90、3.95/5.38 tok/s。两套池管理、放置和 transport 路径不同，不是纯传输对照。长输入只有 3 条；4K→512 C1 仅 Mooncake 完成，不补作配对。
 
-两种协议各通过 A/B 两种 18 MiB 内容的 store/load，破坏源缓冲后恢复一致，引用和 pins 归零。TP1 模型请求 1373 输入，D 恢复 1280、本地计算 93，实际读池 188743680 字节，prefetch 为 10/10 且 0 L1/10 L2，答案 `ORCHID`。P/D/池成员均在同一服务器，不能称跨物理机。
+## 未完成及生命周期
 
-模型 gate 关闭本地前缀缓存、使用原生 `skip_l1` 策略，relay 等写池完成且原生 L1 排空后才放行 D，没有手工删除 L1。这是证明来源的受控功能条件，不能用于客户自然服务性能结论。首次监督器误查不存在的 proxy `/health` 而停在请求前，该失败单独归档；改查已有 OpenAPI 接口后两轮功能通过。
+正式单机 OFF MMLU20 为实机 0/20；TE 只有 fake CPU 契约，真实 TE 注册/搬运和同目录 BM→TE→TE→BM 未验。核心 `mooncake_te_impl.py` 只有读取能力，不能直接替换完整存取路径。
 
-退出仍有边界：SDK 有 `free sq_cq -8` 告警；进程组 SIGTERM 及父进程 SIGINT 两种停止试验均出现 P/D `-6`。父进程 SIGINT 时 proxy 0、service 130、member 0；原始 wait 与发送信号分别保留。不把功能通过说成无告警、无退出异常。
-
-## 最小接入入口
-
-已有 `l2.json` 默认 SDMA。使用原 LMCacheMPConnector，service 增加：
-
-```sh
-lmcache server --host 127.0.0.1 --port 25555 --chunk-size 128 \
-  --l1-size-gb 2 --max-gpu-workers 2 \
-  --l2-adapter "$(cat examples/memfabric/l2.json)"
-```
-
-运行前仍需准备 Ascend 环境和池成员。跨机 DEVICE_RDMA 必须显式配置 data_op_type、device_nic、enable_56bits_gva、join_coord_url、每次唯一 join_group_id；service 与 pool_member 的固定 BM 组一致。真实共享 L1 的 Host pin 设备与 BM 设备组合需沿用已验证部署，不能仅换这个参数就宣称任意环境可用。测试脚本 `l2_rdma_memoryobj_gate.py` 默认只生成计划，真实执行需 `--allow-npu`。
-
-## CPU 检查
-
-```sh
-python -m unittest discover -s tests/v1/distributed -p 'test_memfabric*.py' -v
-```
-
-使用假 SDK 和本地 HTTP 控制面，不证明真实 RDMA 或性能。
-
-## 本轮验证补记（2026-11-02）
-
-本轮开发分支为 `work/memfabric-l2-lifecycle-20261102`；设备组 07–11 使用 Ascend `075186f`、官方 LMCache core `6913259`。本节点新增 shutdown timeout 选项、双协议模型 gate、七项基础用例及协调器 SIGINT 收尾修复；没有修改生产 adapter、BM 封装或 core。
-
-- 03 实际使用 Ascend `8bb28ad` / core `6913259`；04 实际使用 Ascend `6817f94` / 同一 core。两轮 strict gate 均为 1373 输入、1280 外部恢复、93 本地计算，P 写入与 D 读取各 180 MiB，0 L1/10 L2，答案 `ORCHID`；repeat 与 partial-prefix 功能项通过。
-- 03/04 的 cold 请求各为 73 tokens，小于 128-token chunk，不能证明多 chunk 冷池写入。并发两请求合计 2746 输入、1280 外部恢复、1466 本地计算、0 本地缓存命中；结果与一条复用、一条重算相符，具体内部原因尚未确定。
-- 04 设置 30 秒 drain 后 P/D 仍以 `-6` 退出。05 无 connector、无推理请求，P 退出 0；06 使用 LMCache connector/native L1、无 MemFabric L2/BM/池成员且无推理请求，P 仍以 `-6` 退出、service 以 130 退出。这说明本轮 `-6` 不需要 MemFabric 参与，但不足以归因给 LMCache core；SDK、native 扩展和运行环境仍未排除。
-- SDMA 组 07 实际使用 Ascend `075186f` / core `6913259`；strict gate 与六项 basic 功能用例通过。多 chunk 冷请求为 1,758 tokens、13 个完整 chunk，首次全量本地计算并新写 234 MiB；同 body repeat 从 L2 恢复 1,664 tokens，本地计算 94。P/D 仍以 `-6` 退出，功能结果不代表生命周期通过。
-- 07 同键并发 DEBUG 中，两条请求都 lookup 到 10/10 个 L2 keys；一条恢复，另一条在 L1 `reserve_write` 得到 `KEY_NOT_WRITABLE` 后最终 0 hit、没有第二次 L2 load。不能把它归为池 miss，也不能据此断言 core 缺陷；原因仍未确定。
-- RDMA 组 08 使用 Ascend `075186f` / core `6913259`；strict gate 与七项 basic 通过。不同前缀并发两请求共 3,131 tokens，来源为 2,944 外部恢复、187 本地计算、0 本地缓存命中；P/D 仍以 `-6` 退出。
-- CPU import-only 最小已测组合 `torch + torch_npu + mooncake.engine` 在不加载 LMCache 或 vLLM 时仍以 `-6` 退出；独立 native block import 对照退出 0。这缩小了当前组合复现范围，但不能证明 ABI 冲突或与设备组相同的堆根因。
-- 09 在缺少可选 Mooncake 包的私有依赖视图中完成 DEVICE_RDMA strict 与七项 basic；P、D、service 实际退出 0，未出现此前的堆损坏文本。原安装和 core 未改，这是当前部署对照的结果，不是对 Mooncake 原生扩展或 SDK 的修复；SDK `free sq_cq -8` 仍有记录，旧协调器需 SIGTERM。
-- 该私有环境的 SDMA 模型对照仍未完成：10 在 gate 监听端口冲突时结束，11 在模型就绪前遇到不可写的日志目录。两组均没有推理请求，不能判定 SDMA KV 搬运失败；11 清理时 D 退出 -11，保留为未解决异常。
-- 协调器修复 `57f51b7` 仅显式恢复 SIGINT 处理并在 KeyboardInterrupt 后关闭 HTTP server；普通启动和继承 SIG_IGN 后 exec 两种纯 CPU 场景均完成真实 GET/POST/GET、SIGINT 退出 0 和端口重绑定。模型组未使用这项后续修复，不称模型已重新验证。
-- 当前设备验证复用了历史固定环境中的 native 扩展；对应源码构建提交未建立，不能称为从当前 Ascend HEAD 全量重编。部署须先确认运行用户有可写的日志目录，并验证监听端口实际可绑定；无 LISTEN 不等于端口可绑定。
+计划 SIGINT 服务退出130、SDK关闭告警及Mooncake Store释放阶段-9分别保留；功能完成不改写为所有角色干净退出。11月6日释放回执是历史现场，不是本轮设备状态或授权。本轮仅本地迁移、CPU检查与文档整理。

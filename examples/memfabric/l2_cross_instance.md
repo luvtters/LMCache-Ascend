@@ -1,4 +1,6 @@
-# 两套 L2 实例复用一份 DDR 对象
+# 两套 L2 实例共享 DDR 对象与双 owner 聚合
+
+2026-11-07 本地维护说明：当前生产源码来自 Ascend `3012c71`，配套官方 core `6913259`。双 owner 的真实容量、GLM 和性能依据见[当前验收](../../../报告/当前验收.md)。本页前半部分保留单 owner 的有效配置，双 owner 需按专节显式配置，不能把默认单 owner 示例当作聚合模式。没有本轮设备授权时只阅读方案，不执行启动命令。
 
 本用例在两台 Linux 主机上各启动一个 `MemFabricL2Adapter`。A 为 BM rank 0，B 为 BM rank 1，两者各贡献 1 GiB HOST DRAM。默认 `storage_rank=0`，两个适配器都访问 A 的 32 MiB 槽位。A 写本机池后，B 通过 BM 从 A 的 DRAM 读取到 B 的 CPU `MemoryObj`。共享目录保存 `ObjectKey`、槽位、布局和 pin 等元数据，HTTP 事件只协调步骤。此配置可使用的对象容量为 1 GiB。若改为 `storage_rank=1`，则 A 远端写、B 本机读，需单独记录方向。
 
