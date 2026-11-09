@@ -7,6 +7,7 @@ from ._version import __version_tuple__ as __version_tuple__  # noqa: F401  # is
 
 # Standard
 from typing import Any
+import os
 import sys
 
 # NOTE: Must be manually edited per each version and
@@ -1101,5 +1102,12 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_cache_engine()
 
         _patch_api_server()
+
+    if os.environ.get("LMCACHE_ASCEND_PP_STAGE_LOCAL") == "1":
+        from lmcache_ascend.v1.pp_stage_local_activation import (
+            install_npu_stage_pinning,
+        )
+
+        install_npu_stage_pinning()
 
     LMCACHE_ASCEND_PATCHED = True
