@@ -1103,6 +1103,12 @@ if not LMCACHE_ASCEND_PATCHED:
 
         _patch_api_server()
 
+    from lmcache_ascend.v1.pp_stage_local_activation import (
+        install_npu_registration_context,
+    )
+
+    install_npu_registration_context()
+
     if os.environ.get("LMCACHE_ASCEND_PP_STAGE_LOCAL") == "1":
         from lmcache_ascend.v1.pp_stage_local_activation import (
             install_npu_stage_pinning,
