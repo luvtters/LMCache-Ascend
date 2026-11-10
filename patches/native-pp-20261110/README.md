@@ -1,5 +1,33 @@
 # Cross-host PP startup patches
 
+## Revised customer procedure
+
+Use `switch-to-official.sh` with all three patch files in this directory. Source
+the customer's `/opt/ks-luv-pp/env.sh` first. The script resolves the actual
+top-level package paths without importing the device frameworks, checks all
+three target files, reverses patches 0001 and 0002 if present, then applies 0003.
+It preserves unrelated source edits and skips steps already completed. It also
+handles files previously modified by the equivalent Python replacement helper.
+
+Patch 0003 contains only the production change from merged official
+[PR #18521](https://github.com/vllm-project/vllm-ascend/pull/18521), commit
+`7b5ad8160e5f1eb6eda6954d0659d1a0e65b1122`. It changes
+`vllm_ascend/patch/platform/patch_multiproc_executor.py`, updating the cached
+headless CLI executor reference from the existing Ascend executor adapter.
+It does not require editing the core `serve.py` file.
+
+Keep `DYNAMIC_EPLB=True`, dynamic EPLB enabled in the additional configuration,
+and `--headless` on node 1. No model configuration change or compilation is
+required. Apply source changes before starting new model processes.
+
+The separate receive-buffer change in 0002 is no longer a mandatory customer
+prerequisite: the recorded original communication mode also had successful
+device runs, so its necessity and its relationship to the observed failure
+were not established. The old `apply.sh` and patches 0001/0002 are retained for
+review and reversal; do not use `apply.sh` for the revised procedure.
+
+## Original patch bundle
+
 These are project-specific framework patches distributed alongside the LMCache
 Ascend integration. They modify the two framework source files listed below;
 they do not modify LMCache runtime code.
