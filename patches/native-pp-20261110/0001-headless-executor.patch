@@ -1,0 +1,12 @@
+diff --git a/vllm/entrypoints/cli/serve.py b/vllm/entrypoints/cli/serve.py
+--- a/vllm/entrypoints/cli/serve.py
++++ b/vllm/entrypoints/cli/serve.py
+@@ -216,6 +216,8 @@
+             head_node_address,
+         )
+ 
++        from vllm.v1.executor.multiproc_executor import MultiprocExecutor
++
+         executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+         executor.start_worker_monitor(inline=True)
+         return

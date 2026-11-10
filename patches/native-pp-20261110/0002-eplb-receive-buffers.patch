@@ -1,0 +1,19 @@
+diff --git a/vllm_ascend/eplb/eplb_updator.py b/vllm_ascend/eplb/eplb_updator.py
+--- a/vllm_ascend/eplb/eplb_updator.py
++++ b/vllm_ascend/eplb/eplb_updator.py
+@@ -170,11 +170,14 @@
+             global_dst = self.comm_group.ranks[dst_rank]
+             comm_op_list.append(dist.P2POp(dist.isend, src_tensor, global_dst, group=self.comm_group.device_group))
+ 
++        recv_tensors = []
+         for src_rank in range(self.comm_group.world_size):
+             if src_rank == self.comm_group.rank_in_group:
+                 continue
+             global_src = self.comm_group.ranks[src_rank]
+-            comm_op_list.append(dist.P2POp(dist.irecv, src_tensor, global_src, group=self.comm_group.device_group))
++            recv_tensor = torch.empty_like(src_tensor)
++            recv_tensors.append(recv_tensor)
++            comm_op_list.append(dist.P2POp(dist.irecv, recv_tensor, global_src, group=self.comm_group.device_group))
+         if comm_op_list:
+             reqs = dist.batch_isend_irecv(comm_op_list)
+ 
