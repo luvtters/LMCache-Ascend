@@ -1,5 +1,11 @@
 # MemFabric L2 兼容：Ascend 实现
 
+## 85/86 SDMA 客户测试候选（2026-11-11）
+
+本分支 `feature/memfabric-sdma-85-86-20261111` 开放 SDMA 双 owner 共享目录，配套现有原生 LMCache On + PP 安装使用。拉取、独立加载、两机配置、容量关和模型启用见 [客户测试步骤](customer/sdma/README.md)。只加载 `customer/sdma` 下的独立入口，不重装本分支的 Ascend 包。此候选只有本地 CPU 依据，尚未在 85/86 做 SDMA 映射、字节搬运或模型验证；下方历史 RDMA 结果不转移给本候选。
+
+## 原 L2 基线与历史验收
+
 更新日期：2026-11-07（北京时间）。本库通过原生 `L2AdapterInterface` 接入 MemFabric HOST DDR 池，保留官方 worker、NPU↔CPU L1 和原生 L1 管理链路。路线入口见[方案说明](../README.md)，分类原件见[当前验收](../报告/当前验收.md)。
 
 ## 版本与隔离

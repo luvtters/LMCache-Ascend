@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Two independent L2 adapters with real MemoryObjs. Default: plan only."""
 import argparse
+import importlib
 import json
 import math
 import os
@@ -32,7 +33,8 @@ def arguments():
     parser.add_argument('--device-nic', required=True, help='this rank\'s device NIC URI')
     parser.add_argument('--join-coord-url', required=True)
     parser.add_argument('--join-group-id', required=True, help='fresh coordinator --run-id')
-    parser.add_argument('--data-op-type', choices=('DEVICE_RDMA',), default='DEVICE_RDMA')
+    parser.add_argument('--data-op-type', choices=('SDMA', 'DEVICE_RDMA'), default='DEVICE_RDMA')
+    parser.add_argument('--adapter-module', default='lmcache_ascend.v1.distributed.memfabric_l2_adapter')
     parser.add_argument('--enable-56bits-gva', action='store_true')
     parser.add_argument('--payload-bytes', type=int, default=18 << 20)
     parser.add_argument('--timeout', type=float, default=90, help='seconds per task or peer event')
@@ -202,7 +204,7 @@ def worker(args, report):
     from lmcache.v1.distributed.api import ObjectKey
     from lmcache.v1.memory_allocators.host_memory_allocator import HostMemoryAllocator
     from lmcache.v1.memory_management import MemoryFormat
-    from lmcache_ascend.v1.distributed.memfabric_l2_adapter import MemFabricL2Adapter
+    MemFabricL2Adapter = importlib.import_module(args.adapter_module).MemFabricL2Adapter
 
     torch.set_num_threads(1)
     size = args.payload_bytes

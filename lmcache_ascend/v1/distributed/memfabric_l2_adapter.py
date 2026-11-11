@@ -16,12 +16,11 @@ from types import MappingProxyType
 
 from lmcache.lmcache_native import Bitmap
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import MemoryResidency, MemorySegment, MemoryTags
 from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.platform import create_event_notifier
 
-from lmcache_ascend.v1.distributed.memfabric_bm import BMSession
+from .memfabric_bm import BMSession
 
 logger = init_logger(__name__)
 
@@ -81,9 +80,11 @@ class MemFabricL2Adapter(L2AdapterInterface):
         shared = params.get("shared_directory", False)
         if type(shared) is not bool or type(self._rank) is not int:
             raise ValueError("shared_directory must be a bool and rank_id an integer")
+        if shared and not (params.get("join_coord_url") and params.get("join_group_id")):
+            raise ValueError("shared_directory requires explicit join_coord_url and fresh join_group_id")
         if shared and (world != 2 or self._rank not in (0, 1) or "rank_id" not in params
-                       or self._data_op_type != "DEVICE_RDMA"):
-            raise ValueError("shared_directory requires two DEVICE_RDMA adapters with explicit rank_ids 0 and 1")
+                       or self._data_op_type not in ("SDMA", "DEVICE_RDMA")):
+            raise ValueError("shared_directory requires two SDMA or DEVICE_RDMA adapters with explicit rank_ids 0 and 1")
         multi_owner = "storage_ranks" in params
         if multi_owner:
             owners = params["storage_ranks"]
@@ -133,7 +134,7 @@ class MemFabricL2Adapter(L2AdapterInterface):
                 "data_op_type", "device_nic", "enable_56bits_gva", "join_coord_url", "join_group_id") if name in params}
             store_url = params.get("store_url", "tcp://127.0.0.1:28580")
             if shared:
-                from lmcache_ascend.v1.distributed.memfabric_directory_rpc import DirectoryClient
+                from .memfabric_directory_rpc import DirectoryClient
 
                 contract = dict(world_size=world, pool_gb=pool_gb, slot_size_mb=slot_mb, store_url=store_url)
                 if multi_owner:
@@ -519,6 +520,9 @@ class MemFabricL2Adapter(L2AdapterInterface):
                         self._remove(key)
 
     def get_memory_tags(self):
+        # The customer's PP core predates memory tags and never calls this API.
+        from lmcache.v1.distributed.api import MemoryResidency, MemorySegment, MemoryTags
+
         return MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE if self._directory else MemoryResidency.LOCAL)
 
     def get_usage(self):

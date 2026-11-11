@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import sys
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -121,7 +122,7 @@ def load_adapter(factory):
         modules[name] = ModuleType(name)
         modules[name].__dict__.update(fields)
     path = Path(__file__).parents[3] / "lmcache_ascend/v1/distributed/memfabric_l2_adapter.py"
-    spec = importlib.util.spec_from_file_location("l2_rdma_cpu_adapter", path)
+    spec = importlib.util.spec_from_file_location("lmcache_ascend.v1.distributed.memfabric_l2_adapter", path)
     module = importlib.util.module_from_spec(spec)
     modules[spec.name] = module
     with patch.dict("sys.modules", modules):
@@ -377,6 +378,53 @@ class CpuMemoryObjContracts(unittest.TestCase):
 
 
 class AdapterContracts(unittest.TestCase):
+    def test_source_namespace_loads_without_pp_plugin_or_new_memory_tags(self):
+        adapter_type = load_adapter(Session)
+        modules = dict(adapter_type._cpu_import_modules)
+        modules["lmcache.v1.distributed.api"] = ModuleType("lmcache.v1.distributed.api")
+        # Fail if this isolated loader accidentally activates the other plugin.
+        modules["lmcache_ascend"] = None
+        path = Path(__file__).parents[3] / "customer/sdma"
+        with patch.dict("sys.modules", modules), patch.object(sys, "path", [str(path), *sys.path]):
+            module = importlib.import_module("memfabric_sdma.memfabric_l2_adapter")
+            self.assertEqual(Path(module.__file__).resolve(),
+                             Path(__file__).parents[3] / "lmcache_ascend/v1/distributed/memfabric_l2_adapter.py")
+            self.assertEqual(module.BMSession.__module__, "memfabric_sdma.memfabric_bm")
+
+    def test_shared_sdma_uses_both_owner_addresses_and_raw_copy(self):
+        class SdmaSession(Session):
+            def peer_address(self, rank):
+                return (rank + 1) << 30
+
+        adapter_type = load_adapter(SdmaSession)
+        directory = MagicMock()
+        directory.epoch = "sdma-epoch"
+        rpc = ModuleType("lmcache_ascend.v1.distributed.memfabric_directory_rpc")
+        rpc.DirectoryClient = MagicMock(return_value=directory)
+        params = dict(world_size=2, rank_id=0, storage_ranks=[0, 1],
+                      shared_directory=True, pool_gb=1, slot_size_mb=32,
+                      data_op_type="SDMA", join_coord_url="http://fake:1",
+                      join_group_id="sdma-test", store_url="tcp://fake:2")
+        with patch.dict("sys.modules", {rpc.__name__: rpc}):
+            adapter = adapter_type(params)
+        obj = MemoryObj(size=64)
+        try:
+            self.assertEqual(adapter._slot_address(0), (0, 1 << 30))
+            self.assertEqual(adapter._slot_address(1), (1, 2 << 30))
+            for store in (True, False):
+                adapter._executor.submit(adapter._copy, obj, 2 << 30, 64, store=store).result()
+            self.assertEqual(adapter._session.operations, ["legacy_sdma", "legacy_sdma"])
+            self.assertEqual(obj.refs, 1)
+            self.assertEqual(adapter._session.config["directory_epoch"], "sdma-epoch")
+        finally:
+            adapter.close()
+
+    def test_shared_sdma_requires_fixed_group_coordination(self):
+        adapter_type = load_adapter(Session)
+        with self.assertRaisesRegex(ValueError, "join_coord_url"):
+            adapter_type(dict(world_size=2, rank_id=0, storage_ranks=[0, 1],
+                              shared_directory=True, data_op_type="SDMA"))
+
     def adapter(self, rdma=True, register_arena=False, desc=None):
         sessions = []
         def factory(**kwargs):
