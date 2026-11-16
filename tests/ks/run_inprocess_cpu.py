@@ -92,7 +92,10 @@ def aborted():
         sched.update_connector_output(NS(kv_connector_worker_meta=late))
         state = cpu.snapshot(e)
         check(delayed and state["pins"] == 0 and client.lookup_cache("abort") == -1, "aborted lookup survived")
-        return {"delay_free": delayed, "pins_after_abort": state["pins"], "late_lookup_status": -1}
+        admission = unittests((src.ConnectorTests,
+                               "test_finish_before_admission_clears_scheduler_lookup_state"))()
+        return {"delay_free": delayed, "pins_after_abort": state["pins"],
+                "late_lookup_status": -1, "scheduler_cleanup": admission}
     finally:
         e.close()
 

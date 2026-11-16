@@ -201,6 +201,29 @@ def step(*, new=(), reqs=(), finished=(), preempted=(), cached=None):
 
 
 class ConnectorTests(unittest.TestCase):
+    def test_finish_before_admission_clears_scheduler_lookup_state(self):
+        adapter = CORE / "lmcache/integration/vllm/vllm_v1_adapter.py"
+        client = lookup.StepLookupClient(1)
+        impl = NS(lookup_client=client, kv_role="kv_both", skip_last_n_tokens=0,
+                  config=NS(min_retrieve_tokens=0), _max_tokens_per_load=0, force_skip_save=False,
+                  _requests_priority={}, load_specs={}, _request_trackers={}, _unfinished_requests={})
+        matched = method(adapter, "LMCacheConnectorV1Impl", "get_num_new_matched_tokens",
+                         logger=logging.getLogger(__name__), extract_mm_features=lambda r: (None, None),
+                         extract_request_configs=lambda p: None, LoadSpec=NS)
+        build = method(adapter, "LMCacheConnectorV1Impl", "build_connector_meta",
+                       LMCacheConnectorMetadata=Meta)
+        for rid in ("cancelled", "waiting"):
+            req = NS(request_id=rid, all_token_ids=list(range(256)), priority=5,
+                     sampling_params=None, num_tokens=256)
+            self.assertIsNone(matched(impl, req, 0))
+            query, = client.take_requests()
+            client.receive({query.sequence: {0: 128}})
+            self.assertEqual(matched(impl, req, 0), 128)
+        client.clear_lookup_status("cancelled")
+        build(impl, step(finished=["cancelled"]))
+        self.assertEqual(set(impl._requests_priority), {"waiting"})
+        self.assertEqual(set(impl.load_specs), {"waiting"})
+
     def test_long_passive_lookup_uses_only_length(self):
         scheduler = create("SCHEDULER")
         scheduler._lmcache_engine.lookup_client.lookup(list(range(8192)), "r")
