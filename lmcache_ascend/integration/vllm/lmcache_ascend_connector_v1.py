@@ -24,6 +24,8 @@ class AscendStepMetadata(LMCacheConnectorMetadata):
     queries: list[LookupRequest]
     preempted: set[str]
     release_pins: set[str]
+    finish_epoch: int
+    delayed_finishes: set[str]
 
 
 @dataclass
@@ -126,6 +128,8 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
         self._lmcache_engine._discard_partial_chunks = True
         self._release_pins = set()
         self._worker_replies = {}
+        self._finish_epoch = 0
+        self._pending_finish_ids = set()
         if role.name == "WORKER":
             ready = isinstance(self._lmcache_engine.lmcache_engine, AscendLMCacheEngine)
         else:
@@ -177,11 +181,17 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
                 raise ValueError(f"Incomplete allocation groups for {req.req_id}")
         release = self._release_pins | scheduler_output.finished_req_ids
         self._release_pins.clear()
+        delayed = self._pending_finish_ids & scheduler_output.finished_req_ids
+        if delayed:
+            self._finish_epoch += 1
+            self._pending_finish_ids.difference_update(delayed)
         return AscendStepMetadata(
             requests=base.requests,
             queries=client.take_requests(),
             preempted=preempted,
             release_pins=release,
+            finish_epoch=self._finish_epoch,
+            delayed_finishes=delayed,
         )
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
@@ -233,6 +243,17 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
         replies, self._worker_replies = self._worker_replies, {}
         return WorkerLookups(replies) if replies else None
 
+    def get_finished(self, finished_req_ids):
+        # Arm each scheduler decision to delay block release once. The Engine
+        # still polls deferred STOREs on idle steps and MTP still owns its replay.
+        meta = self._get_connector_metadata()
+        if meta.finish_epoch > self._finish_epoch:
+            self._finish_epoch = meta.finish_epoch
+            self._pending_finish_ids.update(meta.delayed_finishes)
+        eligible = self._pending_finish_ids & finished_req_ids
+        self._pending_finish_ids.difference_update(eligible)
+        return super().get_finished(eligible)
+
     def update_connector_output(self, connector_output):
         meta = connector_output.kv_connector_worker_meta
         if meta is not None:
@@ -241,7 +262,10 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
     def request_finished(self, request, block_ids):
         self._lmcache_engine.lookup_client.clear_lookup_status(request.request_id)
         self._release_pins.add(request.request_id)
-        return super().request_finished(request, block_ids)
+        delay_free, params = super().request_finished(request, block_ids)
+        if delay_free:
+            self._pending_finish_ids.add(request.request_id)
+        return delay_free, params
 
     def request_finished_all_groups(self, request, block_ids):
         # The inherited finish callback owns a request-wide STORE fence. Physical
