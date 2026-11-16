@@ -204,11 +204,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 assert len(slot_mapping) == len(token_ids)
 
                 # lmcache-ascend start ---------------------
-                slot_mapping = slot_mapping.pin_memory()
-                with torch.npu.stream(self.lmcache_engine.gpu_connector.store_stream):
-                    slot_mapping_npu = slot_mapping.to(
-                        device="npu", dtype=torch.long, non_blocking=True
-                    )
+                block_tables = getattr(request, "block_tables", None)
+                if block_tables is None:
+                    slot_mapping = slot_mapping.pin_memory()
+                    with torch.npu.stream(self.lmcache_engine.gpu_connector.store_stream):
+                        slot_mapping_npu = slot_mapping.to(
+                            device="npu", dtype=torch.long, non_blocking=True
+                        )
+                    address_args = {"slot_mapping_npu": slot_mapping_npu}
+                else:
+                    address_args = {"block_tables": block_tables}
                 # lmcache-ascend end ---------------------
 
                 if persist_remote_skip is not None:
@@ -264,7 +269,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     request_configs=request.request_configs,
                     req_id=request.req_id,
                     ordering_event=ordering_event,
-                    slot_mapping_npu=slot_mapping_npu,
+                    **address_args,
                 )
 
                 if get_pp_group().is_last_rank:

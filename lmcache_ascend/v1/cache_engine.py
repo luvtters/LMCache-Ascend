@@ -89,9 +89,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self.is_store_async = self.config.store_async
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
+        self._store_queue: Optional[queue.Queue] = None
+        self._store_worker_thread: Optional[threading.Thread] = None
+        self._store_submit_lock = threading.Lock()
+        self._closing = False
+        self._closed = False
         if self.is_store_async:
-            self._store_queue: Optional[queue.Queue] = None
-            self._store_worker_thread: Optional[threading.Thread] = None
             self._store_lock = threading.Lock()
             self._store_cv = threading.Condition(self._store_lock)
 
@@ -187,7 +190,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         dtypes = self.metadata.get_dtypes()
         per_chunk_bytes = get_size_bytes(shapes, dtypes)
 
-        device = self.metadata.worker_id
+        device = torch.npu.current_device()
         props = torch.npu.get_device_properties(device)
         total_mem = props.total_memory
         allocated = torch.npu.memory_allocated(device)
@@ -395,31 +398,27 @@ class AscendLMCacheEngine(LMCacheEngine):
         first_rank = self.metadata.first_rank
         load_stream = self.gpu_connector.load_stream
 
-        plan = self._broadcast_metadata_table(reordered_chunks, shard_size, first_rank)
-        if plan is None or plan.get("total", 0) == 0:
-            # Sender's CPU mem_objs won't enter the pipeline; release
-            # them now to avoid leaking.
-            if self.metadata.is_first_rank():
+        is_sender = self.metadata.is_first_rank()
+        try:
+            plan = self._broadcast_metadata_table(reordered_chunks, shard_size, first_rank)
+            if plan is None or not plan.get("total"):
+                return
+            if is_sender:
+                self._pipeline_broadcast_and_load(
+                    plan, load_stream, reordered_chunks=reordered_chunks, **kwargs
+                )
+            else:
+                self._pipeline_broadcast_and_load(
+                    plan, load_stream, ret_mask=ret_mask, **kwargs
+                )
+        except Exception:
+            # A failed submission may precede the event linking the two streams.
+            self.broadcast_stream.synchronize()
+            raise
+        finally:
+            if is_sender:
                 for _, mem_obj, _, _ in reordered_chunks:
                     mem_obj.ref_count_down()
-            return
-
-        if self.metadata.is_first_rank():
-            # sender
-            self._pipeline_broadcast_and_load(
-                plan,
-                load_stream,
-                reordered_chunks=reordered_chunks,
-                **kwargs,
-            )
-        else:
-            # receiver
-            self._pipeline_broadcast_and_load(
-                plan,
-                load_stream,
-                ret_mask=ret_mask,
-                **kwargs,
-            )
 
     def _fill_shard_sender(
         self,
@@ -443,7 +442,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
             dst = merged[byte_off : byte_off + byte_size]
             dst.copy_(
-                raw.contiguous().view(torch.uint8).flatten(),
+                raw.contiguous().view(torch.uint8).flatten()[:byte_size],
                 non_blocking=True,
             )
 
@@ -518,7 +517,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         meta_table = plan["meta"]
         shard_plan = plan["shard_plan"]
         shard_layouts = plan["shard_layouts"]
-        device = f"npu:{self.metadata.worker_id}"
+        device = f"npu:{torch.npu.current_device()}"
         if not self._ensure_merged_pool(plan["max_shard_bytes"], device):
             raise RuntimeError(
                 f"Failed to allocate merged broadcast pool on {device} "
@@ -585,14 +584,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                         pass
             pending.clear()
 
-            # Sender-only: release the original CPU mem_objs whose
-            # raw_tensor was H2D-copied into the merged buffer.
-            if is_sender:
-                for _, mem_obj, _, _ in reordered_chunks:
-                    try:
-                        mem_obj.ref_count_down()
-                    except Exception:
-                        pass
 
     @torch.inference_mode()
     def retrieve(
@@ -684,9 +675,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         elif len(reordered_chunks) > 0:
             with retrieve_stats.profile_to_gpu():
                 _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
-                self.gpu_connector.batched_to_gpu(
-                    list(memory_objs), list(starts), list(ends), **kwargs
-                )
+                try:
+                    self.gpu_connector.batched_to_gpu(
+                        list(memory_objs), list(starts), list(ends), **kwargs
+                    )
+                except Exception:
+                    if not self.async_loading:
+                        for obj in memory_objs:
+                            obj.ref_count_down()
+                    raise
 
         # --- Cleanup ---
         # When save_only_first_rank is set, the sharded-broadcast pipeline
@@ -1114,82 +1111,68 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kwargs["slot_mapping"], dtype=torch.long, device="npu"
             )
 
-        # lmcache-ascend start ---------------------
-        if not self.is_store_async:
-            self._run_store_pipeline(
-                req_id, tokens, hashes, offsets, mask, num_to_store_tokens, kwargs
-            )
-        else:
-            self._ensure_store_worker()
-            with self._store_lock:
-                self._pending_store_reqs[req_id] = (
-                    self._pending_store_reqs.get(req_id, 0) + 1
+        # Serialize enqueue with shutdown so a STORE cannot follow the sentinel.
+        with self._store_submit_lock:
+            if self._closing:
+                raise RuntimeError("STORE submitted while Ascend Engine is closing")
+            if not self.is_store_async:
+                self._run_store_pipeline(
+                    req_id, tokens, hashes, offsets, mask, num_to_store_tokens, kwargs
                 )
-                pending = self._pending_store_reqs[req_id]
-
-            enqueued = False
-            try:
-                self._store_queue.put(
-                    (
-                        req_id,
-                        tokens,
-                        hashes,
-                        offsets,
-                        mask,
-                        num_to_store_tokens,
-                        kwargs,
+            else:
+                self._ensure_store_worker()
+                with self._store_lock:
+                    self._pending_store_reqs[req_id] = (
+                        self._pending_store_reqs.get(req_id, 0) + 1
                     )
-                )
-                enqueued = True
-            finally:
-                if not enqueued:
-                    with self._store_lock:
-                        cnt = self._pending_store_reqs.get(req_id, 1) - 1
-                        if cnt <= 0:
-                            self._pending_store_reqs.pop(req_id, None)
-                        else:
-                            self._pending_store_reqs[req_id] = cnt
-                        self._store_cv.notify_all()
+                    pending = self._pending_store_reqs[req_id]
 
-            logger.debug(
-                "Enqueued async store for req %s; pending=%d tokens=%d",
-                req_id,
-                pending,
-                num_to_store_tokens,
-            )
+                enqueued = False
+                try:
+                    self._store_queue.put(
+                        (
+                            req_id,
+                            tokens,
+                            hashes,
+                            offsets,
+                            mask,
+                            num_to_store_tokens,
+                            kwargs,
+                        )
+                    )
+                    enqueued = True
+                finally:
+                    if not enqueued:
+                        with self._store_lock:
+                            cnt = self._pending_store_reqs.get(req_id, 1) - 1
+                            if cnt <= 0:
+                                self._pending_store_reqs.pop(req_id, None)
+                            else:
+                                self._pending_store_reqs[req_id] = cnt
+                            self._store_cv.notify_all()
+
+                logger.debug(
+                    "Enqueued async store for req %s; pending=%d tokens=%d",
+                    req_id,
+                    pending,
+                    num_to_store_tokens,
+                )
         # lmcache-ascend end ---------------------
 
     def close(self) -> None:
         """Stop the bg worker gracefully, then close the base engine."""
-        # Push poison pill first so any in-flight work drains before
-        # ``storage_manager.close()`` runs inside ``super().close()``.
-        if self._store_queue is not None:
-            try:
-                # Bounded queues can be full here; avoid blocking forever
-                # while still preferring graceful drain.
-                while True:
-                    try:
-                        self._store_queue.put_nowait(None)
-                        break
-                    except queue.Full:
-                        if (
-                            self._store_worker_thread is None
-                            or not self._store_worker_thread.is_alive()
-                        ):
-                            logger.warning(
-                                "Ascend store queue is full and worker is not alive; "
-                                "cannot enqueue shutdown signal cleanly."
-                            )
-                            break
-                        time.sleep(0.01)
-                if self._store_worker_thread is not None:
-                    self._store_worker_thread.join(timeout=10)
-                    if self._store_worker_thread.is_alive():
-                        logger.warning(
-                            "Ascend store worker did not stop within 10s; "
-                            "proceeding with engine shutdown."
-                        )
-            except Exception:
-                logger.exception("Error stopping Ascend store worker")
-
-        super().close()
+        with self._store_submit_lock:
+            if self._closed:
+                return
+            if not self._closing:
+                if self._store_queue is not None:
+                    # Do not release the allocator on timeout. A later close can
+                    # retry after the worker has finished its current transfer.
+                    self._store_queue.put(None, timeout=10)
+                self._closing = True
+            if self._store_worker_thread is not None:
+                self._store_worker_thread.join(timeout=10)
+                if self._store_worker_thread.is_alive():
+                    raise TimeoutError("Ascend STORE still owns KV buffers during close")
+            super().close()
+            self._closed = True

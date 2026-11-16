@@ -32,6 +32,12 @@ def CreateNPUConnector(
     Replaces upstream CreateGPUConnector to return Ascend NPU-specific
     connector implementations.
     """
+    if engine == EngineType.VLLM and getattr(metadata, "storage_owner_rank", None) is not None:
+        from lmcache_ascend.v1.npu_connector.inprocess_blocks import RegisteredBlockTransfer
+
+        # The runner already chose its local NPU. KV layout arrives at registration.
+        return RegisteredBlockTransfer()
+
     use_gpu = need_gpu_interm_buffer(config)
 
     num_gpus = torch.npu.device_count()
