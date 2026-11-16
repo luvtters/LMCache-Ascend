@@ -132,7 +132,9 @@ def unit_cases():
         ("KV 注册、重复注册与分配形状", unittests((c, "test_register_updates_storage_geometry_before_post_init"))),
         ("异构 KV 平面与 APC 前缀字节", unittests((b, "test_mixed_planes_distinct_group_tables_and_apc"))),
         ("错块号及 chunk 对齐拒绝", unittests((b, "test_bad_chunk_and_bad_table"))),
-        ("LOOKUP 共同前缀与缺回复", unittests((l, "test_common_prefix_requires_both_ranks"))),
+        ("LOOKUP 共同前缀、紧凑快照及被动 rank", unittests(
+            (l, "test_common_prefix_requires_both_ranks"), (l, "test_wire_roundtrip_and_snapshot"),
+            (c, "test_long_passive_lookup_uses_only_length"))),
         ("同 ID 重新接纳与迟到回复", unittests((l, "test_reissued_request_ignores_late_reply"))),
         ("查询发出之前取消", unittests((l, "test_cancel_before_dispatch"))),
         ("错误 rank 和冲突回复", unittests((l, "test_invalid_rank_and_inconsistent_replay"))),

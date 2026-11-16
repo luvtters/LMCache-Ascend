@@ -6,7 +6,6 @@ import __future__
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
-from itertools import count
 import os
 from pathlib import Path
 import queue
@@ -18,6 +17,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import torch
+from test_inprocess_lookup_cpu import module as lookup
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -172,7 +172,6 @@ class BaseAdapter:
 
 wrapper = classes(CORE / "lmcache/integration/vllm/lmcache_connector_v1.py",
                   dict(KVConnectorBase_V1=BaseConnector, LMCacheConnectorV1Impl=BaseAdapter))
-lookup = classes(INTEGRATION / "inprocess_lookup.py", dict(dataclass=dataclass, count=count))
 
 
 class BaseFactory:
@@ -202,6 +201,18 @@ def step(*, new=(), reqs=(), finished=(), preempted=(), cached=None):
 
 
 class ConnectorTests(unittest.TestCase):
+    def test_long_passive_lookup_uses_only_length(self):
+        scheduler = create("SCHEDULER")
+        scheduler._lmcache_engine.lookup_client.lookup(list(range(8192)), "r")
+        worker = create("WORKER")
+        worker.step = scheduler.build_connector_meta(step())
+        engine = worker._lmcache_engine.lmcache_engine
+        engine.save_only_first_rank = True
+        engine.metadata.is_first_rank = lambda: False
+        with patch.object(lookup.LookupRequest, "owner_tokens", side_effect=AssertionError):
+            worker.start_load_kv(None)
+        self.assertEqual(worker.build_connector_worker_meta().replies, {0: {16: 8192}})
+
     def test_mtp_finish_before_save_is_reported_once(self):
         path = INTEGRATION / "vllm_v1_adapter.py"
         cls = "LMCacheAscendConnectorV1Impl"

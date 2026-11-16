@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import importlib.util
+import pickle
 import sys
 import unittest
 
@@ -15,6 +16,26 @@ spec.loader.exec_module(module)
 
 
 class StepLookupTests(unittest.TestCase):
+    def test_wire_roundtrip_and_snapshot(self):
+        for n, largest, width in [(0, 1, 0), (255, 123, 0), (256, 255, 1),
+                                  (257, 65535, 2), (8192, 100002, 3),
+                                  (256, 2**32 - 1, 4), (256, -1, 0), (256, 2**63, 0)]:
+            with self.subTest(n=n, largest=largest):
+                expected = ([0, largest] * (n // 2 + 1))[:n]
+                original = expected.copy()
+                client = module.StepLookupClient(2)
+                client.lookup(original, "req", {"tenant": "a"})
+                original[:] = [43]
+                packet, = client.take_requests()
+                received = pickle.loads(pickle.dumps(packet, protocol=5))
+                self.assertEqual(received.token_count, n)
+                self.assertEqual(received.owner_tokens(), expected)
+                self.assertEqual(received.configs, {"tenant": "a"})
+                if width:
+                    self.assertEqual(len(received.tokens), width)
+                else:
+                    self.assertIsInstance(received.tokens, list)
+
     def setUp(self):
         self.client = module.StepLookupClient(2)
 

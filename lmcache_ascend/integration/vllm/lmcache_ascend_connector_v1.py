@@ -243,10 +243,10 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
                 for query in meta.queries:
                     attempted += 1
                     if engine.save_only_first_rank and not engine.metadata.is_first_rank():
-                        hit = len(query.tokens)  # The TP owner supplies this rank's KV.
+                        hit = query.token_count  # The TP owner supplies this rank's KV.
                     else:
                         hit = engine.lookup(
-                            tokens=query.tokens, lookup_id=query.request_id,
+                            tokens=query.owner_tokens(), lookup_id=query.request_id,
                             request_configs=query.configs, pin=True,
                         )
                     hits[query.sequence] = hit

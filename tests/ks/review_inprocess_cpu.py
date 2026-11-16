@@ -257,6 +257,7 @@ def cost():
         slots = slot_map()
         times.append((perf_counter_ns() - start) / 1e6)
     scheduler = src.create("SCHEDULER")
+    slot_ms = median(times[1:])
     group_rows = []
     for count in (0, 1, 32):
         ids = [str(i) for i in range(count)]
@@ -272,7 +273,7 @@ def cost():
         group_rows.append(dict(requests=count, metadata_median_ms=median(times[1:])))
     return dict(lookup=rows, group_table_append=group_rows, block_ids_per_group=128, block_size=64,
                 slot_tensor_bytes=slots.numel()*slots.element_size(),
-                slot_build_median_ms=median(times[1:]), serialization="pickle protocol 5 proxy")
+                slot_build_median_ms=slot_ms, serialization="pickle protocol 5 proxy")
 
 
 def main():

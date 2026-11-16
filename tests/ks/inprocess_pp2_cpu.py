@@ -229,7 +229,8 @@ class Workers:
         t = [3, 31, 32, 33]
         self.seed(0, "short", t, 31)
         self.seed(1, "short", t[:2], 32)
-        counts, common = self.query("short", t)
+        # A long query forces the actual packed wire form across both pipes.
+        counts, common = self.query("short", t + list(range(256)))
         self.finish("short")
         require(counts == [4, 2] and common == 2, "short stage overclaimed")
         return {"stage_tokens": counts, "common": common}

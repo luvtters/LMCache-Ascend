@@ -1,16 +1,52 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scheduler-side lookup state carried over vLLM's existing step messages."""
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from itertools import count
+import struct
+import sys
 
 
 @dataclass
 class LookupRequest:
     sequence: int
     request_id: str
-    tokens: list[int]
+    # Long uint32 prompts travel as little-endian byte planes. Short prompts
+    # and wide multimodal IDs keep the original integer representation.
+    tokens: list[int] | tuple[bytes, ...]
     configs: dict | None
+
+    @property
+    def token_count(self) -> int:
+        return len(self.tokens[0]) if isinstance(self.tokens, tuple) else len(self.tokens)
+
+    def owner_tokens(self) -> list[int]:
+        if isinstance(self.tokens, list):
+            return self.tokens
+        count = self.token_count
+        words = bytearray(4 * count)
+        for i, plane in enumerate(self.tokens):
+            lane = i if sys.byteorder == "little" else 3 - i
+            words[lane::4] = plane
+        return memoryview(words).cast("I").tolist()
+
+
+def _snapshot(token_ids):
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    if isinstance(token_ids, Iterator):
+        token_ids = list(token_ids)
+    if not hasattr(token_ids, "__len__") or len(token_ids) < 256:
+        return list(token_ids)
+    try:
+        words = struct.pack(f"<{len(token_ids)}I", *token_ids)
+    except (struct.error, OverflowError):
+        return list(token_ids)
+    planes = [words[i::4] for i in range(4)]
+    while len(planes) > 1 and planes[-1].count(0) == len(token_ids):
+        planes.pop()
+    return tuple(planes)
 
 
 class StepLookupClient:
@@ -34,10 +70,10 @@ class StepLookupClient:
 
     def lookup(self, token_ids, lookup_id: str, request_configs=None) -> int | None:
         if lookup_id not in self.active:
+            tokens = _snapshot(token_ids)
             seq = next(self.sequence)
             self.active[lookup_id] = seq
             self.answers[seq] = {}
-            tokens = token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
             self.unsent[lookup_id] = LookupRequest(seq, lookup_id, tokens, request_configs)
         return self.lookup_cache(lookup_id)
 
