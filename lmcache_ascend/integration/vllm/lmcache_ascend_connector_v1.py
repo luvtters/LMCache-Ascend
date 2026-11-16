@@ -21,6 +21,7 @@ from lmcache_ascend.v1.npu_connector.inprocess_blocks import RegisteredBlockTran
 
 @dataclass(kw_only=True)
 class AscendStepMetadata(LMCacheConnectorMetadata):
+    step_id: int
     queries: list[LookupRequest]
     preempted: set[str]
     release_pins: set[str]
@@ -128,6 +129,9 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
         self._lmcache_engine._discard_partial_chunks = True
         self._release_pins = set()
         self._worker_replies = {}
+        self._step_id = 0
+        self._last_worker_step = -1
+        self._last_lookup_hits = None
         self._finish_epoch = 0
         self._pending_finish_ids = set()
         if role.name == "WORKER":
@@ -185,7 +189,9 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
         if delayed:
             self._finish_epoch += 1
             self._pending_finish_ids.difference_update(delayed)
+        self._step_id += 1
         return AscendStepMetadata(
+            step_id=self._step_id,
             requests=base.requests,
             queries=client.take_requests(),
             preempted=preempted,
@@ -213,31 +219,49 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
         pass
 
     def handle_preemptions(self, kv_connector_metadata):
-        if kv_connector_metadata.preempted:
+        if (kv_connector_metadata.preempted
+                and kv_connector_metadata.step_id > self._last_worker_step):
             self._lmcache_engine.handle_preemptions(kv_connector_metadata.preempted)
 
     def start_load_kv(self, forward_context, **kwargs):
         meta = self._get_connector_metadata()
         engine = self._lmcache_engine.lmcache_engine
-        for req_id in meta.release_pins:
-            engine.lookup_unpin(req_id)
-        for query in meta.queries:
-            if engine.save_only_first_rank and not engine.metadata.is_first_rank():
-                hit = len(query.tokens)  # The TP owner supplies this rank's KV.
-            else:
-                hit = engine.lookup(
-                    tokens=query.tokens,
-                    lookup_id=query.request_id,
-                    request_configs=query.configs,
-                    pin=True,
-                )
-            self._worker_replies[query.sequence] = {engine.metadata.worker_id: hit}
+        if meta.step_id < self._last_worker_step:
+            if meta.requests:
+                raise RuntimeError("Out-of-order step refers to obsolete KV blocks")
+            return  # Old metadata can refer to a reused request ID or freed blocks.
+        if meta.step_id > self._last_worker_step:
+            self._last_worker_step = meta.step_id
+            self._last_lookup_hits = None
+        hits = self._last_lookup_hits
+        attempted = len(meta.queries) if hits is not None else 0
         try:
+            if hits is None:
+                hits = {}
+                for req_id in meta.release_pins:
+                    engine.lookup_unpin(req_id)
+                for query in meta.queries:
+                    attempted += 1
+                    if engine.save_only_first_rank and not engine.metadata.is_first_rank():
+                        hit = len(query.tokens)  # The TP owner supplies this rank's KV.
+                    else:
+                        hit = engine.lookup(
+                            tokens=query.tokens, lookup_id=query.request_id,
+                            request_configs=query.configs, pin=True,
+                        )
+                    hits[query.sequence] = hit
             super().start_load_kv(forward_context, **kwargs)
         except Exception:
+            self._last_lookup_hits = None
+            for query in meta.queries[:attempted]:
+                self._worker_replies.pop(query.sequence, None)
+                engine.lookup_unpin(query.request_id)
             for request in meta.requests:
                 engine.lookup_unpin(request.req_id)
             raise
+        self._last_lookup_hits = hits
+        for sequence, hit in hits.items():
+            self._worker_replies[sequence] = {engine.metadata.worker_id: hit}
 
     def build_connector_worker_meta(self):
         replies, self._worker_replies = self._worker_replies, {}

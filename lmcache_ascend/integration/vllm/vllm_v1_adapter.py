@@ -163,6 +163,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             self._replay_finished_stores_after_save()
             return
 
+        if not connector_metadata.requests:
+            self._wait_for_save_done = True
+            self._replay_finished_stores_after_save()
+            return
+
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
